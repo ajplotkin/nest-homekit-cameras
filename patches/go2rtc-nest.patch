@@ -1,0 +1,733 @@
+# go2rtc Nest patches — apply to a clean go2rtc v1.9.14 checkout
+#
+# Generated from https://github.com/ajplotkin/go2rtc branch fix/nest-ipv6-ice-failure.
+# Includes this project's own patches (IPv4-only ICE, keyframe PLI, sprop-in-SDP,
+# stall watchdog, extend-loop resilience) AND these adopted community PRs, credited
+# in the README: AlexxIT/go2rtc #2351 (tillo), #2194 & #2193 (MechanicalCoderX),
+# #2327 (zephleggett).
+#
+# Apply:  cd go2rtc && git apply /path/to/go2rtc-nest.patch
+# (or from a tarball checkout:  patch -p1 < go2rtc-nest.patch)
+#
+diff --git a/internal/mjpeg/mjpeg.go b/internal/mjpeg/mjpeg.go
+index e9f973a..7cfe920 100644
+--- a/internal/mjpeg/mjpeg.go
++++ b/internal/mjpeg/mjpeg.go
+@@ -83,11 +83,24 @@ func handlerKeyframe(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	// WriteTo below blocks until a keyframe arrives, and the in-memory OnceBuffer
++	// sink never errors on client disconnect to unblock it. Reap the consumer when
++	// the request context ends so a stuck WriteTo can't leak it.
++	ctx := r.Context()
++	go func() {
++		<-ctx.Done()
++		_ = cons.Stop()
++		stream.RemoveConsumer(cons)
++	}()
++
+ 	once := &core.OnceBuffer{} // init and first frame
+ 	_, _ = cons.WriteTo(once)
+ 	b = once.Buffer()
+ 
+-	stream.RemoveConsumer(cons)
++	if ctx.Err() != nil {
++		b = nil     // don't let a partial/raw buffer get cached (cache defer stores non-nil b)
++		return      // client gone before a keyframe arrived
++	}
+ 
+ 	switch cons.CodecName() {
+ 	case core.CodecH264, core.CodecH265:
+diff --git a/internal/mp4/mp4.go b/internal/mp4/mp4.go
+index d0a6d97..83ce635 100644
+--- a/internal/mp4/mp4.go
++++ b/internal/mp4/mp4.go
+@@ -55,10 +55,21 @@ func handlerKeyframe(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
++	// See mjpeg.handlerKeyframe: WriteTo blocks until a keyframe arrives and the
++	// OnceBuffer sink never unblocks it on disconnect. Reap on the request context.
++	ctx := r.Context()
++	go func() {
++		<-ctx.Done()
++		_ = cons.Stop()
++		stream.RemoveConsumer(cons)
++	}()
++
+ 	once := &core.OnceBuffer{} // init and first frame
+ 	_, _ = cons.WriteTo(once)
+ 
+-	stream.RemoveConsumer(cons)
++	if ctx.Err() != nil {
++		return // client gone before a keyframe arrived
++	}
+ 
+ 	// Apple Safari won't show frame without length
+ 	header := w.Header()
+diff --git a/internal/streams/preload.go b/internal/streams/preload.go
+index ac4403d..9ab0287 100644
+--- a/internal/streams/preload.go
++++ b/internal/streams/preload.go
+@@ -5,6 +5,7 @@ import (
+ 	"maps"
+ 	"net/url"
+ 	"sync"
++	"time"
+ 
+ 	"github.com/AlexxIT/go2rtc/pkg/probe"
+ )
+@@ -42,6 +43,10 @@ func AddPreload(name, rawQuery string) error {
+ 	cons := probe.Create("preload", query)
+ 
+ 	if err = stream.AddConsumer(cons); err != nil {
++		// The source may be temporarily unavailable (e.g. a Nest camera powered off at
++		// boot returns 400). Retry in the background so the preload attaches when the
++		// source comes back, instead of staying cold until a restart.
++		go retryPreload(name, rawQuery, query)
+ 		return err
+ 	}
+ 
+@@ -49,6 +54,30 @@ func AddPreload(name, rawQuery string) error {
+ 	return nil
+ }
+ 
++func retryPreload(name, rawQuery string, query url.Values) {
++	for {
++		time.Sleep(time.Minute)
++
++		preloadsMu.Lock()
++		if preloads[name] != nil { // a successful AddPreload (or newer retry) already ran
++			preloadsMu.Unlock()
++			return
++		}
++		stream := Get(name)
++		if stream == nil { // stream removed from config
++			preloadsMu.Unlock()
++			return
++		}
++		cons := probe.Create("preload", query)
++		if err := stream.AddConsumer(cons); err == nil {
++			preloads[name] = &Preload{stream: stream, Cons: cons, Query: rawQuery}
++			preloadsMu.Unlock()
++			return
++		}
++		preloadsMu.Unlock()
++	}
++}
++
+ func DelPreload(name string) error {
+ 	preloadsMu.Lock()
+ 	defer preloadsMu.Unlock()
+diff --git a/pkg/core/writebuffer.go b/pkg/core/writebuffer.go
+index 50ad013..b489c7b 100644
+--- a/pkg/core/writebuffer.go
++++ b/pkg/core/writebuffer.go
+@@ -13,10 +13,11 @@ import (
+ // WriteTo will be locked until Write fails or Close will be called.
+ type WriteBuffer struct {
+ 	io.Writer
+-	err   error
+-	mu    sync.Mutex
+-	wg    sync.WaitGroup
+-	state byte
++	err    error
++	mu     sync.Mutex
++	wg     sync.WaitGroup
++	state  byte
++	closed bool
+ }
+ 
+ func NewWriteBuffer(wr io.Writer) *WriteBuffer {
+@@ -47,10 +48,16 @@ func (w *WriteBuffer) WriteTo(wr io.Writer) (n int64, err error) {
+ }
+ 
+ func (w *WriteBuffer) Close() error {
+-	if closer, ok := w.Writer.(io.Closer); ok {
++	// snapshot Writer under the lock; WriteTo/Reset can swap it concurrently
++	w.mu.Lock()
++	writer := w.Writer
++	w.mu.Unlock()
++
++	if closer, ok := writer.(io.Closer); ok {
+ 		return closer.Close()
+ 	}
+ 	w.mu.Lock()
++	w.closed = true
+ 	w.done()
+ 	w.mu.Unlock()
+ 	return nil
+@@ -76,7 +83,8 @@ const (
+ )
+ 
+ func (w *WriteBuffer) add() {
+-	if w.state == none {
++	// don't Add if Close already ran, or WriteTo would block on a Done that already fired
++	if w.state == none && !w.closed {
+ 		w.state = start
+ 		w.wg.Add(1)
+ 	}
+diff --git a/pkg/core/writebuffer_test.go b/pkg/core/writebuffer_test.go
+new file mode 100644
+index 0000000..c35dae2
+--- /dev/null
++++ b/pkg/core/writebuffer_test.go
+@@ -0,0 +1,52 @@
++package core
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// A WriteTo still blocked on a keyframe must unblock on Close, or the consumer leaks.
++func TestWriteBufferCloseUnblocksWriteTo(t *testing.T) {
++	wb := NewWriteBuffer(nil)
++
++	returned := make(chan struct{})
++	go func() {
++		_, _ = wb.WriteTo(&OnceBuffer{}) // no keyframe is ever written
++		close(returned)
++	}()
++
++	// WriteTo must still be blocked: no keyframe, no Close yet.
++	select {
++	case <-returned:
++		t.Fatal("WriteTo returned before any keyframe or Close")
++	case <-time.After(50 * time.Millisecond):
++	}
++
++	require.NoError(t, wb.Close())
++
++	select {
++	case <-returned:
++	case <-time.After(time.Second):
++		t.Fatal("WriteTo did not unblock after Close - the consumer would leak")
++	}
++}
++
++// Close before WriteTo registers its wait must not block WriteTo forever.
++func TestWriteBufferCloseBeforeWriteTo(t *testing.T) {
++	wb := NewWriteBuffer(nil)
++	require.NoError(t, wb.Close())
++
++	returned := make(chan struct{})
++	go func() {
++		_, _ = wb.WriteTo(&OnceBuffer{})
++		close(returned)
++	}()
++
++	select {
++	case <-returned:
++	case <-time.After(time.Second):
++		t.Fatal("WriteTo blocked after Close-before-WriteTo - the race window leaks the consumer")
++	}
++}
+diff --git a/pkg/h264/h264.go b/pkg/h264/h264.go
+index 1223953..ae3b0c2 100644
+--- a/pkg/h264/h264.go
++++ b/pkg/h264/h264.go
+@@ -126,10 +126,21 @@ func GetFmtpLine(avc []byte) string {
+ 	s := "packetization-mode=1"
+ 
+ 	for {
++		// Bounds guards vs malformed device data: need >=4 for the length prefix,
++		// >=5 for NALUType (avc[4]), and size within the buffer for the NAL slice.
++		if len(avc) < 5 {
++			return s
++		}
+ 		size := 4 + int(binary.BigEndian.Uint32(avc))
++		if size > len(avc) {
++			return s
++		}
+ 
+ 		switch NALUType(avc) {
+ 		case NALUTypeSPS:
++			if len(avc) < 8 {
++				return s
++			}
+ 			s += ";profile-level-id=" + hex.EncodeToString(avc[5:8])
+ 			s += ";sprop-parameter-sets=" + base64.StdEncoding.EncodeToString(avc[4:size])
+ 		case NALUTypePPS:
+diff --git a/pkg/homekit/helpers.go b/pkg/homekit/helpers.go
+index 625e3ab..13b4d32 100644
+--- a/pkg/homekit/helpers.go
++++ b/pkg/homekit/helpers.go
+@@ -22,7 +22,13 @@ func videoToMedia(codecs []camera.VideoCodecConfiguration) *core.Media {
+ 		for _, param := range codec.CodecParams {
+ 			// get best profile and level
+ 			profileID := core.Max(param.ProfileID)
++			if int(profileID) >= len(videoProfiles) {
++				profileID = byte(len(videoProfiles) - 1)
++			}
+ 			level := core.Max(param.Level)
++			if int(level) >= len(videoLevels) {
++				level = byte(len(videoLevels) - 1)
++			}
+ 			profile := videoProfiles[profileID] + videoLevels[level]
+ 			mediaCodec := &core.Codec{
+ 				Name:      videoCodecs[codec.CodecType],
+diff --git a/pkg/nest/api.go b/pkg/nest/api.go
+index 4e9e4db..ae69dd1 100644
+--- a/pkg/nest/api.go
++++ b/pkg/nest/api.go
+@@ -26,7 +26,10 @@ type API struct {
+ 	StreamToken          string
+ 	StreamExtensionToken string
+ 
++	key string // credentials cache key, used to refresh the OAuth token
++
+ 	extendTimer *time.Timer
++	extendStop  chan struct{}
+ }
+ 
+ type Auth struct {
+@@ -49,8 +52,12 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
+ 	key := clientID + ":" + clientSecret + ":" + refreshToken
+ 	now := time.Now()
+ 
++	// The cache only stores the OAuth token. Each caller gets its own API
++	// instance, because the Stream* fields hold per-stream session state -
++	// multiple cameras sharing one instance overwrite each other's session
++	// and only the last one gets extended.
+ 	if api := cache[key]; api != nil && now.Before(api.ExpiresAt) {
+-		return api, nil
++		return &API{Token: api.Token, ExpiresAt: api.ExpiresAt, key: key}, nil
+ 	}
+ 
+ 	data := url.Values{
+@@ -60,7 +67,7 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
+ 		"refresh_token": []string{refreshToken},
+ 	}
+ 
+-	client := &http.Client{Timeout: time.Second * 5000}
++	client := &http.Client{Timeout: time.Second * 10}
+ 	res, err := client.PostForm("https://www.googleapis.com/oauth2/v4/token", data)
+ 	if err != nil {
+ 		return nil, err
+@@ -89,7 +96,7 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
+ 
+ 	cache[key] = api
+ 
+-	return api, nil
++	return &API{Token: api.Token, ExpiresAt: api.ExpiresAt, key: key}, nil
+ }
+ 
+ func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
+@@ -101,7 +108,7 @@ func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
+ 
+ 	req.Header.Set("Authorization", "Bearer "+a.Token)
+ 
+-	client := &http.Client{Timeout: time.Second * 5000}
++	client := &http.Client{Timeout: time.Second * 10}
+ 	res, err := client.Do(req)
+ 	if err != nil {
+ 		return nil, err
+@@ -178,7 +185,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
+ 
+ 		req.Header.Set("Authorization", "Bearer "+a.Token)
+ 
+-		client := &http.Client{Timeout: time.Second * 5000}
++		client := &http.Client{Timeout: time.Second * 10}
+ 		res, err := client.Do(req)
+ 		if err != nil {
+ 			return "", err
+@@ -228,23 +235,12 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
+ }
+ 
+ func (a *API) refreshToken() error {
+-	// Get the cached API with matching token to get credentials
+-	var refreshKey string
+-	cacheMu.Lock()
+-	for key, api := range cache {
+-		if api.Token == a.Token {
+-			refreshKey = key
+-			break
+-		}
+-	}
+-	cacheMu.Unlock()
+-
+-	if refreshKey == "" {
++	if a.key == "" {
+ 		return errors.New("nest: unable to find cached credentials")
+ 	}
+ 
+-	// Parse credentials from cache key
+-	parts := strings.Split(refreshKey, ":")
++	// Parse credentials from the cache key
++	parts := strings.SplitN(a.key, ":", 3)
+ 	if len(parts) != 3 {
+ 		return errors.New("nest: invalid cache key format")
+ 	}
+@@ -295,7 +291,7 @@ func (a *API) ExtendStream() error {
+ 
+ 	req.Header.Set("Authorization", "Bearer "+a.Token)
+ 
+-	client := &http.Client{Timeout: time.Second * 5000}
++	client := &http.Client{Timeout: time.Second * 10}
+ 	res, err := client.Do(req)
+ 	if err != nil {
+ 		return err
+@@ -348,7 +344,7 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
+ 
+ 	req.Header.Set("Authorization", "Bearer "+a.Token)
+ 
+-	client := &http.Client{Timeout: time.Second * 5000}
++	client := &http.Client{Timeout: time.Second * 10}
+ 	res, err := client.Do(req)
+ 	if err != nil {
+ 		return "", err
+@@ -412,11 +408,12 @@ func (a *API) StopRTSPStream() error {
+ 
+ 	req.Header.Set("Authorization", "Bearer "+a.Token)
+ 
+-	client := &http.Client{Timeout: time.Second * 5000}
++	client := &http.Client{Timeout: time.Second * 10}
+ 	res, err := client.Do(req)
+ 	if err != nil {
+ 		return err
+ 	}
++	defer res.Body.Close()
+ 
+ 	if res.StatusCode != 200 {
+ 		return errors.New("nest: wrong status: " + res.Status)
+@@ -469,11 +466,50 @@ func (a *API) StartExtendStreamTimer() {
+ 		return
+ 	}
+ 
+-	a.extendTimer = time.NewTimer(time.Until(a.StreamExpiresAt) - time.Minute)
++	// Google expires sessions after ~5 minutes; each successful extension
++	// returns a new expiresAt, so keep extending until the stream stops.
++	timer := time.NewTimer(time.Until(a.StreamExpiresAt) - time.Minute)
++	stop := make(chan struct{})
++	a.extendTimer = timer
++	a.extendStop = stop
++
+ 	go func() {
+-		<-a.extendTimer.C
+-		if err := a.ExtendStream(); err != nil {
+-			return
++		// Retry transient extend/refresh failures a few times before giving up, so a single
++		// blip (one 10s timeout, a 429/401) does not permanently stop extension and leave the
++		// session to expire (which stalls the stream). If it truly can't extend, the loop exits
++		// and the stall watchdog in pkg/webrtc reconnects.
++		fails := 0
++		for {
++			select {
++			case <-timer.C:
++				// The OAuth token lives ~1 hour, sessions can live longer
++				if time.Now().After(a.ExpiresAt.Add(-30 * time.Second)) {
++					if err := a.refreshToken(); err != nil {
++						if fails++; fails <= 3 {
++							timer.Reset(15 * time.Second)
++							continue
++						}
++						return
++					}
++				}
++				if err := a.ExtendStream(); err != nil {
++					if fails++; fails <= 3 {
++						timer.Reset(15 * time.Second)
++						continue
++					}
++					return
++				}
++				fails = 0
++				// Clamp so a zero/past/short expiresAt from Google can't hot-loop ExtendStream
++				// at HTTP-round-trip rate (which would 429 and kill the goroutine).
++				d := time.Until(a.StreamExpiresAt) - time.Minute
++				if d < 30*time.Second {
++					d = 30 * time.Second
++				}
++				timer.Reset(d)
++			case <-stop:
++				return
++			}
+ 		}
+ 	}()
+ }
+@@ -483,4 +519,8 @@ func (a *API) StopExtendStreamTimer() {
+ 		a.extendTimer.Stop()
+ 		a.extendTimer = nil
+ 	}
++	if a.extendStop != nil {
++		close(a.extendStop)
++		a.extendStop = nil
++	}
+ }
+diff --git a/pkg/nest/client.go b/pkg/nest/client.go
+index 6a57091..a38b25d 100644
+--- a/pkg/nest/client.go
++++ b/pkg/nest/client.go
+@@ -97,62 +97,59 @@ func (c *WebRTCClient) MarshalJSON() ([]byte, error) {
+ }
+ 
+ func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, error) {
+-	maxRetries := 3
+-	retryDelay := time.Second * 30
+-	var lastErr error
+-
+-	for attempt := 0; attempt < maxRetries; attempt++ {
+-		rtcAPI, err := webrtc.NewAPI()
+-		if err != nil {
+-			return nil, err
+-		}
+-
+-		conf := pion.Configuration{}
+-		pc, err := rtcAPI.NewPeerConnection(conf)
+-		if err != nil {
+-			return nil, err
+-		}
++	// Fix: use udp4-only to avoid ICE failure on hosts with broken/partial IPv6.
++	// Stock go2rtc uses webrtc.NewAPI() which passes nil filters, gathering on all
++	// network types (UDP4/UDP6/TCP4/TCP6). On hosts where IPv6 addresses exist but
++	// have no working route, pion gathers IPv6 candidates, Google's answer includes
++	// IPv6 candidates, and every ICE pair fails — no media ever flows.
++	// The webrtc: filters: YAML config handles this for the server API, but pkg/nest
++	// bypasses it entirely. See https://github.com/AlexxIT/go2rtc/issues/2311
++	//
++	// The proper upstream fix would plumb the parsed webrtc.Filters through to this
++	// function. This fork hardcodes udp4 as a working reference.
++	rtcAPI, err := webrtc.NewServerAPI("", "", &webrtc.Filters{Networks: []string{"udp4"}})
++	if err != nil {
++		return nil, err
++	}
+ 
+-		conn := webrtc.NewConn(pc)
+-		conn.FormatName = "nest/webrtc"
+-		conn.Mode = core.ModeActiveProducer
+-		conn.Protocol = "http"
+-		conn.URL = rawURL
+-
+-		// https://developers.google.com/nest/device-access/traits/device/camera-live-stream#generatewebrtcstream-request-fields
+-		medias := []*core.Media{
+-			{Kind: core.KindAudio, Direction: core.DirectionRecvonly},
+-			{Kind: core.KindVideo, Direction: core.DirectionRecvonly},
+-			{Kind: "app"}, // important for Nest
+-		}
++	conf := pion.Configuration{ICEServers: []pion.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}}
++	pc, err := rtcAPI.NewPeerConnection(conf)
++	if err != nil {
++		return nil, err
++	}
+ 
+-		// 3. Create offer with candidates
+-		offer, err := conn.CreateCompleteOffer(medias)
+-		if err != nil {
+-			return nil, err
+-		}
++	conn := webrtc.NewConn(pc)
++	conn.FormatName = "nest/webrtc"
++	conn.Mode = core.ModeActiveProducer
++	conn.Protocol = "http"
++	conn.URL = rawURL
++
++	// https://developers.google.com/nest/device-access/traits/device/camera-live-stream#generatewebrtcstream-request-fields
++	medias := []*core.Media{
++		{Kind: core.KindAudio, Direction: core.DirectionRecvonly},
++		{Kind: core.KindVideo, Direction: core.DirectionRecvonly},
++		{Kind: "app"}, // important for Nest
++	}
+ 
+-		// 4. Exchange SDP via Hass
+-		answer, err := nestAPI.ExchangeSDP(projectID, deviceID, offer)
+-		if err != nil {
+-			lastErr = err
+-			if attempt < maxRetries-1 {
+-				time.Sleep(retryDelay)
+-				retryDelay *= 2
+-				continue
+-			}
+-			return nil, err
+-		}
++	offer, err := conn.CreateCompleteOffer(medias)
++	if err != nil {
++		return nil, err
++	}
+ 
+-		// 5. Set answer with remote medias
+-		if err = conn.SetAnswer(answer); err != nil {
+-			return nil, err
+-		}
++	// Inner retry loop removed: FAILED_PRECONDITION ("camera not available") is
++	// deterministic — retrying 3x with 90s of sleep burned ~130 SDM calls/hr per
++	// off camera (over the 100/hr quota) and held the producer mutex, blocking
++	// consumers. Let producer.go's outer reconnect handle backoff instead.
++	answer, err := nestAPI.ExchangeSDP(projectID, deviceID, offer)
++	if err != nil {
++		return nil, err
++	}
+ 
+-		return &WebRTCClient{conn: conn, api: nestAPI}, nil
++	if err = conn.SetAnswer(answer); err != nil {
++		return nil, err
+ 	}
+ 
+-	return nil, lastErr
++	return &WebRTCClient{conn: conn, api: nestAPI}, nil
+ }
+ 
+ func rtspConn(nestAPI *API, rawURL, projectID, deviceID string) (*RTSPClient, error) {
+@@ -187,8 +184,10 @@ func (c *RTSPClient) Start() error {
+ }
+ 
+ func (c *RTSPClient) Stop() error {
+-	c.api.StopRTSPStream()
++	// Stop the extend goroutine first so it can't race StopRTSPStream on the shared
++	// StreamToken/StreamExtensionToken fields (or extend after stop).
+ 	c.api.StopExtendStreamTimer()
++	c.api.StopRTSPStream()
+ 	return c.conn.Stop()
+ }
+ 
+diff --git a/pkg/webrtc/conn.go b/pkg/webrtc/conn.go
+index 924fd55..5a27bae 100644
+--- a/pkg/webrtc/conn.go
++++ b/pkg/webrtc/conn.go
+@@ -1,12 +1,16 @@
+ package webrtc
+ 
+ import (
++	"encoding/base64"
++	"encoding/binary"
+ 	"encoding/json"
+ 	"fmt"
+ 	"strings"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/AlexxIT/go2rtc/pkg/h264"
+ 	"github.com/pion/rtcp"
+ 	"github.com/pion/rtp"
+ 	"github.com/pion/webrtc/v4"
+@@ -87,10 +91,17 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+ 			}
+ 		}
+ 
+-		if c.Mode == core.ModePassiveProducer && remote.Kind() == webrtc.RTPCodecTypeVideo {
++		// Patched: also request periodic keyframes for the Nest source (ModeActiveProducer,
++		// FormatName "nest/webrtc"). Upstream only does this for PassiveProducer (WHIP/browser
++		// push). Gating on FormatName (not the mode) avoids forcing 2s IDRs on other
++		// ActiveProducer WebRTC sources (ring/tuya battery cams etc.) where it'd be harmful.
++		// Keeps keyframes ~2s fresh so RTSP consumers (Homebridge live view) start fast.
++		if (c.Mode == core.ModePassiveProducer || c.FormatName == "nest/webrtc") && remote.Kind() == webrtc.RTPCodecTypeVideo {
+ 			go func() {
+ 				pkts := []rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())}}
+-				for range time.NewTicker(time.Second * 2).C {
++				t := time.NewTicker(time.Second * 2)
++				defer t.Stop()
++				for range t.C {
+ 					if err := pc.WriteRTCP(pkts); err != nil {
+ 						return
+ 					}
+@@ -98,6 +109,53 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+ 			}()
+ 		}
+ 
++		// Patched: capture SPS/PPS from the Nest H264 stream and append sprop-parameter-sets to
++		// the codec FmtpLine, so RTSP consumers (Homebridge live view via ffmpeg) learn video
++		// dimensions from the DESCRIBE SDP and start fast instead of waiting for an in-band
++		// keyframe + probe (~3.7s -> near-instant). Google's WebRTC SDP has profile-level-id but
++		// no sprop; SPS/PPS arrive in-band (usually bundled in a STAP-A). Upstream does the
++		// equivalent for H265 (pkg/dvrip). Gated on FormatName like the PLI patch above.
++		//
++		// Note (accepted race): FmtpLine is appended from this receive goroutine without a
++		// lock. In practice SPS/PPS are captured within the first few frames (the 2s PLI above
++		// forces an early keyframe), before any RTSP consumer's DESCRIBE clones the codec, so
++		// the write happens-before the read. A -race build could flag a consumer connecting
++		// during the sub-2s warm-up window; upstream's H265 append in pkg/dvrip is unguarded
++		// the same way. Codec.Match ignores FmtpLine, so this can't affect media matching.
++		// Left lock-free to mirror upstream; documented rather than hidden.
++		captureSprop := c.FormatName == "nest/webrtc" && codec.Name == core.CodecH264 &&
++			!strings.Contains(codec.FmtpLine, "sprop-parameter-sets=")
++		var spropSPS, spropPPS []byte
++
++		// Patched: stall watchdog for the Nest video track. An expired/quiet Nest WebRTC
++		// session stops delivering media WITHOUT erroring the connection, so producer.go never
++		// reconnects and the stream becomes a zombie (warm but frozen -> HomeKit live view and
++		// snapshots break). If no video RTP arrives for 15s while connected, close the
++		// connection to force a reconnect. With the 2s PLI above, healthy video is never quiet
++		// this long, so 15s is unambiguous.
++		isNestVideo := c.FormatName == "nest/webrtc" && remote.Kind() == webrtc.RTPCodecTypeVideo
++		var lastVideoNS atomic.Int64
++		if isNestVideo {
++			lastVideoNS.Store(time.Now().UnixNano())
++			stallDone := make(chan struct{})
++			defer close(stallDone)
++			go func() {
++				t := time.NewTicker(5 * time.Second)
++				defer t.Stop()
++				for {
++					select {
++					case <-t.C:
++						if time.Since(time.Unix(0, lastVideoNS.Load())) > 15*time.Second {
++							_ = c.Close() // unblocks remote.Read below -> producer reconnect
++							return
++						}
++					case <-stallDone:
++						return
++					}
++				}
++			}()
++		}
++
+ 		for {
+ 			b := make([]byte, ReceiveMTU)
+ 			n, _, err := remote.Read(b)
+@@ -106,6 +164,9 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+ 			}
+ 
+ 			c.Recv += n
++			if isNestVideo {
++				lastVideoNS.Store(time.Now().UnixNano())
++			}
+ 
+ 			packet := &rtp.Packet{}
+ 			if err := packet.Unmarshal(b[:n]); err != nil {
+@@ -116,6 +177,42 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+ 				continue
+ 			}
+ 
++			if captureSprop {
++				save := func(nal []byte) {
++					if len(nal) == 0 {
++						return
++					}
++					switch nal[0] & 0x1F {
++					case h264.NALUTypeSPS:
++						spropSPS = append([]byte(nil), nal...)
++					case h264.NALUTypePPS:
++						spropPPS = append([]byte(nil), nal...)
++					}
++				}
++				if pl := packet.Payload; pl[0]&0x1F == 24 { // STAP-A: bundled NALs
++					for bb := pl[1:]; len(bb) >= 2; {
++						sz := int(binary.BigEndian.Uint16(bb))
++						bb = bb[2:]
++						if sz < 1 || sz > len(bb) {
++							break
++						}
++						save(bb[:sz])
++						bb = bb[sz:]
++					}
++				} else {
++					save(pl)
++				}
++				if spropSPS != nil && spropPPS != nil {
++					if codec.FmtpLine != "" {
++						codec.FmtpLine += ";"
++					}
++					codec.FmtpLine += "sprop-parameter-sets=" +
++						base64.StdEncoding.EncodeToString(spropSPS) + "," +
++						base64.StdEncoding.EncodeToString(spropPPS)
++					captureSprop = false
++				}
++			}
++
+ 			track.WriteRTP(packet)
+ 		}
+ 	})
