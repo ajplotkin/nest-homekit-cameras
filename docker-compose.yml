@@ -1,0 +1,54 @@
+# docker-compose.yml — the go2rtc warm-stream + snapshot-warmer half of the stack.
+#
+# This covers everything EXCEPT Homebridge itself (you almost certainly already
+# run Homebridge some other way). See the note at the bottom for the one line you
+# must add to your Homebridge container.
+#
+# Before `docker compose up -d`:
+#   1. Build the patched go2rtc image (once):
+#        ./install.sh --rebuild --dry-run   # shows the build command, or just run install.sh
+#      or build it by hand — see the guide's "Build from this fork" (Part 3).
+#   2. Generate go2rtc.yaml from your Homebridge credentials:
+#        python3 scripts/nest-go2rtc-sync.py \
+#          --hb-config /path/to/homebridge/config.json --out ./go2rtc.yaml
+#   3. Create the snapshot dir (tmpfs recommended on SD-card systems — see the guide):
+#        sudo mkdir -p /run/nest-snaps
+#
+# Paths below assume ./go2rtc.yaml and /run/nest-snaps — adjust to taste.
+
+services:
+  go2rtc:
+    image: go2rtc-nestfix:1.9.14          # built from ajplotkin/go2rtc (see install.sh phase 1)
+    container_name: go2rtc
+    restart: unless-stopped
+    network_mode: host                    # Nest WebRTC ICE + the localhost API/RTSP need host net
+    volumes:
+      - ./go2rtc.yaml:/config/go2rtc.yaml:ro   # contains your OAuth secret — keep it chmod 600
+
+  warmer:
+    image: alpine:3.20
+    container_name: nest-snapshot-warmer
+    restart: unless-stopped
+    network_mode: host                    # so it reaches go2rtc at 127.0.0.1:1985
+    depends_on:
+      - go2rtc
+    volumes:
+      - /run/nest-snaps:/run/nest-snaps
+      - ./scripts/go2rtc-snapshot-warmer.sh:/warmer.sh:ro
+    # installs curl+python3 once per start, then runs the shipped warmer script
+    command: sh -c "apk add --no-cache bash curl python3 >/dev/null && exec bash /warmer.sh"
+
+# ---------------------------------------------------------------------------
+# YOUR HOMEBRIDGE CONTAINER must (a) mount the snapshot dir and (b) have the
+# plugin patched. Add this volume to however you run Homebridge, then restart it:
+#
+#   volumes:
+#     - /run/nest-snaps:/homebridge/nest-snaps
+#
+# and apply the plugin patches (after any npm install of the plugin):
+#
+#   HOMEBRIDGE_DIR=/path/to/homebridge ./scripts/apply-snapshot-patch.sh
+#
+# The plugin patch must run against the plugin's node_modules on disk, so it
+# can't be expressed as a compose service — run the script whenever you (re)install.
+# ---------------------------------------------------------------------------

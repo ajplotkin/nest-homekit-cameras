@@ -16,8 +16,10 @@ This guide walks through the full setup from scratch: getting API access to your
 ### What's in this repo
 
 - **This README** — the complete, from-scratch guide (start here and read top to bottom).
-- **[`scripts/`](scripts/)** — the three helper scripts the guide uses: `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), and `apply-snapshot-patch.sh` (re-applies the Homebridge plugin patches after any upgrade). They read all paths/credentials as arguments or env vars — nothing is hardcoded.
-- **[`patches/go2rtc-nest.patch`](patches/go2rtc-nest.patch)** — the go2rtc source changes as a single diff you can apply to a clean go2rtc **v1.9.14** checkout, if you'd rather patch upstream yourself than use the prebuilt fork.
+- **[`install.sh`](install.sh)** — one idempotent installer that does everything after you have Google credentials (build image, tmpfs, config, go2rtc, warmer service, plugin patches, verify). See [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
+- **[`docker-compose.yml`](docker-compose.yml)** — the go2rtc + warmer half of the stack as Compose services.
+- **[`scripts/`](scripts/)** — the three helper scripts: `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), and `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches). They take all paths/credentials as arguments or env vars — nothing is hardcoded.
+- **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout) and `homebridge-plugin/*.patch` (the three plugin changes as diffs against stock plugin 1.1.23).
 
 The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/fix/nest-ipv6-ice-failure)** (branch `fix/nest-ipv6-ice-failure`). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
 
@@ -38,6 +40,32 @@ There are four layers. Each builds on the last:
 If your Nest cameras are already in Apple HomeKit via Homebridge and you just want to fix the snapshot/tile-image problem, skip to [Part 3: go2rtc](#part-3-go2rtc--warm-streams-and-snapshots). You already have the credentials and the plugin — you just need the warm-stream layer and the patches.
 
 If you also want faster live stream startup (~2s instead of ~8s), check the `vEncoder: "copy"` and PR #212 notes in [Part 2](#part-2-homebridge-and-the-nest-plugin) first.
+
+## Quick start (automated) — if Parts 1 & 2 are already done
+
+The one thing that **cannot** be scripted is Google Device Access (Part 1) — creating the Cloud project, the OAuth consent screen, the $5 registration, and getting a refresh token is manual clicking through Google's consoles. Once you have those credentials in a working **Homebridge + homebridge-google-nest-sdm 1.1.23** install, the rest is one script.
+
+**Option A — `install.sh`** (does everything post-credentials: builds the patched go2rtc image, sets up the tmpfs, generates the config, starts go2rtc, installs the warmer service, and applies the plugin patches — all idempotent):
+
+```bash
+git clone https://github.com/ajplotkin/nest-homekit-snapshots.git
+cd nest-homekit-snapshots
+
+# see exactly what it will do first (changes nothing):
+./install.sh --dry-run --hb-config /path/to/homebridge/config.json \
+             --homebridge-dir /path/to/homebridge
+
+# then run it for real:
+./install.sh --hb-config /path/to/homebridge/config.json \
+             --homebridge-dir /path/to/homebridge \
+             --homebridge-container my-homebridge
+```
+
+Every path and container name is a flag with a sensible default (`./install.sh --help`). The **one** step it deliberately leaves to you — because how you run Homebridge is yours to own — is adding `-v /run/nest-snaps:/homebridge/nest-snaps` to your Homebridge container and restarting it. The script detects whether that mount exists and tells you the exact line if it's missing.
+
+**Option B — Docker Compose** ([`docker-compose.yml`](docker-compose.yml)) brings up the go2rtc + warmer half of the stack. You still build the image and generate `go2rtc.yaml` first (the file's header comments walk through it), add the one volume line to your Homebridge service, and run `./scripts/apply-snapshot-patch.sh`. Compose can't patch the plugin's `node_modules` for you, so that stays a script call.
+
+Either way, the detailed reference for **what** each piece does and **why** is the walkthrough below.
 
 ---
 
