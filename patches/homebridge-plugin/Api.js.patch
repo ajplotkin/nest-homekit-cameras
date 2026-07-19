@@ -1,0 +1,13 @@
+--- a/dist/sdm/Api.js
++++ b/dist/sdm/Api.js
+@@ -68,6 +68,10 @@
+                 // if ((event as Events.ResourceRelationEvent).relationUpdate) {
+                 //     const resourceRelationtEvent = event as Events.ResourceRelationEvent;
+                 // } else
++                if (!event || !event.resourceUpdate) {
++                    this.log.debug('Event without resourceUpdate (e.g. relationUpdate), ignoring: ' + message.data.toString());
++                    return;
++                }
+                 if (event.resourceUpdate.events) {
+                     const resourceEventEvent = event;
+                     const device = lodash_1.default.find(this.devices, device => device.getName() === resourceEventEvent.resourceUpdate.name);

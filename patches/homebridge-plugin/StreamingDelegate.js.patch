@@ -1,0 +1,93 @@
+--- a/dist/StreamingDelegate.js
++++ b/dist/StreamingDelegate.js
+@@ -193,16 +193,39 @@
+         const bitrate = request.video.max_bit_rate * 4;
+         const vEncoder = this.config.vEncoder || 'libx264 -preset ultrafast -tune zerolatency';
+         this.log.debug(`Video stream requested: ${request.video.width} x ${request.video.height}, ${request.video.fps} fps, ${request.video.max_bit_rate} kbps`, this.camera.getDisplayName());
+-        const nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera);
++        // PATCHED: prefer the local go2rtc warm RTSP stream. Avoids opening a SECOND
++        // concurrent Google WebRTC stream per camera (go2rtc's preload is the first) and
++        // skips the variable Google negotiation. Gated on a fresh snapshot (== stream warm);
++        // stale/missing -> fall back to the direct Google dial.
++        // NOTE: probe values MUST be large enough to catch SPS/PPS (video dimensions) before
++        // the copy-to-RTP output initializes -- low probesize -> "Could not write header".
+         let ffmpegArgs;
++        let nestStreamer;
+         let nestStream;
+-        try {
+-            nestStream = await nestStreamer.initialize(); // '-analyzeduration 15000000 -probesize 100000000 -i ' + streamInfo.streamUrls.rtspUrl;
+-            ffmpegArgs = nestStream.args;
++        const go2rtcKey = (this.camera.displayName || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
++        let useGo2rtc = false;
++        if (go2rtcKey) {
++            try {
++                const st = require('fs').statSync('/homebridge/nest-snaps/' + go2rtcKey + '.jpg');
++                if (Date.now() - st.mtimeMs < 90000)
++                    useGo2rtc = true;
++            }
++            catch (e) { }
+         }
+-        catch (error) {
+-            this.logThenCallback(callback, error);
+-            return;
++        if (useGo2rtc) {
++            this.log.debug('Using local go2rtc RTSP (warm stream) instead of a fresh Google dial', this.camera.getDisplayName());
++            ffmpegArgs = '-rtsp_transport tcp -analyzeduration 3000000 -probesize 5000000 -i rtsp://127.0.0.1:8554/' + go2rtcKey;
++        }
++        else {
++            nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera, this.config);
++            try {
++                nestStream = await nestStreamer.initialize();
++                ffmpegArgs = nestStream.args;
++            }
++            catch (error) {
++                this.logThenCallback(callback, error);
++                return;
++            }
+         }
+         ffmpegArgs += // Video
+             ' -an -sn -dn' +
+@@ -264,12 +287,23 @@
+                 }, request.video.rtcp_interval * 2 * 1000);
+             });
+             activeSession.socket.bind(sessionInfo.videoReturnPort, sessionInfo.localAddress);
++            // PATCHED: arm an initial inactivity watchdog at session start (15s grace, long
++            // enough for a slow RTSP open to produce its first RTCP). The go2rtc RTSP input
++            // never EOFs (preload keeps it warm), so without this an abandoned session (HomeKit
++            // vanishes before sending any RTCP) would orphan the ffmpeg transcode + RTSP consumer
++            // forever. The socket 'message' handler above replaces this with the normal
++            // rtcp_interval*2 timeout on the first RTCP.
++            activeSession.timeout = setTimeout(() => {
++                this.log.debug('No RTCP received; assuming abandoned session. Stopping stream.', this.camera.getDisplayName());
++                this.controller.forceStopStreamingSession(request.sessionID);
++                this.stopStream(request.sessionID);
++            }, 15000);
+         }
+         catch (error) {
+             this.logThenCallback(callback, error);
+             return;
+         }
+-        activeSession.mainProcess = new FfMpegProcess_1.FfmpegProcess(this.camera.getDisplayName(), request.sessionID, ffmpegArgs, nestStream.stdin, this.log, this.platform.debugMode, this, callback);
++        activeSession.mainProcess = new FfMpegProcess_1.FfmpegProcess(this.camera.getDisplayName(), request.sessionID, ffmpegArgs, nestStream ? nestStream.stdin : undefined, this.log, this.platform.debugMode, this, callback);
+         this.ongoingSessions[request.sessionID] = activeSession;
+         delete this.pendingSessions[request.sessionID];
+     }
+@@ -314,7 +348,8 @@
+                 this.log.error('Error occurred terminating two-way FFmpeg process: ' + err, this.camera.getDisplayName());
+             }
+             try {
+-                await session.streamer.teardown();
++                if (session.streamer)
++                    await session.streamer.teardown();
+             }
+             catch (err) {
+                 this.log.error('Error terminating SDM stream: ' + err, this.camera.getDisplayName());
+@@ -412,7 +447,7 @@
+                 "-ac", `${this.cameraRecordingConfiguration.audioCodec.audioChannels}`,
+             ]
+             : [];
+-        const nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera);
++        const nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera, this.config);
+         const nestStream = await nestStreamer.initialize();
+         const hksvStreamer = new HksvStreamer_1.default(this.log, nestStream, audioArgs, videoArgs, this.platform.debugMode);
+         this.recordingSessionInfo = {

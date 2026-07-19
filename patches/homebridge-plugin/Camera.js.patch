@@ -1,0 +1,45 @@
+--- a/dist/sdm/Camera.js
++++ b/dist/sdm/Camera.js
+@@ -43,6 +43,23 @@
+     async getSnapshot() {
+         if (this.image)
+             return this.image;
++        // PATCHED: serve the newest frame written by go2rtc-snapshot-warmer.service
++        // (file read ~1ms, no races, no HTTP 500s). Falls back to the logo below.
++        try {
++            const key = (this.displayName || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
++            const snapPath = '/homebridge/nest-snaps/' + key + '.jpg';
++            const st = await fs_1.default.promises.stat(snapPath);
++            if (Date.now() - st.mtimeMs > 90000) {
++                this.log.debug('snapshot too stale (' + Math.round((Date.now() - st.mtimeMs)/1000) + 's), using logo', this.getDisplayName());
++            } else {
++                const buf = await fs_1.default.promises.readFile(snapPath);
++                if (buf && buf.length > 1000)
++                    return buf;
++            }
++        }
++        catch (e) {
++            this.log.debug('no warm snapshot on disk, using logo: ' + e, this.getDisplayName());
++        }
+         //Nest cams do not have any method to get a current snapshot,
+         //starting streams up just to retrieve one is slow and will cause
+         //the SDM API to hit a rate limit of creating too many streams
+@@ -139,13 +156,17 @@
+                     this.getVideoProtocol()
+                         .then(protocol => {
+                         if (protocol === Traits.ProtocolType.WEB_RTC) {
++                            // Signal the warmer to grab a fresh frame NOW
++                            try { fs_1.default.closeSync(fs_1.default.openSync('/homebridge/nest-snaps/.refresh', 'w')); } catch(e) {}
+                             if (this.onMotion)
+                                 this.onMotion();
+                         }
+                         else {
+                             this.getEventImage(value.eventId, new Date(event.timestamp))
+                                 .then(() => {
+-                                if (this.onMotion)
++                                // Signal the warmer to grab a fresh frame NOW
++                            try { fs_1.default.closeSync(fs_1.default.openSync('/homebridge/nest-snaps/.refresh', 'w')); } catch(e) {}
++                            if (this.onMotion)
+                                     this.onMotion();
+                             });
+                         }

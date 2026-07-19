@@ -1,52 +1,69 @@
 #!/bin/bash
-# Re-applies all homebridge-google-nest-sdm patches. MUST run after any npm install
-# of the plugin (npm wipes node_modules; the backup tar excludes node_modules too).
+# Re-applies the homebridge-google-nest-sdm plugin patches after any `npm install`
+# of the plugin (npm wipes node_modules, taking the patches with it).
 #
-# Patches (all whole-file copies from patches/):
-#   Camera.js            -> getSnapshot() reads /homebridge/nest-snaps/<key>.jpg; event() touches .refresh
-#   Api.js               -> pubsub handler guard (relationUpdate events with no resourceUpdate)
-#   StreamingDelegate.js -> live streams via go2rtc RTSP + initial inactivity watchdog
+# It applies the unified diffs in ../patches/homebridge-plugin/ to your installed
+# plugin. Each patch is idempotent (skipped if already present) and the script exits
+# NON-ZERO and loudly if anything is missing or does not apply — so a re-apply can
+# never silently leave you unpatched.
 #
-# The .patched files were cut from plugin version below. A plugin UPGRADE moves internals;
-# blindly pasting old files over a new version can revert upstream fixes or break. So we
-# ABORT on version mismatch and require re-cutting the patches against the new version.
+# Override any path via env vars:
+#   HOMEBRIDGE_DIR=/path/to/homebridge \
+#   HOMEBRIDGE_CONTAINER=my-homebridge \
+#   ./apply-snapshot-patch.sh
 set -uo pipefail
-# Point HOMEBRIDGE_DIR at your Homebridge data directory (the one holding node_modules/
-# and where you keep this patches/ folder). Override any of these via env vars:
-#   HOMEBRIDGE_DIR=/path/to/homebridge PATCH_DIR=/path/to/patches ./apply-snapshot-patch.sh
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PATCH_DIR="${PATCH_DIR:-$SCRIPT_DIR/../patches/homebridge-plugin}"
 HOMEBRIDGE_DIR="${HOMEBRIDGE_DIR:-$HOME/homebridge}"
 PLUGIN="${PLUGIN:-$HOMEBRIDGE_DIR/node_modules/homebridge-google-nest-sdm}"
-D="${PATCH_DIR:-$HOMEBRIDGE_DIR/patches}"
 CONTAINER="${HOMEBRIDGE_CONTAINER:-homebridge}"
 EXPECT_VER="1.1.23"
 
-[ -d "$PLUGIN" ] || { echo "plugin not installed"; exit 1; }
-CUR_VER=$(python3 -c "import json;print(json.load(open('$PLUGIN/package.json'))['version'])")
+[ -d "$PLUGIN" ] || { echo "ERROR: plugin not found at $PLUGIN (set HOMEBRIDGE_DIR)"; exit 1; }
+[ -d "$PATCH_DIR" ] || { echo "ERROR: patch dir not found at $PATCH_DIR"; exit 1; }
+
+CUR_VER=$(node -e "console.log(require('$PLUGIN/package.json').version)" 2>/dev/null)
 if [ "$CUR_VER" != "$EXPECT_VER" ]; then
-  echo "REFUSING: plugin is $CUR_VER but patches were cut from $EXPECT_VER."
-  echo "Re-cut the patches against $CUR_VER before re-applying (internals may have moved)."
+  echo "REFUSING: plugin is '$CUR_VER' but these patches were cut from $EXPECT_VER."
+  echo "The compiled dist/ layout moves between releases — re-cut the diffs against"
+  echo "$CUR_VER before applying (see the guide), or pin the plugin to $EXPECT_VER."
   exit 1
 fi
 
-stamp=$(date +%Y%m%d-%H%M%S)
+# patchfile | dist-relative target | sentinel string proving it's already applied
+patches=(
+  "Camera.js.patch|dist/sdm/Camera.js|nest-snaps"
+  "Api.js.patch|dist/sdm/Api.js|relationUpdate), ignoring"
+  "StreamingDelegate.js.patch|dist/StreamingDelegate.js|go2rtcKey"
+)
+
 applied=0
-apply_one() {  # $1=dist-relative path  $2=sentinel  $3=patched-filename
-  local f="$PLUGIN/$1" sentinel="$2" src="$D/$3"
-  [ -f "$f" ] || { echo "  MISSING: $1 (skipped)"; return; }
-  [ -f "$src" ] || { echo "  NO PATCH FILE: $3 (skipped)"; return; }
-  if grep -q "$sentinel" "$f"; then echo "  ok: $1 already patched"; return; fi
-  cp "$f" "$f.bak-$stamp" || { echo "  BACKUP FAILED: $1 (skipped)"; return; }
-  cp "$src" "$f" || { echo "  COPY FAILED: $1 — restoring backup"; cp "$f.bak-$stamp" "$f"; return; }
-  echo "  PATCHED: $1"
-  applied=1
-}
+failed=0
+for entry in "${patches[@]}"; do
+  IFS='|' read -r pf target sentinel <<<"$entry"
+  patchfile="$PATCH_DIR/$pf"
+  tgt="$PLUGIN/$target"
+  [ -f "$patchfile" ] || { echo "  ERROR: missing patch file $patchfile"; failed=1; continue; }
+  [ -f "$tgt" ]       || { echo "  ERROR: target not found: $target"; failed=1; continue; }
+  if grep -qF "$sentinel" "$tgt"; then
+    echo "  ok: $target already patched"
+    continue
+  fi
+  if patch -p1 -d "$PLUGIN" --dry-run <"$patchfile" >/dev/null 2>&1; then
+    patch -p1 -d "$PLUGIN" <"$patchfile" >/dev/null && { echo "  PATCHED: $target"; applied=1; }
+  else
+    echo "  ERROR: $pf does not apply cleanly to $target (wrong plugin version, or already edited?)"
+    failed=1
+  fi
+done
 
-apply_one "dist/sdm/Camera.js"          "nest-snaps"              "Camera.js.patched"
-apply_one "dist/sdm/Api.js"             "relationUpdate), ignoring" "Api.js.patched"
-apply_one "dist/StreamingDelegate.js"   "go2rtcKey"               "StreamingDelegate.js.patched"
-
+if [ "$failed" = 1 ]; then
+  echo "FAILED: one or more patches did not apply — the plugin is NOT fully patched."
+  exit 1
+fi
 if [ "$applied" = 1 ]; then
-  echo "Done. Restart: docker restart $CONTAINER"
+  echo "Done. Restart Homebridge:  docker restart $CONTAINER"
 else
-  echo "Nothing to do (all patched)."
+  echo "All patches already present; nothing to do."
 fi
