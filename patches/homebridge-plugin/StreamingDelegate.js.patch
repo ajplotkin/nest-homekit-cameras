@@ -83,7 +83,17 @@
              }
              catch (err) {
                  this.log.error('Error terminating SDM stream: ' + err, this.camera.getDisplayName());
-@@ -412,8 +447,27 @@
+@@ -327,7 +362,8 @@
+         var _a, _b;
+         if ((_a = this.recordingSessionInfo) === null || _a === void 0 ? void 0 : _a.hksvStreamer) {
+             (_b = this.recordingSessionInfo) === null || _b === void 0 ? void 0 : _b.hksvStreamer.destroy();
+-            this.recordingSessionInfo.nestStreamer.teardown();
++            if (this.recordingSessionInfo.nestStreamer)
++                this.recordingSessionInfo.nestStreamer.teardown();
+             this.recordingSessionInfo = undefined;
+         }
+         this.handlingRecordingStreamingRequest = false;
+@@ -412,9 +448,34 @@
                  "-ac", `${this.cameraRecordingConfiguration.audioCodec.audioChannels}`,
              ]
              : [];
@@ -111,5 +121,12 @@
 +            nestStream = await nestStreamer.initialize();
 +        }
          const hksvStreamer = new HksvStreamer_1.default(this.log, nestStream, audioArgs, videoArgs, this.platform.debugMode);
++        // PATCHED: clean up any prior session before overwriting it. The go2rtc RTSP input
++        // never EOFs, so a clobbered session's transcode would otherwise run forever (#150).
++        if (this.recordingSessionInfo) {
++            try { if (this.recordingSessionInfo.hksvStreamer) this.recordingSessionInfo.hksvStreamer.destroy(); } catch (e) {}
++            try { if (this.recordingSessionInfo.nestStreamer) this.recordingSessionInfo.nestStreamer.teardown(); } catch (e) {}
++        }
          this.recordingSessionInfo = {
              hksvStreamer: hksvStreamer,
+             nestStreamer: nestStreamer

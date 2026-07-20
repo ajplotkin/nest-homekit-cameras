@@ -457,6 +457,8 @@ By default, when motion fires, the plugin's recording handler (`handleRecordingS
 
 Routing recording through the warm RTSP stream instead (same check → `rtsp://127.0.0.1:8554/<key>`, else fall back to a Google dial) eliminates all of it: no second session, no contention, no reconnect burst, and the transcode runs against a clean, already-established stream. Measured before/after on a Pi 4: decode errors dropped from **thousands per recording to ~zero**, and recording-induced reconnect spikes went to **none**. `HksvStreamer.js` already accepts an RTSP input (no stdin pipe needed), so the only change is at the streamer-creation point in `handleRecordingStreamRequest`. It ships in the same `StreamingDelegate.js.patch`.
 
+The patch also carries two teardown guards the RTSP path needs (found in adversarial review): `closeRecordingStream` must **guard `nestStreamer.teardown()`** (on the RTSP path there's no streamer object — the unguarded call throws on every recording close, harmless only because hap-nodejs catches it), and `handleRecordingStreamRequest` must **destroy any prior session before overwriting `recordingSessionInfo`**. That second one matters *more* on the go2rtc path than on stock: a Google WebRTC input self-expires after 5 minutes, but the warm RTSP input never EOFs, so a clobbered session's transcode would otherwise run **forever** (the exact shape of plugin issue #150). Both are in the patch.
+
 ## Reference
 
 ### SDM API Quotas
