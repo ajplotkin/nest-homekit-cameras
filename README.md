@@ -9,6 +9,7 @@ This guide walks through the full setup from scratch: getting API access to your
 - **Real camera images on your HomeKit tiles** — refreshed every 10 seconds, and instantly on motion or doorbell events (so the tile shows *who's there*, not a stale frame)
 - **~2 second live stream startup** — down from ~8 seconds stock
 - **Motion and doorbell event notifications** in Apple Home
+- **HomeKit Secure Video recording** — motion-triggered clips saved to iCloud also work through this setup (confirmed on a Pi 4; the software H.264 encode keeps up, so no hardware encoder is needed). Requires iCloud+ and a Home Hub, like any HKSV camera.
 - **Automatic camera discovery** — new cameras appear without editing config files
 
 **Everything here is open source and runs on a Raspberry Pi.**
@@ -482,6 +483,7 @@ A camera that's **switched off** costs a little more than an active one: the for
 - [homebridge-google-nest-sdm #214](https://github.com/potmat/homebridge-google-nest-sdm/issues/214) — Api.js crash on `relationUpdate` events
 - [homebridge-google-nest-sdm #215](https://github.com/potmat/homebridge-google-nest-sdm/issues/215) — README corrections (project ID confusion, self-hosted Pub/Sub, Node regression)
 - [homebridge-google-nest-sdm PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) — stream startup latency fix by [@littlepope81](https://github.com/littlepope81)
+- [homebridge-google-nest-sdm PR #216](https://github.com/potmat/homebridge-google-nest-sdm/pull/216) — the Pub/Sub auto-reconnect fix from this repo, submitted upstream (events silently stopping after a connection drop)
 
 **Upstream go2rtc work this fork builds on (credit to the authors):**
 
