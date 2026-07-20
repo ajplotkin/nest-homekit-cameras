@@ -1,6 +1,6 @@
 --- a/dist/StreamingDelegate.js
 +++ b/dist/StreamingDelegate.js
-@@ -193,16 +193,39 @@
+@@ -193,17 +193,40 @@
          const bitrate = request.video.max_bit_rate * 4;
          const vEncoder = this.config.vEncoder || 'libx264 -preset ultrafast -tune zerolatency';
          this.log.debug(`Video stream requested: ${request.video.width} x ${request.video.height}, ${request.video.fps} fps, ${request.video.max_bit_rate} kbps`, this.camera.getDisplayName());
@@ -33,7 +33,7 @@
 +        if (useGo2rtc) {
 +            this.log.debug('Using local go2rtc RTSP (warm stream) instead of a fresh Google dial', this.camera.getDisplayName());
 +            ffmpegArgs = '-rtsp_transport tcp -analyzeduration 3000000 -probesize 5000000 -i rtsp://127.0.0.1:8554/' + go2rtcKey;
-+        }
+         }
 +        else {
 +            nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera, this.config);
 +            try {
@@ -44,9 +44,10 @@
 +                this.logThenCallback(callback, error);
 +                return;
 +            }
-         }
++        }
          ffmpegArgs += // Video
              ' -an -sn -dn' +
+                 ` -codec:v ${vEncoder}` +
 @@ -264,12 +287,23 @@
                  }, request.video.rtcp_interval * 2 * 1000);
              });
@@ -82,12 +83,33 @@
              }
              catch (err) {
                  this.log.error('Error terminating SDM stream: ' + err, this.camera.getDisplayName());
-@@ -412,7 +447,7 @@
+@@ -412,8 +447,27 @@
                  "-ac", `${this.cameraRecordingConfiguration.audioCodec.audioChannels}`,
              ]
              : [];
 -        const nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera);
-+        const nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera, this.config);
-         const nestStream = await nestStreamer.initialize();
+-        const nestStream = await nestStreamer.initialize();
++        // PATCHED: prefer local go2rtc warm RTSP for HKSV recording — same pattern as
++        // startStream. Avoids opening a SECOND concurrent Google WebRTC session, which
++        // exhausts Google's per-device stream limit and causes RECONNECT-SPIKEs.
++        const go2rtcKeyRec = (this.camera.displayName || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
++        let nestStreamer;
++        let nestStream;
++        let useGo2rtcRec = false;
++        if (go2rtcKeyRec) {
++            try {
++                const st = require("fs").statSync("/homebridge/nest-snaps/" + go2rtcKeyRec + ".jpg");
++                if (Date.now() - st.mtimeMs < 90000) useGo2rtcRec = true;
++            } catch (e) {}
++        }
++        if (useGo2rtcRec) {
++            this.log.debug("HKSV recording: using local go2rtc RTSP (warm stream)", this.camera.getDisplayName());
++            nestStream = { args: "-rtsp_transport tcp -analyzeduration 3000000 -probesize 5000000 -i rtsp://127.0.0.1:8554/" + go2rtcKeyRec, stdin: undefined };
++        } else {
++            this.log.debug("HKSV recording: falling back to direct Google WebRTC dial", this.camera.getDisplayName());
++            nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera, this.config);
++            nestStream = await nestStreamer.initialize();
++        }
          const hksvStreamer = new HksvStreamer_1.default(this.log, nestStream, audioArgs, videoArgs, this.platform.debugMode);
          this.recordingSessionInfo = {
+             hksvStreamer: hksvStreamer,

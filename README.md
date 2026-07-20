@@ -357,7 +357,7 @@ What the patches do:
 
 - **`Camera.js`** — `getSnapshot()` returns the warm JPEG from `/homebridge/nest-snaps/<key>.jpg` instead of the Google logo, falling back to the logo if the file is missing or older than 90 seconds (so an off camera shows the honest placeholder). And on a motion/person event it creates `/homebridge/nest-snaps/.refresh` (via the plugin's `fs`, no subshell) to trigger an immediate warm-frame grab. The `<key>` is the slugified SDM room name — **identical** to the sync script's derivation, which is how the plugin finds the file the warmer wrote.
 - **`Api.js`** — two robustness fixes to the Pub/Sub event subscription: (a) guards the handler against `relationUpdate` events with no `resourceUpdate` (an upstream crash; [issue #214](https://github.com/potmat/homebridge-google-nest-sdm/issues/214)); and (b) **auto-reconnects the subscription**. Upstream sets it up once and, on error, just stops — so a silently dropped streaming-pull connection permanently kills all camera events (no motion alerts, no HKSV recording) until you restart Homebridge. This re-subscribes on `error`/`close` with backoff, plus a 12-hour proactive recycle to catch half-open stalls. (Submitted upstream — see the PRs section.)
-- **`StreamingDelegate.js`** — *(optional, Part 6)* routes HomeKit live view through go2rtc's warm RTSP stream.
+- **`StreamingDelegate.js`** — *(optional, Part 6)* routes HomeKit live view **and HKSV recording** through go2rtc's warm RTSP stream, so neither opens a second Google session (fixes recording-time stream contention and corrupt clips).
 
 Clone this repo (you'll want it for the scripts too) and run the patcher:
 
@@ -448,6 +448,14 @@ activeSession.timeout = setTimeout(() => {
 This `StreamingDelegate.js` change ships as [`patches/homebridge-plugin/StreamingDelegate.js.patch`](patches/homebridge-plugin/StreamingDelegate.js.patch) and is applied by the same `apply-snapshot-patch.sh` — like the others, it's wiped by any `npm install` and must be re-applied.
 
 > **Requires Homebridge on the host network.** The live-view patch dials `rtsp://127.0.0.1:8554` from *inside* the Homebridge container, so `127.0.0.1` has to be the same host go2rtc listens on. Run the Homebridge container with `--network host` (as go2rtc does). If Homebridge is on Docker's default bridge network instead, `127.0.0.1` points at the container itself and the live-view dial fails — use the host's LAN IP, or move Homebridge to `--network host`. The **snapshot** path doesn't care (it's a file bind-mount), so this only affects Part 6.
+
+### HKSV recording rides the warm stream too — and this matters more than live view
+
+The same `StreamingDelegate.js` patch routes **HomeKit Secure Video recording** through the warm RTSP stream as well, using the identical freshness check. This is the bigger win.
+
+By default, when motion fires, the plugin's recording handler (`handleRecordingStreamRequest`) opens **yet another** fresh Google WebRTC session — a *second* concurrent stream for that camera (a *third* if you're also viewing live). That tips Nest over its per-device concurrent-stream limit, and every recording triggers an ugly cascade: the second dial contends with go2rtc's warm stream → go2rtc's stream gets throttled/dropped → it reconnects (a burst of `retry=` in the go2rtc log) → and the recording itself decodes garbage (`concealing 3721 DC/AC/MV errors in I frame`, corrupt frames) because it started against a contended, half-broken stream. The system "self-heals" a minute later, but the clip is ruined.
+
+Routing recording through the warm RTSP stream instead (same check → `rtsp://127.0.0.1:8554/<key>`, else fall back to a Google dial) eliminates all of it: no second session, no contention, no reconnect burst, and the transcode runs against a clean, already-established stream. Measured before/after on a Pi 4: decode errors dropped from **thousands per recording to ~zero**, and recording-induced reconnect spikes went to **none**. `HksvStreamer.js` already accepts an RTSP input (no stdin pipe needed), so the only change is at the streamer-creation point in `handleRecordingStreamRequest`. It ships in the same `StreamingDelegate.js.patch`.
 
 ## Reference
 
