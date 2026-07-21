@@ -147,3 +147,16 @@
              hksvStreamer: hksvStreamer,
              nestStreamer: nestStreamer
          };
+@@ -447,6 +522,12 @@
+         catch (error) {
+             this.log.error("Encountered unexpected error on generator " + error.stack);
+         }
++        finally {
++            // Clear the session even if the controller never calls closeRecordingStream (e.g. the
++            // generator threw and HAP moved on): otherwise handlingRecordingStreamingRequest stays
++            // true and blocks all future recordings. closeRecordingStream is idempotent.
++            this.closeRecordingStream(streamId, undefined);
++        }
+     }
+     updateRecordingActive(active) {
+         // we haven't implemented a prebuffer
