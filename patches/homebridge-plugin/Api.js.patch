@@ -1,15 +1,85 @@
 --- a/dist/sdm/Api.js
 +++ b/dist/sdm/Api.js
-@@ -58,33 +58,97 @@
+@@ -34,6 +34,8 @@
+ class SmartDeviceManagement {
+     constructor(config, log) {
+         this.subscribed = true;
++        this.reconnectDelay = SmartDeviceManagement.RECONNECT_MIN_MS;
++        this.consecFails = 0; // consecutive setup/reconnect failures, reset on healthy traffic; throttles the warn
+         this.log = log;
+         this.oauth2Client = new google.Auth.OAuth2Client(config.clientId, config.clientSecret);
+         this.projectId = config.projectId;
+@@ -58,37 +60,118 @@
                      refresh_token: config.refreshToken
                  }
              });
 -            this.subscription = this.pubSubClient.subscription(config.subscriptionId);
 -            this.subscription.on('message', message => {
--                message.ack();
--                if (!this.devices)
--                    return;
--                this.log.debug('Event received: ' + message.data.toString());
++            this.subscribeToEvents(config.subscriptionId);
++        }
++        catch (error) {
++            this.log.error("Plugin initialization failed, there was a failure with event subscription. Did you read the readme: https://github.com/potmat/homebridge-google-nest-sdm#where-do-the-config-values-come-from", error);
++            this.subscribed = false;
++        }
++    }
++    /**
++     * Subscribe to the Pub/Sub event stream, re-subscribing on error/close.
++     *
++     * The streaming-pull connection can drop silently — a half-open stream surfaces as a 'close'
++     * with no 'error'. Upstream created the subscription once and, on error, only logged and set
++     * subscribed=false (never handling 'close'), so a dropped connection permanently stopped all
++     * camera events until Homebridge was restarted. Here we re-subscribe with exponential backoff
++     * (reset on healthy traffic) plus a proactive recycle to catch half-open stalls. The whole
++     * body is wrapped so a synchronous throw on a reconnect timer reschedules instead of crashing.
++     */
++    subscribeToEvents(subscriptionId) {
++        try {
++            const sub = this.pubSubClient.subscription(subscriptionId);
++            this.subscription = sub;
++            this.subscribed = true;
++            let reconnectScheduled = false;
++            const reconnect = (reason, error) => {
++                var _a, _b;
++                if (reconnectScheduled)
++                    return;
++                reconnectScheduled = true;
++                this.subscribed = false;
++                clearTimeout(this.recycleTimer);
++                // A deliberate 12h recycle is healthy, not a failure: use a short fixed gap and do
++                // NOT ratchet the backoff or the failure counter. Otherwise an idle camera's recycle
++                // gap would grow past the 30s event-freshness window and silently drop events that
++                // Pub/Sub redelivers on re-subscribe.
++                const recycle = reason === 'periodic recycle';
++                const delay = recycle ? SmartDeviceManagement.RECYCLE_DELAY_MS : this.reconnectDelay;
++                if (!recycle) {
++                    this.consecFails++;
++                    if (this.consecFails <= 5 || this.consecFails % 12 === 0) {
++                        // A NOT_FOUND / PERMISSION_DENIED won't self-heal — point at the readme once.
++                        const fatal = /NOT_FOUND|PERMISSION_DENIED|not found|permission/i.test(String((_b = (_a = error === null || error === void 0 ? void 0 : error.message) !== null && _a !== void 0 ? _a : error) !== null && _b !== void 0 ? _b : ''));
++                        this.log.warn(fatal
++                            ? `Nest event subscription ${reason} — this looks like a bad subscription id or revoked access; check the readme: https://github.com/potmat/homebridge-google-nest-sdm#where-do-the-config-values-come-from (retrying in ${delay / 1000}s)`
++                            : `Nest event subscription ${reason}; reconnecting in ${delay / 1000}s`, error !== null && error !== void 0 ? error : '');
++                    }
++                }
++                // close() first: it flips isOpen synchronously and returns a promise that can reject
++                // during an outage (ack-flush RPC failure) — an unhandled rejection would crash the
++                // process on Node >= 15. Then drop listeners; absorb any late 'error' forwarded from
++                // the subscriber during in-flight gRPC teardown.
++                Promise.resolve(sub.close()).catch(() => { });
++                sub.removeAllListeners();
++                sub.on('error', () => { });
++                setTimeout(() => this.subscribeToEvents(subscriptionId), delay);
++                if (!recycle)
++                    this.reconnectDelay = Math.min(this.reconnectDelay * 2, SmartDeviceManagement.RECONNECT_MAX_MS);
++            };
++            sub.on('message', message => {
++                var _a;
+                 message.ack();
++                this.reconnectDelay = SmartDeviceManagement.RECONNECT_MIN_MS; // healthy traffic resets backoff
++                this.consecFails = 0;
+                 if (!this.devices)
+                     return;
+                 this.log.debug('Event received: ' + message.data.toString());
 -                const event = JSON.parse(message.data);
 -                // if ((event as Events.ResourceRelationEvent).relationUpdate) {
 -                //     const resourceRelationtEvent = event as Events.ResourceRelationEvent;
@@ -19,108 +89,73 @@
 -                    const device = lodash_1.default.find(this.devices, device => device.getName() === resourceEventEvent.resourceUpdate.name);
 -                    if (device)
 -                        device.event(resourceEventEvent);
--                }
--                else if (event.resourceUpdate.traits) {
--                    const resourceTraitEvent = event;
--                    const device = lodash_1.default.find(this.devices, device => device.getName() === resourceTraitEvent.resourceUpdate.name);
--                    if (device)
--                        device.event(resourceTraitEvent);
--                }
--            });
--            this.subscription.on('error', error => {
--                this.log.error("Plugin initialization failed, there was a failure with event subscription. Did you read the readme: https://github.com/potmat/homebridge-google-nest-sdm#where-do-the-config-values-come-from", error);
-+            // Patched: auto-reconnect the Pub/Sub event subscription. Upstream sets up the
-+            // subscription once and, on 'error', only logs and sets subscribed=false with no
-+            // reconnect (and never handles 'close') — so a silently dropped streaming-pull
-+            // connection permanently stops ALL camera events (no motion alerts, no HKSV
-+            // recording triggers) until Homebridge is restarted. Here we re-subscribe on
-+            // 'error'/'close' with exponential backoff (5s..60s), reset on healthy traffic.
-+            this._nestReconnectDelay = 5000;
-+            this._nestSubscribe = () => {
-+              try {
-+                // Capture the subscription in a closure local; tear THIS one down on reconnect
-+                // (not this.subscription, which a future path could have already replaced).
-+                const sub = this.pubSubClient.subscription(config.subscriptionId);
-+                this.subscription = sub;
-+                this.subscribed = true;
-+                let reconnectScheduled = false;
-+                const reconnect = (reason, error) => {
-+                    if (reconnectScheduled)
-+                        return;
-+                    reconnectScheduled = true;
-+                    this.subscribed = false;
-+                    clearTimeout(this._nestRecycleTimer);
-+                    this._nestConsecFails = (this._nestConsecFails || 0) + 1;
-+                    if (this._nestConsecFails <= 5 || this._nestConsecFails % 12 === 0)
-+                        this.log.warn('Nest event subscription ' + reason + '; reconnecting in ' + (this._nestReconnectDelay / 1000) + 's', error || '');
-+                    // close() FIRST (it flips isOpen synchronously and returns a promise that can
-+                    // REJECT during the outage — ack-flush RPC failure — which would otherwise be an
-+                    // unhandled rejection and crash the process on Node >=15). Then drop listeners;
-+                    // the internal removeListener hook's close() is now a no-op. Finally absorb any
-+                    // late 'error' forwarded from the subscriber during in-flight gRPC teardown.
-+                    Promise.resolve(sub.close()).catch(() => { });
-+                    sub.removeAllListeners();
-+                    sub.on('error', () => { });
-+                    setTimeout(() => this._nestSubscribe(), this._nestReconnectDelay);
-+                    this._nestReconnectDelay = Math.min(this._nestReconnectDelay * 2, 60000);
-+                };
-+                sub.on('message', message => {
-+                    message.ack();
-+                    this._nestReconnectDelay = 5000;
-+                    this._nestConsecFails = 0;
-+                    if (!this.devices)
-+                        return;
-+                    this.log.debug('Event received: ' + message.data.toString());
-+                    let event;
-+                    try {
-+                        event = JSON.parse(message.data);
-+                    }
-+                    catch (e) {
-+                        this.log.debug('Event with unparseable data, ignoring');
++                // The payload is external input we do not control, so no single malformed message
++                // may take down the bridge; relationUpdate events carry no resourceUpdate.
++                try {
++                    const event = JSON.parse(message.data);
++                    const resourceUpdate = event.resourceUpdate;
++                    if (!resourceUpdate) {
++                        this.log.debug(event.relationUpdate
++                            ? 'Ignoring relation update event.'
++                            : 'Ignoring event with no resourceUpdate.');
 +                        return;
 +                    }
-+                    if (!event || !event.resourceUpdate) {
-+                        this.log.debug('Event without resourceUpdate (e.g. relationUpdate), ignoring: ' + message.data.toString());
-+                        return;
-+                    }
-+                    if (event.resourceUpdate.events) {
++                    if (resourceUpdate.events) {
 +                        const resourceEventEvent = event;
 +                        const device = lodash_1.default.find(this.devices, device => device.getName() === resourceEventEvent.resourceUpdate.name);
 +                        if (device)
 +                            device.event(resourceEventEvent);
 +                    }
-+                    else if (event.resourceUpdate.traits) {
++                    else if (resourceUpdate.traits) {
 +                        const resourceTraitEvent = event;
 +                        const device = lodash_1.default.find(this.devices, device => device.getName() === resourceTraitEvent.resourceUpdate.name);
 +                        if (device)
 +                            device.event(resourceTraitEvent);
 +                    }
-+                });
-+                sub.on('error', error => reconnect('error', error));
-+                sub.on('close', () => reconnect('closed'));
-+                // Proactive recycle: a half-open connection can silently stall without ever
-+                // emitting 'error' or 'close' (neither handler above would fire). Recreate the
-+                // subscription every 12h as a backstop. Pub/Sub re-delivers anything published
-+                // during the ~1s gap, so no events are lost.
-+                clearTimeout(this._nestRecycleTimer);
-+                this._nestRecycleTimer = setTimeout(() => reconnect('periodic recycle'), 12 * 60 * 60 * 1000);
-+                this.log.debug('Nest event subscription established');
-+              }
-+              catch (error) {
-+                // Creating the subscription can throw synchronously (bad pubSubClient/auth state
-+                // after an outage). On a reconnect this runs from a bare setTimeout with no handler
-+                // above, so an unhandled throw would crash the process on the very reconnect meant
-+                // to self-heal. Log (throttled) and reschedule instead of rethrowing.
-                 this.subscribed = false;
+                 }
+-                else if (event.resourceUpdate.traits) {
+-                    const resourceTraitEvent = event;
+-                    const device = lodash_1.default.find(this.devices, device => device.getName() === resourceTraitEvent.resourceUpdate.name);
+-                    if (device)
+-                        device.event(resourceTraitEvent);
++                catch (error) {
++                    this.log.error('Could not handle event: ', (_a = error === null || error === void 0 ? void 0 : error.message) !== null && _a !== void 0 ? _a : error);
+                 }
+             });
+-            this.subscription.on('error', error => {
+-                this.log.error("Plugin initialization failed, there was a failure with event subscription. Did you read the readme: https://github.com/potmat/homebridge-google-nest-sdm#where-do-the-config-values-come-from", error);
+-                this.subscribed = false;
 -            });
-+                this._nestConsecFails = (this._nestConsecFails || 0) + 1;
-+                if (this._nestConsecFails <= 5 || this._nestConsecFails % 12 === 0)
-+                    this.log.warn('Nest event subscription setup failed; retrying in ' + (this._nestReconnectDelay / 1000) + 's', error);
-+                setTimeout(() => this._nestSubscribe(), this._nestReconnectDelay);
-+                this._nestReconnectDelay = Math.min(this._nestReconnectDelay * 2, 60000);
-+              }
-+            };
-+            this._nestSubscribe();
++            sub.on('error', error => reconnect('error', error));
++            sub.on('close', () => reconnect('closed'));
++            // A half-open connection can stall without emitting 'error' or 'close'. Recreate the
++            // subscription periodically as a backstop; Pub/Sub re-delivers anything published during
++            // the brief gap, so no events are lost.
++            clearTimeout(this.recycleTimer);
++            this.recycleTimer = setTimeout(() => reconnect('periodic recycle'), SmartDeviceManagement.RECYCLE_MS);
          }
          catch (error) {
-             this.log.error("Plugin initialization failed, there was a failure with event subscription. Did you read the readme: https://github.com/potmat/homebridge-google-nest-sdm#where-do-the-config-values-come-from", error);
+-            this.log.error("Plugin initialization failed, there was a failure with event subscription. Did you read the readme: https://github.com/potmat/homebridge-google-nest-sdm#where-do-the-config-values-come-from", error);
++            // Creating the subscription can throw synchronously (bad pubSubClient/auth state after an
++            // outage). On a reconnect this runs from a bare setTimeout with no handler above, so an
++            // unhandled throw would crash the process on the very reconnect meant to self-heal.
++            // Log (throttled) and reschedule instead of rethrowing.
+             this.subscribed = false;
++            this.consecFails++;
++            if (this.consecFails <= 5 || this.consecFails % 12 === 0)
++                this.log.warn(`Nest event subscription setup failed; retrying in ${this.reconnectDelay / 1000}s`, error);
++            setTimeout(() => this.subscribeToEvents(subscriptionId), this.reconnectDelay);
++            this.reconnectDelay = Math.min(this.reconnectDelay * 2, SmartDeviceManagement.RECONNECT_MAX_MS);
+         }
+     }
+     async list_devices() {
+@@ -122,4 +205,8 @@
+     }
+ }
+ exports.SmartDeviceManagement = SmartDeviceManagement;
++SmartDeviceManagement.RECONNECT_MIN_MS = 5000;
++SmartDeviceManagement.RECONNECT_MAX_MS = 60000;
++SmartDeviceManagement.RECYCLE_MS = 12 * 60 * 60 * 1000; // proactive recycle for half-open stalls
++SmartDeviceManagement.RECYCLE_DELAY_MS = 2000; // deliberate recycle: short fixed gap, no backoff
+ //# sourceMappingURL=Api.js.map
+\ No newline at end of file

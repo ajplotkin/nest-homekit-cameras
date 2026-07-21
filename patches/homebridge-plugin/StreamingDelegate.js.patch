@@ -48,7 +48,7 @@
          ffmpegArgs += // Video
              ' -an -sn -dn' +
                  ` -codec:v ${vEncoder}` +
-@@ -264,12 +287,23 @@
+@@ -264,12 +287,26 @@
                  }, request.video.rtcp_interval * 2 * 1000);
              });
              activeSession.socket.bind(sessionInfo.videoReturnPort, sessionInfo.localAddress);
@@ -62,7 +62,10 @@
 +                this.log.debug('No RTCP received; assuming abandoned session. Stopping stream.', this.camera.getDisplayName());
 +                this.controller.forceStopStreamingSession(request.sessionID);
 +                this.stopStream(request.sessionID);
-+            }, 15000);
++                // 15s is enough for a warm RTSP open, but the cold Google-dial fallback adds WebRTC
++                // negotiation + a 15s analyzeduration, so give it a longer grace before assuming
++                // abandonment — else a legitimately-slow start gets force-stopped and retried.
++            }, useGo2rtc ? 15000 : 45000);
          }
          catch (error) {
              this.logThenCallback(callback, error);
@@ -73,7 +76,7 @@
          this.ongoingSessions[request.sessionID] = activeSession;
          delete this.pendingSessions[request.sessionID];
      }
-@@ -314,7 +348,8 @@
+@@ -314,7 +351,8 @@
                  this.log.error('Error occurred terminating two-way FFmpeg process: ' + err, this.camera.getDisplayName());
              }
              try {
@@ -83,17 +86,28 @@
              }
              catch (err) {
                  this.log.error('Error terminating SDM stream: ' + err, this.camera.getDisplayName());
-@@ -327,7 +362,8 @@
+@@ -325,9 +363,19 @@
+     }
+     closeRecordingStream(streamId, reason) {
          var _a, _b;
++        // Only tear down if this close targets the session we're actually running. A HomeKit hub can
++        // send a late close for an already-replaced (orphaned) session; without this guard that stale
++        // close would kill the *current* recording. See Fable review.
++        if (this.recordingSessionInfo && streamId !== undefined &&
++            this.recordingSessionInfo.streamId !== undefined &&
++            this.recordingSessionInfo.streamId !== streamId) {
++            this.log.debug('Ignoring recording close for a stale/replaced session id ' + streamId, this.camera.getDisplayName());
++            return;
++        }
          if ((_a = this.recordingSessionInfo) === null || _a === void 0 ? void 0 : _a.hksvStreamer) {
              (_b = this.recordingSessionInfo) === null || _b === void 0 ? void 0 : _b.hksvStreamer.destroy();
 -            this.recordingSessionInfo.nestStreamer.teardown();
 +            if (this.recordingSessionInfo.nestStreamer)
-+                this.recordingSessionInfo.nestStreamer.teardown();
++                Promise.resolve(this.recordingSessionInfo.nestStreamer.teardown()).catch(e => this.log.error('Error tearing down recording SDM stream: ' + e, this.camera.getDisplayName()));
              this.recordingSessionInfo = undefined;
          }
          this.handlingRecordingStreamingRequest = false;
-@@ -412,9 +448,34 @@
+@@ -412,10 +460,37 @@
                  "-ac", `${this.cameraRecordingConfiguration.audioCodec.audioChannels}`,
              ]
              : [];
@@ -125,8 +139,11 @@
 +        // never EOFs, so a clobbered session's transcode would otherwise run forever (#150).
 +        if (this.recordingSessionInfo) {
 +            try { if (this.recordingSessionInfo.hksvStreamer) this.recordingSessionInfo.hksvStreamer.destroy(); } catch (e) {}
-+            try { if (this.recordingSessionInfo.nestStreamer) this.recordingSessionInfo.nestStreamer.teardown(); } catch (e) {}
++            if (this.recordingSessionInfo.nestStreamer)
++                Promise.resolve(this.recordingSessionInfo.nestStreamer.teardown()).catch(e => this.log.error('Error tearing down prior recording SDM stream: ' + e, this.camera.getDisplayName()));
 +        }
          this.recordingSessionInfo = {
++            streamId: streamId,
              hksvStreamer: hksvStreamer,
              nestStreamer: nestStreamer
+         };

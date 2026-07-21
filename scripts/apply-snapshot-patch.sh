@@ -35,8 +35,9 @@ fi
 patches=(
   "Camera.js.patch|dist/sdm/Camera.js|isEventStale"
   "Doorbell.js.patch|dist/sdm/Doorbell.js|isEventStale"
-  "Api.js.patch|dist/sdm/Api.js|relationUpdate), ignoring"
+  "Api.js.patch|dist/sdm/Api.js|subscribeToEvents"
   "StreamingDelegate.js.patch|dist/StreamingDelegate.js|go2rtcKey"
+  "HksvStreamer.js.patch|dist/HksvStreamer.js|hang forever"
 )
 
 applied=0

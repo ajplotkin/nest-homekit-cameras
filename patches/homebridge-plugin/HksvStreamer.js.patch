@@ -1,0 +1,37 @@
+--- a/dist/HksvStreamer.js
++++ b/dist/HksvStreamer.js
+@@ -64,17 +64,32 @@
+         }
+     }
+     destroy() {
+-        var _a;
++        var _a, _b;
+         this.log.debug('HksvStreamer destroy command received, ending process.');
+         (_a = this.childProcess) === null || _a === void 0 ? void 0 : _a.kill();
+         this.childProcess = undefined;
+         this.destroyed = true;
++        // Close the listening server if a client never connected (else the socket fd leaks), and
++        // unblock a generator still awaiting connectPromise (it then throws "Unexpected state!").
++        try {
++            this.server.close(() => { });
++        }
++        catch (e) { }
++        (_b = this.connectResolve) === null || _b === void 0 ? void 0 : _b.call(this);
+     }
+     handleDisconnect() {
+-        var _a;
++        var _a, _b;
+         this.log.debug('Socket destroyed.');
+         (_a = this.socket) === null || _a === void 0 ? void 0 : _a.destroy();
+         this.socket = undefined;
++        // If ffmpeg exited/errored before ever connecting, connectPromise would never settle and
++        // generator() would hang forever. Close the server and resolve so the generator proceeds
++        // to its "Unexpected state!" throw (a fast, visible failure) instead of leaking a session.
++        try {
++            this.server.close(() => { });
++        }
++        catch (e) { }
++        (_b = this.connectResolve) === null || _b === void 0 ? void 0 : _b.call(this);
+     }
+     handleConnection(socket) {
+         var _a;
