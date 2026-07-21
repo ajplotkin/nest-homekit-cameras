@@ -1,6 +1,6 @@
 --- a/dist/sdm/Api.js
 +++ b/dist/sdm/Api.js
-@@ -58,33 +58,80 @@
+@@ -58,33 +58,97 @@
                      refresh_token: config.refreshToken
                  }
              });
@@ -29,8 +29,6 @@
 -            });
 -            this.subscription.on('error', error => {
 -                this.log.error("Plugin initialization failed, there was a failure with event subscription. Did you read the readme: https://github.com/potmat/homebridge-google-nest-sdm#where-do-the-config-values-come-from", error);
--                this.subscribed = false;
--            });
 +            // Patched: auto-reconnect the Pub/Sub event subscription. Upstream sets up the
 +            // subscription once and, on 'error', only logs and sets subscribed=false with no
 +            // reconnect (and never handles 'close') — so a silently dropped streaming-pull
@@ -39,6 +37,7 @@
 +            // 'error'/'close' with exponential backoff (5s..60s), reset on healthy traffic.
 +            this._nestReconnectDelay = 5000;
 +            this._nestSubscribe = () => {
++              try {
 +                // Capture the subscription in a closure local; tear THIS one down on reconnect
 +                // (not this.subscription, which a future path could have already replaced).
 +                const sub = this.pubSubClient.subscription(config.subscriptionId);
@@ -51,7 +50,9 @@
 +                    reconnectScheduled = true;
 +                    this.subscribed = false;
 +                    clearTimeout(this._nestRecycleTimer);
-+                    this.log.warn('Nest event subscription ' + reason + '; reconnecting in ' + (this._nestReconnectDelay / 1000) + 's', error || '');
++                    this._nestConsecFails = (this._nestConsecFails || 0) + 1;
++                    if (this._nestConsecFails <= 5 || this._nestConsecFails % 12 === 0)
++                        this.log.warn('Nest event subscription ' + reason + '; reconnecting in ' + (this._nestReconnectDelay / 1000) + 's', error || '');
 +                    // close() FIRST (it flips isOpen synchronously and returns a promise that can
 +                    // REJECT during the outage — ack-flush RPC failure — which would otherwise be an
 +                    // unhandled rejection and crash the process on Node >=15). Then drop listeners;
@@ -66,6 +67,7 @@
 +                sub.on('message', message => {
 +                    message.ack();
 +                    this._nestReconnectDelay = 5000;
++                    this._nestConsecFails = 0;
 +                    if (!this.devices)
 +                        return;
 +                    this.log.debug('Event received: ' + message.data.toString());
@@ -103,6 +105,20 @@
 +                clearTimeout(this._nestRecycleTimer);
 +                this._nestRecycleTimer = setTimeout(() => reconnect('periodic recycle'), 12 * 60 * 60 * 1000);
 +                this.log.debug('Nest event subscription established');
++              }
++              catch (error) {
++                // Creating the subscription can throw synchronously (bad pubSubClient/auth state
++                // after an outage). On a reconnect this runs from a bare setTimeout with no handler
++                // above, so an unhandled throw would crash the process on the very reconnect meant
++                // to self-heal. Log (throttled) and reschedule instead of rethrowing.
+                 this.subscribed = false;
+-            });
++                this._nestConsecFails = (this._nestConsecFails || 0) + 1;
++                if (this._nestConsecFails <= 5 || this._nestConsecFails % 12 === 0)
++                    this.log.warn('Nest event subscription setup failed; retrying in ' + (this._nestReconnectDelay / 1000) + 's', error);
++                setTimeout(() => this._nestSubscribe(), this._nestReconnectDelay);
++                this._nestReconnectDelay = Math.min(this._nestReconnectDelay * 2, 60000);
++              }
 +            };
 +            this._nestSubscribe();
          }
