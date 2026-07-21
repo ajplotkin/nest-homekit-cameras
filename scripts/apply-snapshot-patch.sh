@@ -33,7 +33,8 @@ fi
 
 # patchfile | dist-relative target | sentinel string proving it's already applied
 patches=(
-  "Camera.js.patch|dist/sdm/Camera.js|nest-snaps"
+  "Camera.js.patch|dist/sdm/Camera.js|isEventStale"
+  "Doorbell.js.patch|dist/sdm/Doorbell.js|isEventStale"
   "Api.js.patch|dist/sdm/Api.js|relationUpdate), ignoring"
   "StreamingDelegate.js.patch|dist/StreamingDelegate.js|go2rtcKey"
 )

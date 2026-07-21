@@ -24,7 +24,40 @@
          //Nest cams do not have any method to get a current snapshot,
          //starting streams up just to retrieve one is slow and will cause
          //the SDM API to hit a rate limit of creating too many streams
-@@ -139,13 +156,17 @@
+@@ -68,7 +85,7 @@
+     }
+     async getEventImage(eventId, date) {
+         const dateDiff = (Date.now() - date.getTime()) / 1000;
+-        if (dateDiff > 30) {
++        if (dateDiff > Camera.MAX_EVENT_AGE_SECONDS) {
+             this.log.debug(`Camera event image is too old (${dateDiff} sec), ignoring.`, this.getDisplayName());
+             return;
+         }
+@@ -128,8 +145,23 @@
+             });
+         }
+     }
++    isEventStale(event) {
++        const ageSeconds = (Date.now() - new Date(event.timestamp).getTime()) / 1000;
++        // Fail open when the event timestamp cannot be parsed.
++        if (Number.isNaN(ageSeconds))
++            return false;
++        if (ageSeconds > Camera.MAX_EVENT_AGE_SECONDS) {
++            this.log.debug(`Camera event is too old (${ageSeconds} sec), ignoring.`, this.getDisplayName());
++            return true;
++        }
++        return false;
++    }
+     event(event) {
+         super.event(event);
++        // Drop replayed/stale events (e.g. a backlog redelivered on reconnect or restart)
++        // before they fire phantom motion/HKSV. See potmat/homebridge-google-nest-sdm#219.
++        if (this.isEventStale(event))
++            return;
+         lodash_1.default.forEach(event.resourceUpdate.events, (value, key) => {
+             switch (key) {
+                 case Events.Constants.CameraMotion:
+@@ -139,13 +171,17 @@
                      this.getVideoProtocol()
                          .then(protocol => {
                          if (protocol === Traits.ProtocolType.WEB_RTC) {
@@ -43,3 +76,10 @@
                                      this.onMotion();
                              });
                          }
+@@ -166,4 +202,5 @@
+     }
+ }
+ exports.Camera = Camera;
++Camera.MAX_EVENT_AGE_SECONDS = 30;
+ //# sourceMappingURL=Camera.js.map
+\ No newline at end of file

@@ -1,0 +1,13 @@
+--- a/dist/sdm/Doorbell.js
++++ b/dist/sdm/Doorbell.js
+@@ -34,6 +34,10 @@
+     }
+     event(event) {
+         super.event(event);
++        // Drop replayed/stale events before they fire a phantom doorbell ring.
++        // Inherits isEventStale from Camera. See potmat/homebridge-google-nest-sdm#219.
++        if (this.isEventStale(event))
++            return;
+         lodash_1.default.forEach(event.resourceUpdate.events, (value, key) => {
+             switch (key) {
+                 case Events.Constants.DoorbellChime:
