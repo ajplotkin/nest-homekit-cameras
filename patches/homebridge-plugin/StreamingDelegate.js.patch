@@ -128,7 +128,7 @@
 +        }
 +        if (useGo2rtcRec) {
 +            this.log.debug("HKSV recording: using local go2rtc RTSP (warm stream)", this.camera.getDisplayName());
-+            nestStream = { args: "-rtsp_transport tcp -analyzeduration 3000000 -probesize 5000000 -i rtsp://127.0.0.1:8554/" + go2rtcKeyRec, stdin: undefined };
++            nestStream = { args: "-rtsp_transport tcp -analyzeduration 500000 -probesize 5000000 -i rtsp://127.0.0.1:8554/" + go2rtcKeyRec, stdin: undefined };
 +        } else {
 +            this.log.debug("HKSV recording: falling back to direct Google WebRTC dial", this.camera.getDisplayName());
 +            nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera, this.config);
