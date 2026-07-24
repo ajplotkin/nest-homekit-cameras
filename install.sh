@@ -11,7 +11,7 @@
 #
 # Prereqs you must already have (see the guide, Parts 1–2):
 #   - Docker
-#   - Homebridge running with homebridge-google-nest-sdm 1.1.23 configured
+#   - Homebridge running with homebridge-google-nest-sdm 1.1.24 configured
 #     (clientId/clientSecret/projectId/refreshToken in its config.json)
 #
 # Usage:
@@ -38,7 +38,7 @@ FORK_URL="${FORK_URL:-https://github.com/ajplotkin/go2rtc.git}"
 # test a branch: FORK_BRANCH=fix/nest-ipv6-ice-failure ./install.sh
 FORK_BRANCH="${FORK_BRANCH:-nestfix-1.9.14-1}"
 BASE_IMAGE="${BASE_IMAGE:-alexxit/go2rtc:1.9.14}"
-PLUGIN_VER="1.1.23"
+PLUGIN_VER="1.1.24"
 REBUILD=0
 DRY_RUN=0
 
@@ -99,6 +99,7 @@ else
   BUILD_TMP="$GO2RTC_DIR/.build"
   run "mkdir -p '$GO2RTC_DIR'"
   run "rm -rf '$BUILD_TMP' && git clone --quiet --branch '$FORK_BRANCH' --depth 1 '$FORK_URL' '$BUILD_TMP'"
+  warn "the Go build below wants ~1-1.5 GB free RAM. On a low-memory host — e.g. a 2 GB Raspberry Pi already running Homebridge/HA — it can OOM and take services down. If that's your box, build the image on a beefier machine (this same repo, any arch you'll run) and move it over: 'docker save $IMAGE | ssh pi docker load', then re-run this script with --image $IMAGE (it detects the existing image and skips the build)."
   say "  compiling (arm64/amd64 native, a few minutes)…"
   run "$DOCKER run --rm -v '$BUILD_TMP':/src -w /src -e GOCACHE=/src/.gocache -e GOMODCACHE=/src/.gomod golang:1.24-alpine sh -c 'CGO_ENABLED=0 go build -trimpath -ldflags \"-s -w\" -o go2rtc_patched .'"
   run "printf 'FROM %s\nCOPY go2rtc_patched /usr/local/bin/go2rtc\n' '$BASE_IMAGE' > '$BUILD_TMP/Dockerfile'"
@@ -133,6 +134,7 @@ ok "wrote $GO2RTC_DIR/go2rtc.yaml (chmod 600)"
 
 say "Start go2rtc container ($GO2RTC_CONTAINER)"
 if $DOCKER ps -a --format '{{.Names}}' | grep -qx "$GO2RTC_CONTAINER"; then
+  warn "replacing the existing '$GO2RTC_CONTAINER' container (docker rm -f). Its config is the file $GO2RTC_DIR/go2rtc.yaml, so nothing is lost — but if '$GO2RTC_CONTAINER' is NOT the go2rtc you think it is, Ctrl-C now and re-run with --go2rtc-container NAME."
   run "$DOCKER rm -f '$GO2RTC_CONTAINER' >/dev/null 2>&1 || true"
 fi
 run "$DOCKER run -d --name '$GO2RTC_CONTAINER' --restart unless-stopped --network host -v '$GO2RTC_DIR/go2rtc.yaml':/config/go2rtc.yaml '$IMAGE' >/dev/null"

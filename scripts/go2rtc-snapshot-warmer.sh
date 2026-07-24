@@ -9,6 +9,14 @@ API=http://127.0.0.1:1985
 INTERVAL=10
 BASELINE_CACHE=8s   # < INTERVAL so the baseline cycle gets a fresh frame each time
 EVENT_CACHE=1s      # motion/doorbell: force a near-fresh transcode
+# Streams are PRELOADed in go2rtc (always-on), so go2rtc — not this script — keeps them
+# warm; no bootstrap-polling needed here. But Nest intermittently DROPS a preloaded stream
+# (5-min session cap, post-motion video droughts, transient errors), and while go2rtc
+# re-establishes it the producer has bytes=0 so the baseline cycle below skips it. If we
+# delete the snapshot during that gap the HomeKit tile falls back to the blank logo ("G").
+# So keep the last good frame through the gap and only reap a snapshot that has gone
+# genuinely stale (camera actually offline), not one that's briefly mid-reconnect.
+STALE_MAX_MIN=30    # reap a snapshot only after this many minutes with no refresh (was 2)
 mkdir -p "$DIR"
 refresh_all() {
   local cache="${1:-$BASELINE_CACHE}"
@@ -32,7 +40,7 @@ for name, s in d.items():
     fi
     rm -f "$DIR/.$s.tmp" 2>/dev/null || true
   done
-  find "$DIR" -name '*.jpg' -mmin +2 -delete 2>/dev/null || true
+  find "$DIR" -name '*.jpg' -mmin +"$STALE_MAX_MIN" -delete 2>/dev/null || true
 }
 while true; do
   refresh_all

@@ -24,46 +24,7 @@
          //Nest cams do not have any method to get a current snapshot,
          //starting streams up just to retrieve one is slow and will cause
          //the SDM API to hit a rate limit of creating too many streams
-@@ -68,7 +85,7 @@
-     }
-     async getEventImage(eventId, date) {
-         const dateDiff = (Date.now() - date.getTime()) / 1000;
--        if (dateDiff > 30) {
-+        if (dateDiff > Camera.MAX_EVENT_AGE_SECONDS) {
-             this.log.debug(`Camera event image is too old (${dateDiff} sec), ignoring.`, this.getDisplayName());
-             return;
-         }
-@@ -128,8 +145,29 @@
-             });
-         }
-     }
-+    isEventStale(event) {
-+        const ageSeconds = (Date.now() - new Date(event.timestamp).getTime()) / 1000;
-+        // Fail open when the event timestamp cannot be parsed.
-+        if (Number.isNaN(ageSeconds))
-+            return false;
-+        if (ageSeconds > Camera.MAX_EVENT_AGE_SECONDS) {
-+            this.log.debug(`Camera event is too old (${ageSeconds} sec), ignoring.`, this.getDisplayName());
-+            // Dropping is silent by design (a stale drop is usually a Pub/Sub duplicate). But if the
-+            // system clock runs fast, FRESH events look stale and get dropped invisibly — so surface a
-+            // throttled warning once drops become frequent, pointing at the clock as the likely cause.
-+            this._staleDrops = (this._staleDrops || 0) + 1;
-+            if (this._staleDrops % 20 === 0)
-+                this.log.warn(`Dropped ${this._staleDrops} stale camera events (latest ${Math.round(ageSeconds)}s old). Occasional drops are normal (duplicate redelivery); if this keeps climbing, check the system clock.`, this.getDisplayName());
-+            return true;
-+        }
-+        return false;
-+    }
-     event(event) {
-         super.event(event);
-+        // Drop replayed/stale events (e.g. a backlog redelivered on reconnect or restart)
-+        // before they fire phantom motion/HKSV. See potmat/homebridge-google-nest-sdm#219.
-+        if (this.isEventStale(event))
-+            return;
-         lodash_1.default.forEach(event.resourceUpdate.events, (value, key) => {
-             switch (key) {
-                 case Events.Constants.CameraMotion:
-@@ -139,13 +177,17 @@
+@@ -156,13 +173,17 @@
                      this.getVideoProtocol()
                          .then(protocol => {
                          if (protocol === Traits.ProtocolType.WEB_RTC) {
@@ -82,10 +43,3 @@
                                      this.onMotion();
                              });
                          }
-@@ -166,4 +208,5 @@
-     }
- }
- exports.Camera = Camera;
-+Camera.MAX_EVENT_AGE_SECONDS = 30;
- //# sourceMappingURL=Camera.js.map
-\ No newline at end of file

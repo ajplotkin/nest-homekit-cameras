@@ -18,7 +18,7 @@ PATCH_DIR="${PATCH_DIR:-$SCRIPT_DIR/../patches/homebridge-plugin}"
 HOMEBRIDGE_DIR="${HOMEBRIDGE_DIR:-$HOME/homebridge}"
 PLUGIN="${PLUGIN:-$HOMEBRIDGE_DIR/node_modules/homebridge-google-nest-sdm}"
 CONTAINER="${HOMEBRIDGE_CONTAINER:-homebridge}"
-EXPECT_VER="1.1.23"
+EXPECT_VER="1.1.24"
 
 [ -d "$PLUGIN" ] || { echo "ERROR: plugin not found at $PLUGIN (set HOMEBRIDGE_DIR)"; exit 1; }
 [ -d "$PATCH_DIR" ] || { echo "ERROR: patch dir not found at $PATCH_DIR"; exit 1; }
@@ -32,12 +32,17 @@ if [ "$CUR_VER" != "$EXPECT_VER" ]; then
 fi
 
 # patchfile | dist-relative target | sentinel string proving it's already applied
+# NOTE: as of plugin 1.1.24, upstream merged our recording-lifecycle (#217/#223) and
+# stale-event (#219) and relation-crash (#218) fixes, so the Doorbell.js / HksvStreamer.js
+# patches and the Camera.js stale-event hunk are gone (redundant). What remains is our
+# go2rtc integration: snapshot-from-disk + warmer .refresh (Camera.js), the Pub/Sub
+# auto-reconnect that is still open as #216 (Api.js), and the go2rtc RTSP live/record
+# routing (StreamingDelegate.js). Sentinels must match OUR additions, NOT anything now in
+# stock — Camera.js uses 'nest-snaps' (its isEventStale is upstream's as of 1.1.24).
 patches=(
-  "Camera.js.patch|dist/sdm/Camera.js|isEventStale"
-  "Doorbell.js.patch|dist/sdm/Doorbell.js|isEventStale"
+  "Camera.js.patch|dist/sdm/Camera.js|nest-snaps"
   "Api.js.patch|dist/sdm/Api.js|subscribeToEvents"
   "StreamingDelegate.js.patch|dist/StreamingDelegate.js|go2rtcKey"
-  "HksvStreamer.js.patch|dist/HksvStreamer.js|hang forever"
 )
 
 applied=0

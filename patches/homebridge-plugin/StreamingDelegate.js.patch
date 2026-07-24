@@ -1,16 +1,13 @@
 --- a/dist/StreamingDelegate.js
 +++ b/dist/StreamingDelegate.js
-@@ -193,17 +193,40 @@
+@@ -193,16 +193,36 @@
          const bitrate = request.video.max_bit_rate * 4;
          const vEncoder = this.config.vEncoder || 'libx264 -preset ultrafast -tune zerolatency';
          this.log.debug(`Video stream requested: ${request.video.width} x ${request.video.height}, ${request.video.fps} fps, ${request.video.max_bit_rate} kbps`, this.camera.getDisplayName());
--        const nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera);
+-        const nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera, this.config);
 +        // PATCHED: prefer the local go2rtc warm RTSP stream. Avoids opening a SECOND
 +        // concurrent Google WebRTC stream per camera (go2rtc's preload is the first) and
-+        // skips the variable Google negotiation. Gated on a fresh snapshot (== stream warm);
-+        // stale/missing -> fall back to the direct Google dial.
-+        // NOTE: probe values MUST be large enough to catch SPS/PPS (video dimensions) before
-+        // the copy-to-RTP output initializes -- low probesize -> "Could not write header".
++        // gives an already-warm, keyframe-aligned stream so the tile/live opens fast.
          let ffmpegArgs;
 +        let nestStreamer;
          let nestStream;
@@ -18,22 +15,22 @@
 -            nestStream = await nestStreamer.initialize(); // '-analyzeduration 15000000 -probesize 100000000 -i ' + streamInfo.streamUrls.rtspUrl;
 -            ffmpegArgs = nestStream.args;
 +        const go2rtcKey = (this.camera.displayName || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-+        let useGo2rtc = false;
-+        if (go2rtcKey) {
-+            try {
-+                const st = require('fs').statSync('/homebridge/nest-snaps/' + go2rtcKey + '.jpg');
-+                if (Date.now() - st.mtimeMs < 90000)
-+                    useGo2rtc = true;
-+            }
-+            catch (e) { }
-         }
--        catch (error) {
--            this.logThenCallback(callback, error);
--            return;
++        // A go2rtc-managed camera ALWAYS uses the warm go2rtc RTSP stream for live view. Do NOT gate
++        // on snapshot freshness: a stale/missing snapshot only means the camera idled (or the warmer
++        // hasn't run yet), NOT that go2rtc can't serve it -- go2rtc re-establishes the stream when
++        // ffmpeg connects. Falling back to a fresh Google dial once a snapshot aged opened a SECOND
++        // concurrent Nest WebRTC session that collides with go2rtc's own and fails ("Could not execute
++        // device command") -> blank tile AND no live video. If go2rtc genuinely has no such stream,
++        // ffmpeg fails fast -- the correct signal, not a conflicting Google dial. (Only an unnamed
++        // camera, go2rtcKey === '', falls through to the direct dial.)
++        const useGo2rtc = !!go2rtcKey;
 +        if (useGo2rtc) {
 +            this.log.debug('Using local go2rtc RTSP (warm stream) instead of a fresh Google dial', this.camera.getDisplayName());
 +            ffmpegArgs = '-rtsp_transport tcp -analyzeduration 3000000 -probesize 5000000 -i rtsp://127.0.0.1:8554/' + go2rtcKey;
          }
+-        catch (error) {
+-            this.logThenCallback(callback, error);
+-            return;
 +        else {
 +            nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera, this.config);
 +            try {
@@ -44,11 +41,10 @@
 +                this.logThenCallback(callback, error);
 +                return;
 +            }
-+        }
+         }
          ffmpegArgs += // Video
              ' -an -sn -dn' +
-                 ` -codec:v ${vEncoder}` +
-@@ -264,12 +287,26 @@
+@@ -264,12 +284,26 @@
                  }, request.video.rtcp_interval * 2 * 1000);
              });
              activeSession.socket.bind(sessionInfo.videoReturnPort, sessionInfo.localAddress);
@@ -76,7 +72,7 @@
          this.ongoingSessions[request.sessionID] = activeSession;
          delete this.pendingSessions[request.sessionID];
      }
-@@ -314,7 +351,8 @@
+@@ -314,7 +348,8 @@
                  this.log.error('Error occurred terminating two-way FFmpeg process: ' + err, this.camera.getDisplayName());
              }
              try {
@@ -86,32 +82,11 @@
              }
              catch (err) {
                  this.log.error('Error terminating SDM stream: ' + err, this.camera.getDisplayName());
-@@ -325,9 +363,19 @@
-     }
-     closeRecordingStream(streamId, reason) {
-         var _a, _b;
-+        // Only tear down if this close targets the session we're actually running. A HomeKit hub can
-+        // send a late close for an already-replaced (orphaned) session; without this guard that stale
-+        // close would kill the *current* recording. See Fable review.
-+        if (this.recordingSessionInfo && streamId !== undefined &&
-+            this.recordingSessionInfo.streamId !== undefined &&
-+            this.recordingSessionInfo.streamId !== streamId) {
-+            this.log.debug('Ignoring recording close for a stale/replaced session id ' + streamId, this.camera.getDisplayName());
-+            return;
-+        }
-         if ((_a = this.recordingSessionInfo) === null || _a === void 0 ? void 0 : _a.hksvStreamer) {
-             (_b = this.recordingSessionInfo) === null || _b === void 0 ? void 0 : _b.hksvStreamer.destroy();
--            this.recordingSessionInfo.nestStreamer.teardown();
-+            if (this.recordingSessionInfo.nestStreamer)
-+                Promise.resolve(this.recordingSessionInfo.nestStreamer.teardown()).catch(e => this.log.error('Error tearing down recording SDM stream: ' + e, this.camera.getDisplayName()));
-             this.recordingSessionInfo = undefined;
-         }
-         this.handlingRecordingStreamingRequest = false;
-@@ -412,10 +460,37 @@
+@@ -420,8 +455,41 @@
                  "-ac", `${this.cameraRecordingConfiguration.audioCodec.audioChannels}`,
              ]
              : [];
--        const nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera);
+-        const nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera, this.config);
 -        const nestStream = await nestStreamer.initialize();
 +        // PATCHED: prefer local go2rtc warm RTSP for HKSV recording — same pattern as
 +        // startStream. Avoids opening a SECOND concurrent Google WebRTC session, which
@@ -119,35 +94,39 @@
 +        const go2rtcKeyRec = (this.camera.displayName || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 +        let nestStreamer;
 +        let nestStream;
-+        let useGo2rtcRec = false;
-+        if (go2rtcKeyRec) {
-+            try {
-+                const st = require("fs").statSync("/homebridge/nest-snaps/" + go2rtcKeyRec + ".jpg");
-+                if (Date.now() - st.mtimeMs < 90000) useGo2rtcRec = true;
-+            } catch (e) {}
-+        }
++        // Same rule as live view: a go2rtc-managed camera ALWAYS records from the warm go2rtc RTSP
++        // stream. Do NOT gate on snapshot freshness -- a stale/missing snapshot means the camera idled,
++        // not that go2rtc can't serve it (go2rtc dials Nest on-demand when ffmpeg connects). Falling
++        // back to a direct Google WebRTC dial opened a SECOND concurrent Nest session that collides
++        // with go2rtc's own (exhausts Google's per-device stream limit) -> failed/empty HKSV recording.
++        // (Only an unnamed camera falls through to the direct dial.)
++        const useGo2rtcRec = !!go2rtcKeyRec;
 +        if (useGo2rtcRec) {
 +            this.log.debug("HKSV recording: using local go2rtc RTSP (warm stream)", this.camera.getDisplayName());
++            // analyzeduration lowered 3000000->500000us for the WARM go2rtc RTSP recording path only
++            // (live-view path above keeps 3000000). The DESCRIBE SDP carries sprop-parameter-sets, so
++            // ffmpeg does not need a long probe to learn the H264 params; a shorter analyzeduration
++            // lets the first media fragment be written ~2.5s sooner, buying margin against the Apple
++            // hub's fixed ~16s HKSV record timeout during a Nest post-motion video drought.
 +            nestStream = { args: "-rtsp_transport tcp -analyzeduration 500000 -probesize 5000000 -i rtsp://127.0.0.1:8554/" + go2rtcKeyRec, stdin: undefined };
-+        } else {
++            // go2rtc owns the Google session, so there is NO SDM streamer to tear down on this path.
++            // But stock 1.1.24's merged teardown (closeRecordingStream + the #150 prior-session cleanup)
++            // calls recordingSessionInfo.nestStreamer.teardown() UNGUARDED — upstream never has an
++            // undefined streamer, so it never needed a guard. Leaving nestStreamer undefined here makes
++            // that call throw a synchronous TypeError (Promise.resolve does NOT absorb it) out of
++            // closeRecordingStream, so recordingSessionInfo never clears and recording is permanently
++            // wedged after the first clip on every go2rtc camera. Hand it a no-op streamer instead.
++            nestStreamer = { teardown: async () => { } };
++        }
++        else {
 +            this.log.debug("HKSV recording: falling back to direct Google WebRTC dial", this.camera.getDisplayName());
 +            nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera, this.config);
 +            nestStream = await nestStreamer.initialize();
 +        }
          const hksvStreamer = new HksvStreamer_1.default(this.log, nestStream, audioArgs, videoArgs, this.platform.debugMode);
-+        // PATCHED: clean up any prior session before overwriting it. The go2rtc RTSP input
-+        // never EOFs, so a clobbered session's transcode would otherwise run forever (#150).
-+        if (this.recordingSessionInfo) {
-+            try { if (this.recordingSessionInfo.hksvStreamer) this.recordingSessionInfo.hksvStreamer.destroy(); } catch (e) {}
-+            if (this.recordingSessionInfo.nestStreamer)
-+                Promise.resolve(this.recordingSessionInfo.nestStreamer.teardown()).catch(e => this.log.error('Error tearing down prior recording SDM stream: ' + e, this.camera.getDisplayName()));
-+        }
-         this.recordingSessionInfo = {
-+            streamId: streamId,
-             hksvStreamer: hksvStreamer,
-             nestStreamer: nestStreamer
-         };
-@@ -447,6 +522,12 @@
+         // Tear down any prior recording session before overwriting it. A HomeKit hub
+         // can start a new recording (e.g. after a brief reconnect) before the previous
+@@ -465,6 +533,12 @@
          catch (error) {
              this.log.error("Encountered unexpected error on generator " + error.stack);
          }

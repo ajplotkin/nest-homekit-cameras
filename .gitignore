@@ -1,2 +1,15 @@
 __pycache__/
 *.pyc
+
+# Never commit real credentials/config. The generated go2rtc.yaml holds the OAuth
+# client secret + refresh token; homebridge config.json holds the same. These are
+# generated OUTSIDE this repo, but block them defensively in case one lands here.
+go2rtc.yaml
+go2rtc.yml
+config.json
+*.env
+.env
+secrets.*
+*credentials*
+*.pem
+*.key

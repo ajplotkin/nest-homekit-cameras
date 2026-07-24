@@ -20,7 +20,7 @@ This guide walks through the full setup from scratch: getting API access to your
 - **[`install.sh`](install.sh)** — one idempotent installer that does everything after you have Google credentials (build image, tmpfs, config, go2rtc, warmer service, plugin patches, verify). See [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
 - **[`docker-compose.yml`](docker-compose.yml)** — the go2rtc + warmer half of the stack as Compose services.
 - **[`scripts/`](scripts/)** — the three helper scripts: `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), and `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches). They take all paths/credentials as arguments or env vars — nothing is hardcoded.
-- **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout) and `homebridge-plugin/*.patch` (the three plugin changes as diffs against stock plugin 1.1.23).
+- **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout) and `homebridge-plugin/*.patch` (the plugin changes as diffs against stock plugin 1.1.24).
 
 The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-1)** — build from the stable tag **`nestfix-1.9.14-1`** (development happens on the `fix/nest-ipv6-ice-failure` branch, which may carry in-progress work and debug logging, so don't build from the branch). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
 
@@ -44,7 +44,7 @@ If you also want faster live stream startup (~2s instead of ~8s), check the `vEn
 
 ## Quick start (automated) — if Parts 1 & 2 are already done
 
-The one thing that **cannot** be scripted is Google Device Access (Part 1) — creating the Cloud project, the OAuth consent screen, the $5 registration, and getting a refresh token is manual clicking through Google's consoles. Once you have those credentials in a working **Homebridge + homebridge-google-nest-sdm 1.1.23** install, the rest is one script.
+The one thing that **cannot** be scripted is Google Device Access (Part 1) — creating the Cloud project, the OAuth consent screen, the $5 registration, and getting a refresh token is manual clicking through Google's consoles. Once you have those credentials in a working **Homebridge + homebridge-google-nest-sdm 1.1.24** install, the rest is one script.
 
 **Option A — `install.sh`** (does everything post-credentials: builds the patched go2rtc image, sets up the tmpfs, generates the config, starts go2rtc, installs the warmer service, and applies the plugin patches — all idempotent):
 
@@ -121,27 +121,24 @@ Two things to note:
 
 **Set `vEncoder` to `"copy"`.** Your Nest cameras send H264 video. HomeKit wants H264 video. The default setting re-encodes it with x264, which wastes CPU and adds seconds of latency. `"copy"` passes the video through untouched. The plugin's README already mentions this option but understates how much it helps.
 
-**For faster live stream startup**, install [PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) by [@littlepope81](https://github.com/littlepope81). This unmerged PR adds three optimizations — FIR keyframe requests instead of PLI, frame-rate probe skipping (`-fpsprobesize 0`), and REMB bandwidth signaling — that reduce the time to first video frame from ~8 seconds to ~2 seconds. Measured on a Pi 4: first keyframe fully received at **+2127ms**. (The remaining ~4s to see the tile is Apple's own HomeKit setup, not addressable from Homebridge.)
-
-```bash
-# Install PR #212 from the author's branch:
-npm install https://github.com/littlepope81/homebridge-google-nest-sdm/tarball/feature/configurable-analyzeduration
-```
+**Faster live stream startup is now in the plugin.** As of **plugin v1.1.24**, [@littlepope81](https://github.com/littlepope81)'s [PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) is **merged** — no separate install needed. It reduces time-to-first-frame from ~8s to ~2s (first keyframe fully received at **+2127ms** on a Pi 4) via keyframe/frame-rate/REMB tuning, and exposes `-analyzeduration` / `-probesize` as optional config fields. Note that these optimizations tune the plugin's own direct WebRTC dial; once you enable this guide's go2rtc live-view routing in [Part 6](#part-6-optional-route-live-view-through-go2rtc-too), live view is served from go2rtc's RTSP instead, so #212's startup win mainly benefits cameras that fall through to the direct dial. (The ~4s beyond first-frame to actually see the tile is Apple's own HomeKit setup, not addressable from Homebridge.)
 
 After restarting Homebridge, your cameras should appear in Apple Home. Live streams will work. But the tiles show a Google logo or a blank image — that's the problem this guide exists to solve.
 
-### Pub/Sub event handler bug
+### Pub/Sub event handler crash — fixed in 1.1.24
 
-If you've set up Pub/Sub events, be aware of a bug in the plugin: the event handler crashes on `relationUpdate` events (which Google sends when device/room relationships change, including right after you enable events). The fix is a 3-line guard in `dist/sdm/Api.js` — add this before `if (event.resourceUpdate.events) {`:
+Older plugin versions crashed on `relationUpdate` events (which Google sends when device/room relationships change, including right after you enable events), silently killing the event stream. **This is fixed in plugin v1.1.24** ([PR #218](https://github.com/potmat/homebridge-google-nest-sdm/pull/218) by [@littlepope81](https://github.com/littlepope81); see [issue #214](https://github.com/potmat/homebridge-google-nest-sdm/issues/214)) — no manual patch is needed anymore. This repo's `Api.js` patch keeps that same guard *and* adds Pub/Sub auto-reconnect (below).
 
-```javascript
-if (!event || !event.resourceUpdate) {
-    this.log.debug('Event without resourceUpdate (e.g. relationUpdate), ignoring');
-    return;
-}
-```
+### Known limitation: Google filters rapid successive events (this is NOT a bug in this setup)
 
-See [issue #214](https://github.com/potmat/homebridge-google-nest-sdm/issues/214) for the full stack trace.
+If you have several motion/person events close together — e.g. someone leaves and comes back a couple of minutes later — you will often see **only the first one** reach HomeKit, so only the first gets a notification and an HKSV recording. This is **Google's own, documented behavior**: the SDM API does not publish rapid successive camera events (within a short debounce window) to your Pub/Sub topic, even when they are genuinely distinct events. See Google's [events documentation](https://developers.google.com/nest/device-access/api/events).
+
+Key points:
+- **It is upstream and intentional**, not something this plugin, this repo, or go2rtc can fix — the filtered events are simply never delivered to any third-party integration.
+- **Google Home / Nest Aware still record them** on Google's own side (a separate pipeline), so you can confirm the "missing" events exist in the Google Home app even though HomeKit never saw them.
+- Nothing here is broken when this happens; the event was filtered before it ever reached Homebridge.
+
+If this matters to you, the only levers are on Google's side — you can file feedback via Device Access asking for a configurable/shorter filter window; the more reports, the better the odds it gets revisited.
 
 ## Part 3: go2rtc — Warm Streams and Snapshots
 
@@ -355,11 +352,11 @@ The plugin needs a few small changes. They're shipped as unified diffs in **[`pa
 
 What the patches do:
 
-- **`Camera.js`** — `getSnapshot()` returns the warm JPEG from `/homebridge/nest-snaps/<key>.jpg` instead of the Google logo, falling back to the logo if the file is missing or older than 90 seconds (so an off camera shows the honest placeholder). And on a motion/person event it creates `/homebridge/nest-snaps/.refresh` (via the plugin's `fs`, no subshell) to trigger an immediate warm-frame grab. The `<key>` is the slugified SDM room name — **identical** to the sync script's derivation, which is how the plugin finds the file the warmer wrote. It also **drops replayed/stale events** (older than 30s) at the top of `event()`, so a backlog of events redelivered by Pub/Sub after a reconnect or restart can't fire phantom motion and phantom HKSV recordings — the freshness gate from [@littlepope81](https://github.com/littlepope81)'s [PR #219](https://github.com/potmat/homebridge-google-nest-sdm/pull/219). This pairs with the `Api.js` auto-reconnect below: reconnecting is what *causes* the backlog redelivery, so the gate is its safety rail.
-- **`Doorbell.js`** — the same replay/stale-event gate as `Camera.js` (it inherits `isEventStale`), so a redelivered backlog can't fire a phantom doorbell ring.
-- **`Api.js`** — two robustness fixes to the Pub/Sub event subscription: (a) guards the handler against `relationUpdate` events with no `resourceUpdate` (an upstream crash; [issue #214](https://github.com/potmat/homebridge-google-nest-sdm/issues/214)); and (b) **auto-reconnects the subscription**. Upstream sets it up once and, on error, just stops — so a silently dropped streaming-pull connection permanently kills all camera events (no motion alerts, no HKSV recording) until you restart Homebridge. This re-subscribes on `error`/`close` with backoff, plus a 12-hour proactive recycle to catch half-open stalls. (Submitted upstream — see the PRs section.)
-- **`StreamingDelegate.js`** — *(optional, Part 6)* routes HomeKit live view **and HKSV recording** through go2rtc's warm RTSP stream, so neither opens a second Google session (fixes recording-time stream contention and corrupt clips). Also carries recording-lifecycle hardening from an adversarial review: `closeRecordingStream` now checks session identity (a late close of an orphaned session can't kill the current recording), the async SDM teardown is `.catch()`-guarded (a rejection there would otherwise restart the bridge), and the start-of-session inactivity watchdog gives the cold Google-dial fallback a longer grace than the warm-RTSP path.
-- **`HksvStreamer.js`** — hardening so an HKSV recording can't hang forever if the RTSP input dies before ffmpeg connects: `destroy()` and `handleDisconnect()` now settle the connection promise (so the fragment generator fails fast instead of awaiting a connection that never comes) and close the listening server (so the socket isn't leaked). Found by the same review.
+- **`Camera.js`** — `getSnapshot()` returns the warm JPEG from `/homebridge/nest-snaps/<key>.jpg` instead of the Google logo, falling back to the logo if the file is missing or older than 90 seconds (so an off camera shows the honest placeholder). And on a motion/person event it creates `/homebridge/nest-snaps/.refresh` (via the plugin's `fs`, no subshell) to trigger an immediate warm-frame grab. The `<key>` is the slugified SDM room name — **identical** to the sync script's derivation, which is how the plugin finds the file the warmer wrote. *(The replayed/stale-event gate that used to live in this patch — and in a `Doorbell.js` patch — is now in the base plugin as of 1.1.24, [@littlepope81](https://github.com/littlepope81)'s [PR #219](https://github.com/potmat/homebridge-google-nest-sdm/pull/219), so this repo no longer carries it.)*
+- **`Api.js`** — **auto-reconnects the Pub/Sub subscription**. Upstream sets it up once and, on error, just stops — so a silently dropped streaming-pull connection permanently kills all camera events (no motion alerts, no HKSV recording) until you restart Homebridge. This re-subscribes on `error`/`close` with exponential backoff, plus a 12-hour proactive recycle to catch half-open stalls. Still open upstream as [PR #216](https://github.com/potmat/homebridge-google-nest-sdm/pull/216). (The `relationUpdate`/malformed-event guard this patch used to add is now in the base plugin as of 1.1.24 via [#218](https://github.com/potmat/homebridge-google-nest-sdm/pull/218); the patch reuses the base handler and only wraps the reconnect around it.)
+- **`StreamingDelegate.js`** — *(optional, Part 6)* routes HomeKit live view **and HKSV recording** through go2rtc's warm RTSP stream, so neither opens a second Google session (fixes recording-time stream contention, corrupt clips, and the blank-tile-after-live-view failure). It also arms a start-of-session inactivity watchdog tuned for the warm-RTSP path. The recording-lifecycle hardening this patch used to carry (session-identity check on close, `.catch()`-guarded teardown, orphaned-session cleanup) is now in the base plugin as of 1.1.24 — merged from this repo's [#217](https://github.com/potmat/homebridge-google-nest-sdm/pull/217) / [#223](https://github.com/potmat/homebridge-google-nest-sdm/pull/223) — so the patch keeps only the go2rtc routing on top of it.
+
+*(Two patches this repo used to carry — a `Doorbell.js` stale-event gate and an `HksvStreamer.js` hang-on-dead-input fix — were merged upstream and ship in plugin 1.1.24, so they're gone from this repo's patch set. What remains is the three above.)*
 
 Clone this repo (you'll want it for the scripts too) and run the patcher:
 
@@ -369,9 +366,9 @@ cd nest-homekit-snapshots
 HOMEBRIDGE_DIR=/path/to/homebridge ./scripts/apply-snapshot-patch.sh
 ```
 
-The script pins the plugin version it was cut against (**1.1.23**) and **refuses to run on a different one** — the compiled `dist/` layout moves between releases, so a stale patch could silently break things. It's idempotent (safe to re-run) and **exits non-zero** if any patch is missing or won't apply, so a re-apply can never leave you half-patched. Want to see exactly what changes? Read the diffs in `patches/homebridge-plugin/`.
+The script pins the plugin version it was cut against (**1.1.24**) and **refuses to run on a different one** — the compiled `dist/` layout moves between releases, so a stale patch could silently break things. It's idempotent (safe to re-run) and **exits non-zero** if any patch is missing or won't apply, so a re-apply can never leave you half-patched. Want to see exactly what changes? Read the diffs in `patches/homebridge-plugin/`.
 
-> **These patches live in `node_modules` and are wiped by any `npm install` of the plugin.** Re-run `apply-snapshot-patch.sh` after any plugin install/upgrade. Install order: (1) `npm install homebridge-google-nest-sdm`, (2) install [PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) on top, (3) *then* run the patch script.
+> **These patches live in `node_modules` and are wiped by any `npm install` of the plugin.** Re-run `apply-snapshot-patch.sh` after any plugin install/upgrade. Install order: (1) `npm install homebridge-google-nest-sdm` (v1.1.24+ already includes PR #212's startup optimizations — no separate install), (2) *then* run the patch script.
 
 ## Part 5: Verify
 
@@ -494,11 +491,13 @@ A camera that's **switched off** costs a little more than an active one: the for
 - [go2rtc #2311](https://github.com/AlexxIT/go2rtc/issues/2311) — `nest: wrong status: 400` / IPv6 ICE failure diagnosis
 - [homebridge-google-nest-sdm #214](https://github.com/potmat/homebridge-google-nest-sdm/issues/214) — Api.js crash on `relationUpdate` events
 - [homebridge-google-nest-sdm #215](https://github.com/potmat/homebridge-google-nest-sdm/issues/215) — README corrections (project ID confusion, self-hosted Pub/Sub, Node regression)
-- [homebridge-google-nest-sdm PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) — stream startup latency fix by [@littlepope81](https://github.com/littlepope81)
-- [homebridge-google-nest-sdm PR #216](https://github.com/potmat/homebridge-google-nest-sdm/pull/216) — the Pub/Sub auto-reconnect fix from this repo, submitted upstream (events silently stopping after a connection drop)
-- [homebridge-google-nest-sdm PR #217](https://github.com/potmat/homebridge-google-nest-sdm/pull/217) — the HKSV recording session-leak fix from this repo, submitted upstream (orphaned ffmpeg / memory growth; relates to #150)
-- [homebridge-google-nest-sdm PR #218](https://github.com/potmat/homebridge-google-nest-sdm/pull/218) by [@littlepope81](https://github.com/littlepope81) — a dedicated upstream hardening of the Pub/Sub handler against `relationUpdate`/malformed events (the crash this repo's `Api.js.patch` guards independently; [issue #214](https://github.com/potmat/homebridge-google-nest-sdm/issues/214))
-- [homebridge-google-nest-sdm PR #219](https://github.com/potmat/homebridge-google-nest-sdm/pull/219) by [@littlepope81](https://github.com/littlepope81) — drops replayed/stale events so a reconnect/restart backlog can't fire phantom motion/recordings (adopted here in `Camera.js.patch` and `Doorbell.js.patch`)
+- [homebridge-google-nest-sdm PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) by [@littlepope81](https://github.com/littlepope81) — stream startup latency + configurable `analyzeduration`/`probesize` — **merged in 1.1.24**
+- [homebridge-google-nest-sdm PR #216](https://github.com/potmat/homebridge-google-nest-sdm/pull/216) — the Pub/Sub auto-reconnect fix from this repo — **open** (events silently stopping after a connection drop); still carried here as `Api.js.patch`
+- [homebridge-google-nest-sdm PR #217](https://github.com/potmat/homebridge-google-nest-sdm/pull/217) — the HKSV recording session-leak fix from this repo (orphaned ffmpeg / memory growth; relates to #150) — **merged in 1.1.24**
+- [homebridge-google-nest-sdm PR #223](https://github.com/potmat/homebridge-google-nest-sdm/pull/223) — HKSV recording-lifecycle hardening from this repo (hang-on-dead-input, stale-close, teardown-rejection) — **merged in 1.1.24**
+- [homebridge-google-nest-sdm PR #224](https://github.com/potmat/homebridge-google-nest-sdm/pull/224) — reset the recording session in a `finally` (follow-up to #223) — **open**; still carried here in `StreamingDelegate.js.patch`
+- [homebridge-google-nest-sdm PR #218](https://github.com/potmat/homebridge-google-nest-sdm/pull/218) by [@littlepope81](https://github.com/littlepope81) — hardens the Pub/Sub handler against `relationUpdate`/malformed events ([issue #214](https://github.com/potmat/homebridge-google-nest-sdm/issues/214)) — **merged in 1.1.24** (this repo's `Api.js.patch` now reuses the base guard and only adds reconnect)
+- [homebridge-google-nest-sdm PR #219](https://github.com/potmat/homebridge-google-nest-sdm/pull/219) by [@littlepope81](https://github.com/littlepope81) — drops replayed/stale events so a reconnect/restart backlog can't fire phantom motion/recordings — **merged in 1.1.24** (this repo relies on the base plugin's version; the standalone Camera.js/Doorbell.js stale-event patches were dropped once it merged)
 
 **Upstream go2rtc work this fork builds on (credit to the authors):**
 
