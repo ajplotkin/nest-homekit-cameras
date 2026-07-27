@@ -7,7 +7,7 @@ This is harder than it should be. Google does not offer Nest cameras through Hom
 This guide walks through the full setup from scratch: getting API access to your Nest cameras, bridging them into HomeKit, and then solving the snapshot problem by keeping a warm stream and serving frames from it. By the end you'll have:
 
 - **Real camera images on your HomeKit tiles** — refreshed every 10 seconds, and instantly on motion or doorbell events (so the tile shows *who's there*, not a stale frame)
-- **~2 second live stream startup** — down from ~8 seconds stock
+- **~2 second live stream startup** — down from ~8 seconds stock (on the plugin's direct dial; the optional RTSP routing in [Part 6](#part-6-optional-route-live-view-through-go2rtc-too) trades a little of that for consistency)
 - **Motion and doorbell event notifications** in Apple Home
 - **HomeKit Secure Video recording** — motion-triggered clips saved to iCloud also work through this setup (confirmed on a Pi 4; the software H.264 encode keeps up, so no hardware encoder is needed). Requires iCloud+ and a Home Hub, like any HKSV camera.
 - **Automatic camera discovery** — new cameras appear without editing config files
@@ -17,9 +17,9 @@ This guide walks through the full setup from scratch: getting API access to your
 ### What's in this repo
 
 - **This README** — the complete, from-scratch guide (start here and read top to bottom).
-- **[`install.sh`](install.sh)** — one idempotent installer that does everything after you have Google credentials (build image, tmpfs, config, go2rtc, warmer service, plugin patches, verify). See [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
+- **[`install.sh`](install.sh)** — one-shot installer for everything after your Google credentials; see [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
 - **[`docker-compose.yml`](docker-compose.yml)** — the go2rtc + warmer half of the stack as Compose services.
-- **[`scripts/`](scripts/)** — the three helper scripts: `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), and `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches). They take all paths/credentials as arguments or env vars — nothing is hardcoded.
+- **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), and `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches).
 - **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout) and `homebridge-plugin/*.patch` (the plugin changes as diffs against stock plugin 1.1.24).
 
 The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-1)** — build from the stable tag **`nestfix-1.9.14-1`** (development happens on the `fix/nest-ipv6-ice-failure` branch, which may carry in-progress work and debug logging, so don't build from the branch). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
@@ -30,9 +30,9 @@ There are four layers. Each builds on the last:
 
 1. **Google Device Access** — Google's [official API](https://developers.google.com/nest/device-access) for accessing Nest devices programmatically. One-time $5 registration. This gives you the credentials everything else needs.
 
-2. **[Homebridge](https://homebridge.io/)** + **[homebridge-google-nest-sdm](https://github.com/potmat/homebridge-google-nest-sdm)** — [Homebridge](https://github.com/homebridge/homebridge) (by the [@homebridge](https://github.com/homebridge) team) is an open-source HomeKit bridge that runs on a Pi or any server. The Nest plugin (by [@potmat](https://github.com/potmat)) connects to Google's SDM API and presents your cameras as HomeKit accessories. After this step, your cameras appear in Apple Home and live streams work — but tiles show a placeholder logo because there's no snapshot API.
+2. **[Homebridge](https://homebridge.io/)** + **[homebridge-google-nest-sdm](https://github.com/potmat/homebridge-google-nest-sdm)** — [Homebridge](https://github.com/homebridge/homebridge) (by the [@homebridge](https://github.com/homebridge) team) is an open-source HomeKit bridge that runs on a Pi or any server. The Nest plugin (by [@potmat](https://github.com/potmat)) connects to Google's SDM API and presents your cameras as HomeKit accessories. After this step, your cameras appear in Apple Home and live streams work — but the tiles are still blank.
 
-3. **[go2rtc](https://github.com/AlexxIT/go2rtc)** (patched) — go2rtc (by [@AlexxIT](https://github.com/AlexxIT)) is a streaming tool that can connect to Nest cameras via WebRTC, keep the connection alive, re-serve the stream over RTSP, and produce JPEG snapshots on demand. This is the engine that makes real tile images possible. (A one-line patch is needed on many home networks — explained below.)
+3. **[go2rtc](https://github.com/AlexxIT/go2rtc)** (patched) — go2rtc (by [@AlexxIT](https://github.com/AlexxIT)) keeps a stream warm per camera, which is what makes real tile images possible. Part 3 covers it, including the one-line patch many home networks need.
 
 4. **Snapshot warmer + plugin patches** — A small script that pulls a JPEG from each warm stream every 10 seconds (and immediately on motion/doorbell events), plus a patch to the Homebridge plugin that serves those images instead of the placeholder. This is the glue that connects go2rtc's capabilities to your HomeKit tiles.
 
@@ -66,7 +66,6 @@ Every path and container name is a flag with a sensible default (`./install.sh -
 
 **Option B — Docker Compose** ([`docker-compose.yml`](docker-compose.yml)) brings up the go2rtc + warmer half of the stack. You still build the image and generate `go2rtc.yaml` first (the file's header comments walk through it), add the one volume line to your Homebridge service, and run `./scripts/apply-snapshot-patch.sh`. Compose can't patch the plugin's `node_modules` for you, so that stays a script call.
 
-Either way, the detailed reference for **what** each piece does and **why** is the walkthrough below.
 
 ---
 
@@ -125,10 +124,6 @@ Two things to note:
 
 After restarting Homebridge, your cameras should appear in Apple Home. Live streams will work. But the tiles show a Google logo or a blank image — that's the problem this guide exists to solve.
 
-### Pub/Sub event handler crash — fixed in 1.1.24
-
-Older plugin versions crashed on `relationUpdate` events (which Google sends when device/room relationships change, including right after you enable events), silently killing the event stream. **This is fixed in plugin v1.1.24** ([PR #218](https://github.com/potmat/homebridge-google-nest-sdm/pull/218) by [@littlepope81](https://github.com/littlepope81); see [issue #214](https://github.com/potmat/homebridge-google-nest-sdm/issues/214)) — no manual patch is needed anymore. This repo's `Api.js` patch keeps that same guard *and* adds Pub/Sub auto-reconnect (below).
-
 ### Known limitation: Google filters rapid successive events (this is NOT a bug in this setup)
 
 If you have several motion/person events close together — e.g. someone leaves and comes back a couple of minutes later — you will often see **only the first one** reach HomeKit, so only the first gets a notification and an HKSV recording. This is **Google's own, documented behavior**: the SDM API does not publish rapid successive camera events (within a short debounce window) to your Pub/Sub topic, even when they are genuinely distinct events. See Google's [events documentation](https://developers.google.com/nest/device-access/api/events).
@@ -174,7 +169,7 @@ The fork also removes an inner retry loop in `rtcConn` that burned ~130 SDM API 
 ```bash
 git clone https://github.com/ajplotkin/go2rtc.git
 cd go2rtc
-git checkout fix/nest-ipv6-ice-failure
+git checkout nestfix-1.9.14-1   # stable tag — not the dev branch
 ```
 
 > **Prefer to patch stock go2rtc yourself?** Instead of cloning the fork, check out upstream go2rtc at the `v1.9.14` tag and apply [`patches/go2rtc-nest.patch`](patches/go2rtc-nest.patch) from this repo (`git clone https://github.com/AlexxIT/go2rtc && cd go2rtc && git checkout v1.9.14 && git apply /path/to/go2rtc-nest.patch`), then run the same build command below. The diff is the exact set of source changes described in this guide, plus the credited community PRs.
@@ -209,7 +204,7 @@ The script below reads your Nest credentials from Homebridge's own `config.json`
 
 The script is [`scripts/nest-go2rtc-sync.py`](scripts/nest-go2rtc-sync.py) in this repo — **copy it from there** rather than transcribing from this page. What it does:
 
-- Reads your Nest credentials straight from Homebridge's `config.json` (no second copy of secrets).
+- Reads your Nest credentials straight from Homebridge's `config.json`.
 - Lists your cameras/doorbells via the SDM API.
 - Derives a **stream key** from each device's SDM **room name** — lowercased, non-alphanumeric → `_` — which is the single join key the warmer and the patched plugin also use. It refuses (loudly, non-zero) if two devices share a room, since the key would collide (see the one-camera-per-room note below).
 - Writes a URL-encoded `go2rtc.yaml` (with a `preload:` per camera) and restarts the go2rtc container.
@@ -232,11 +227,11 @@ Every layer must agree on the stream key or the plugin reads the wrong file. All
 key = re.sub(r"[^a-z0-9]+", "_", room_display_name.lower()).strip("_")
 ```
 
-The generated `go2rtc.yaml` binds `api` to `127.0.0.1` (localhost only), but the RTSP (`:8554`) and WebRTC (`:8555`) listeners are on **all interfaces** and unauthenticated — fine on a trusted home LAN, but don't expose those ports to the internet.
+This is also why **one camera per room** is required: two cameras in the same room derive the same key and would collide, so the sync script refuses to write that config.
 
 </details>
 
-Run it (paths are required arguments — nothing is hardcoded):
+Run it:
 
 ```bash
 python3 ~/scripts/nest-go2rtc-sync.py \
@@ -255,15 +250,15 @@ python3 scripts/nest-go2rtc-sync.py \
   --container go2rtc --dry-run     # drop --dry-run to apply
 ```
 
-It is **idempotent and change-detecting**: it regenerates the config, compares it to the file on disk, and if they match it prints `config unchanged` and exits without touching go2rtc. It only rewrites and restarts when something actually changed, and it refuses to write an empty config if discovery returns nothing. That makes it safe to run whenever you like — a monthly timer is fine — because the disruptive part (the restart) only happens on a real change.
+It is **idempotent and change-detecting**: it regenerates the config, compares it to the file on disk, and if they match it prints `config unchanged` and exits without touching go2rtc. It refuses to write an empty config if discovery returns nothing.
 
 It preserves the `log.level` already in your config, so a rebuild to pick up a new camera won't silently undo a level you set by hand. Pass `--log-level debug` (or `info`, `warn`, …) to set it explicitly.
 
 Note that a **newly added camera still appears in HomeKit before you do any of this** — the plugin discovers cameras from the SDM API directly. It just won't have a warm stream, so its tile shows the placeholder until you re-run the sync.
 
-You only need to re-run this when your set of cameras or rooms changes (add/remove a camera, rename a room) — not on a schedule. The generated config is static; the credentials it embeds come from Homebridge's `config.json`, and the OAuth *refresh* token is long-lived (go2rtc mints short-lived access tokens itself at runtime), so a once-written config keeps working. If you do automate it (e.g. a weekly systemd timer to pick up new cameras), be aware of the next point.
+The generated config is static, and the OAuth *refresh* token it embeds is long-lived (go2rtc mints short-lived access tokens itself at runtime), so a once-written config keeps working indefinitely. You only need to re-run this when your set of cameras or rooms changes.
 
-> **A go2rtc restart drops every warm stream.** The sync script rewrites `go2rtc.yaml` and restarts the container to load it, and any restart tears down all active WebRTC sessions — tiles briefly fall back to the placeholder and live views drop until the streams re-warm (~30s) and re-extend. So restart go2rtc deliberately (config change, upgrade), not on a frequent timer. This is also why the config is kept static rather than regenerated every cycle.
+> **A go2rtc restart drops every warm stream.** When the config *has* changed, the script rewrites `go2rtc.yaml` and restarts the container to load it, and any restart tears down all active WebRTC sessions — tiles briefly fall back to the placeholder and live views drop until the streams re-warm (~30s) and re-extend. Running the script costs nothing when nothing changed, so a periodic timer is fine; it is the restart that is disruptive, and that only fires on a real change.
 
 ### Start go2rtc
 
@@ -274,6 +269,8 @@ docker run -d --name go2rtc \
   -v ~/go2rtc-nest/go2rtc.yaml:/config/go2rtc.yaml \
   go2rtc-nestfix:1.9.14
 ```
+
+> **This uses host networking.** The generated config binds the API to `127.0.0.1` (localhost only), but the RTSP (`:8554`) and WebRTC (`:8555`) listeners are on **all interfaces** and unauthenticated. That is fine on a trusted home LAN — but do not forward those ports, and don't run this on a machine with a public interface.
 
 Wait ~30 seconds for the streams to warm up, then verify:
 
@@ -314,18 +311,14 @@ sudo systemd-tmpfiles --create /etc/tmpfiles.d/nest-snaps.conf
 
 ### The warmer script
 
-The warmer auto-discovers streams from go2rtc (no hardcoded camera list) and only polls streams that have active media — cameras that are off are skipped, avoiding wasted SDM quota. Stale files are pruned after 30 minutes (`STALE_MAX_MIN`) so a camera that is genuinely gone shows the honest placeholder, while one that is only briefly mid-reconnect keeps its last good frame.
-
-It also watches for an **event trigger**: when the plugin receives a motion or doorbell event, it touches a signal file, and the warmer grabs a fresh frame within 1 second instead of waiting for the next cycle.
-
-The script is [`scripts/go2rtc-snapshot-warmer.sh`](scripts/go2rtc-snapshot-warmer.sh) — **copy it from there**. What it does each cycle:
+The script is [`scripts/go2rtc-snapshot-warmer.sh`](scripts/go2rtc-snapshot-warmer.sh) — **copy it from there**. It auto-discovers streams from go2rtc, so there is no hardcoded camera list. Each cycle it:
 
 - Asks go2rtc which streams are actually flowing bytes, and only polls those (off cameras are skipped — no wasted SDM quota).
 - Pulls a JPEG per warm stream and writes it atomically to `/run/nest-snaps/<key>.jpg`.
-- **Retries a failed fetch** (`ATTEMPTS`, default 3, one second apart) instead of losing the whole cycle to one transient HTTP 500. This matters more than it sounds: the plugin discards any snapshot older than 90 seconds, so a handful of silently-dropped cycles is enough to put the placeholder logo back on your tile.
+- **Retries a failed fetch** (`ATTEMPTS`, default 3, one second apart) instead of losing the whole cycle to one transient HTTP 500.
 - **Rejects undersized frames** (`MIN_BYTES`, default 15000) and keeps the last good file instead. ffmpeg emits a *solid grey* JPEG when it decodes H264 without a usable keyframe — around 5–6 KB at 720p, versus 60–100 KB for a real frame. Without this guard that grey image is published as a perfectly valid snapshot.
-- **Logs every failure** via `logger -t go2rtc-warmer` (`journalctl -t go2rtc-warmer`). The original script used `curl -sf`, which silently swallowed server errors — the failures were invisible for weeks.
-- Prunes files older than `STALE_MAX_MIN` (30 min), so a camera that went offline shows the honest placeholder instead of a frozen frame.
+- **Logs every failure** via `logger -t go2rtc-warmer` (`journalctl -t go2rtc-warmer`) — `curl -sf` would swallow server errors silently.
+- Prunes files older than `STALE_MAX_MIN` (30 min), so a camera that is genuinely gone shows the honest placeholder, while one only briefly mid-reconnect keeps its last good frame.
 
 Freshness: the **baseline** cycle uses a cache window *shorter* than the poll interval, so each cycle re-transcodes and the tile stays ~10s fresh. On a motion/doorbell event the plugin touches `/run/nest-snaps/.refresh` and the warmer immediately grabs a frame with a **1-second** cache — so the tile shows who's actually there, not a stale porch. (An earlier version used a 30s cache on both paths, which made "instant on motion" a lie; the shipped script fixes that.)
 
@@ -372,11 +365,11 @@ The plugin needs a few small changes. They're shipped as unified diffs in **[`pa
 
 What the patches do:
 
-- **`Camera.js`** — `getSnapshot()` returns the warm JPEG from `/homebridge/nest-snaps/<key>.jpg` instead of the Google logo, falling back to the logo if the file is missing or older than 90 seconds (so an off camera shows the honest placeholder). And on a motion/person event it creates `/homebridge/nest-snaps/.refresh` (via the plugin's `fs`, no subshell) to trigger an immediate warm-frame grab. The `<key>` is the slugified SDM room name — **identical** to the sync script's derivation, which is how the plugin finds the file the warmer wrote. *(The replayed/stale-event gate that used to live in this patch — and in a `Doorbell.js` patch — is now in the base plugin as of 1.1.24, [@littlepope81](https://github.com/littlepope81)'s [PR #219](https://github.com/potmat/homebridge-google-nest-sdm/pull/219), so this repo no longer carries it.)*
-- **`Api.js`** — **auto-reconnects the Pub/Sub subscription**. Upstream sets it up once and, on error, just stops — so a silently dropped streaming-pull connection permanently kills all camera events (no motion alerts, no HKSV recording) until you restart Homebridge. This re-subscribes on `error`/`close` with exponential backoff, plus a 12-hour proactive recycle to catch half-open stalls. Still open upstream as [PR #216](https://github.com/potmat/homebridge-google-nest-sdm/pull/216). (The `relationUpdate`/malformed-event guard this patch used to add is now in the base plugin as of 1.1.24 via [#218](https://github.com/potmat/homebridge-google-nest-sdm/pull/218); the patch reuses the base handler and only wraps the reconnect around it.)
-- **`StreamingDelegate.js`** — *(optional, Part 6)* routes HomeKit live view **and HKSV recording** through go2rtc's warm RTSP stream, so neither opens a second Google session (fixes recording-time stream contention, corrupt clips, and the blank-tile-after-live-view failure). It also arms a start-of-session inactivity watchdog tuned for the warm-RTSP path. The recording-lifecycle hardening this patch used to carry (session-identity check on close, `.catch()`-guarded teardown, orphaned-session cleanup) is now in the base plugin as of 1.1.24 — merged from this repo's [#217](https://github.com/potmat/homebridge-google-nest-sdm/pull/217) / [#223](https://github.com/potmat/homebridge-google-nest-sdm/pull/223) — so the patch keeps only the go2rtc routing on top of it.
+- **`Camera.js`** — `getSnapshot()` returns the warm JPEG from `/homebridge/nest-snaps/<key>.jpg` instead of the Google logo, falling back to the logo if the file is missing or older than 90 seconds (so an off camera shows the honest placeholder). On a motion/person event it creates `/homebridge/nest-snaps/.refresh` (via the plugin's `fs`, no subshell) to trigger an immediate warm-frame grab. The `<key>` is derived exactly as the sync script derives it, which is how the plugin finds the file the warmer wrote.
+- **`Api.js`** — **auto-reconnects the Pub/Sub subscription**. Upstream sets it up once and, on error, just stops — so a silently dropped streaming-pull connection permanently kills all camera events (no motion alerts, no HKSV recording) until you restart Homebridge. This re-subscribes on `error`/`close` with exponential backoff, plus a 12-hour proactive recycle to catch half-open stalls. Still open upstream as [PR #216](https://github.com/potmat/homebridge-google-nest-sdm/pull/216).
+- **`StreamingDelegate.js`** — *(optional, Part 6)* routes HomeKit live view **and HKSV recording** through go2rtc's warm RTSP stream, so neither opens a second Google session. It also arms a start-of-session inactivity watchdog tuned for the warm-RTSP path.
 
-*(Two patches this repo used to carry — a `Doorbell.js` stale-event gate and an `HksvStreamer.js` hang-on-dead-input fix — were merged upstream and ship in plugin 1.1.24, so they're gone from this repo's patch set. What remains is the three above.)*
+Earlier versions of this repo carried several more patches; those fixes were merged upstream and ship in plugin 1.1.24. The [Related Issues and PRs](#related-issues-and-prs) index records which.
 
 Clone this repo (you'll want it for the scripts too) and run the patcher:
 
@@ -412,7 +405,7 @@ After about 30 seconds:
 
 **Node v24.17.0 breaks the plugin entirely** with `ERR_STREAM_PREMATURE_CLOSE` on every OAuth call. This is a Node.js regression ([nodejs/node#63989](https://github.com/nodejs/node/issues/63989)), not a plugin bug. Fixed in Node 24.18.0. If you're on the official Homebridge Docker image, pull the latest.
 
-**A tile intermittently drops back to the placeholder, even though the camera is on and streaming.** The snapshot endpoint (`/api/frame.jpeg`) returns HTTP 500 on a few percent of transcodes, in bursts, and the plugin discards any snapshot older than 90 seconds — so a run of silently-failed warmer cycles is enough to blank the tile. The shipped warmer retries and logs, which makes this a non-event; if you have modified it, keep the retry. Diagnose with:
+**A tile intermittently drops back to the placeholder, even though the camera is on and streaming.** The snapshot endpoint returns intermittent HTTP 500s (see [Part 4](#part-4-the-snapshot-warmer)), and the plugin discards any snapshot older than 90 seconds — so a run of silently-failed warmer cycles is enough to blank the tile. The shipped warmer retries and logs, which makes this a non-event; if you have modified it, keep the retry. Diagnose with:
 
 ```bash
 journalctl -t go2rtc-warmer --since -30min   # fetch failures / grey-frame rejections
@@ -483,13 +476,13 @@ This `StreamingDelegate.js` change ships as [`patches/homebridge-plugin/Streamin
 
 ### HKSV recording rides the warm stream too — and this matters more than live view
 
-The same `StreamingDelegate.js` patch routes **HomeKit Secure Video recording** through the warm RTSP stream as well, using the identical freshness check. This is the bigger win.
+The same `StreamingDelegate.js` patch routes **HomeKit Secure Video recording** through the warm RTSP stream as well, using the identical freshness check.
 
 By default, when motion fires, the plugin's recording handler (`handleRecordingStreamRequest`) opens **yet another** fresh Google WebRTC session — a *second* concurrent stream for that camera (a *third* if you're also viewing live). That tips Nest over its per-device concurrent-stream limit, and every recording triggers an ugly cascade: the second dial contends with go2rtc's warm stream → go2rtc's stream gets throttled/dropped → it reconnects (a burst of `retry=` in the go2rtc log) → and the recording itself decodes garbage (`concealing 3721 DC/AC/MV errors in I frame`, corrupt frames) because it started against a contended, half-broken stream. The system "self-heals" a minute later, but the clip is ruined.
 
 Routing recording through the warm RTSP stream instead (same check → `rtsp://127.0.0.1:8554/<key>`, else fall back to a Google dial) eliminates all of it: no second session, no contention, no reconnect burst, and the transcode runs against a clean, already-established stream. Measured before/after on a Pi 4: decode errors dropped from **thousands per recording to ~zero**, and recording-induced reconnect spikes went to **none**. `HksvStreamer.js` already accepts an RTSP input (no stdin pipe needed), so the only change is at the streamer-creation point in `handleRecordingStreamRequest`. It ships in the same `StreamingDelegate.js.patch`.
 
-The patch also carries two teardown guards the RTSP path needs (found in adversarial review): `closeRecordingStream` must **guard `nestStreamer.teardown()`** (on the RTSP path there's no streamer object — the unguarded call throws on every recording close, harmless only because hap-nodejs catches it), and `handleRecordingStreamRequest` must **destroy any prior session before overwriting `recordingSessionInfo`**. That second one matters *more* on the go2rtc path than on stock: a Google WebRTC input self-expires after 5 minutes, but the warm RTSP input never EOFs, so a clobbered session's transcode would otherwise run **forever** (the exact shape of plugin issue #150). Both are in the patch.
+The patch also carries two teardown guards the RTSP path needs: `closeRecordingStream` must **guard `nestStreamer.teardown()`** (on the RTSP path there's no streamer object — the unguarded call throws on every recording close, harmless only because hap-nodejs catches it), and `handleRecordingStreamRequest` must **destroy any prior session before overwriting `recordingSessionInfo`**. That second one matters *more* on the go2rtc path than on stock: a Google WebRTC input self-expires after 5 minutes, but the warm RTSP input never EOFs, so a clobbered session's transcode would otherwise run **forever** (the exact shape of plugin issue #150). Both are in the patch.
 
 ## Reference
 
