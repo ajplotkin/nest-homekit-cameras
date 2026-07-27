@@ -22,7 +22,7 @@ This guide walks through the full setup from scratch: getting API access to your
 - **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), and `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches).
 - **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout) and `homebridge-plugin/*.patch` (the plugin changes as diffs against stock plugin 1.1.24).
 
-The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-1)** — build from the stable tag **`nestfix-1.9.14-1`** (development happens on the `fix/nest-ipv6-ice-failure` branch, which may carry in-progress work and debug logging, so don't build from the branch). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
+The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-2)** — build from the stable tag **`nestfix-1.9.14-2`** (development happens on the `fix/nest-ipv6-ice-failure` branch, which may carry in-progress work and debug logging, so don't build from the branch). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
 
 ## What You'll Set Up
 
@@ -186,7 +186,7 @@ The fork also removes an inner retry loop in `rtcConn` that burned ~130 SDM API 
 ```bash
 git clone https://github.com/ajplotkin/go2rtc.git
 cd go2rtc
-git checkout nestfix-1.9.14-1   # stable tag — not the dev branch
+git checkout nestfix-1.9.14-2   # stable tag — not the dev branch
 ```
 
 > **Prefer to patch stock go2rtc yourself?** Instead of cloning the fork, check out upstream go2rtc at the `v1.9.14` tag and apply [`patches/go2rtc-nest.patch`](patches/go2rtc-nest.patch) from this repo (`git clone https://github.com/AlexxIT/go2rtc && cd go2rtc && git checkout v1.9.14 && git apply /path/to/go2rtc-nest.patch`), then run the same build command below. The diff is the exact set of source changes described in this guide, plus the credited community PRs.
@@ -600,6 +600,8 @@ A camera that's **switched off** costs a little more than an active one: the for
 **Upstream go2rtc work this fork builds on (credit to the authors):**
 
 - [go2rtc PR #2368](https://github.com/AlexxIT/go2rtc/pull/2368) — the Nest keyframe-request + `sprop-parameter-sets`-in-SDP patches from this fork, submitted upstream
+- [go2rtc PR #2378](https://github.com/AlexxIT/go2rtc/pull/2378) — `rtcConn` never closed the PeerConnection on a failed dial, leaking it plus its ICE agent's mDNS `:5353` sockets on every retry. A powered-off camera accumulated 142 leaked sockets on one host, which starved mDNS and left HomeKit accessories at "No Response". From this fork, submitted upstream
+- [go2rtc PR #2380](https://github.com/AlexxIT/go2rtc/pull/2380) — `RTPDepay` began depayloading at whatever packet arrived first, so attaching mid-fragmented-NAL produced a synthesized, head-truncated "keyframe" that passes `IsKeyframe` but cannot decode. `/api/frame.jpeg` builds a fresh depayloader per request and hit it constantly. From this fork, submitted upstream
 - [go2rtc PR #2351](https://github.com/AlexxIT/go2rtc/pull/2351) by [@tillo](https://github.com/tillo) — loops the Nest stream-extension timer and stops sharing session state between cameras (adopted here; the fork adds transient-error retry on top)
 - [go2rtc PR #2194](https://github.com/AlexxIT/go2rtc/pull/2194) by [@MechanicalCoderX](https://github.com/MechanicalCoderX) — Nest expiry/token/timeout/leak fixes (the ~83-minute HTTP timeout fix is adopted here)
 - [go2rtc PR #2327](https://github.com/AlexxIT/go2rtc/pull/2327) by [@zephleggett](https://github.com/zephleggett) — reap the keyframe consumer on client disconnect (defense-in-depth for the snapshot warmer)

@@ -1,21 +1,72 @@
 # go2rtc Nest patches — apply to a clean go2rtc v1.9.14 checkout
 #
-# Corresponds to https://github.com/ajplotkin/go2rtc at the stable tag nestfix-1.9.14-1,
+# Corresponds to https://github.com/ajplotkin/go2rtc at the stable tag nestfix-1.9.14-2,
 # which is the tag the README tells you to build. (Development continues on the
 # fix/nest-ipv6-ice-failure branch; that work is not in this diff.)
-# Includes this project's own patches (IPv4-only ICE, keyframe PLI, sprop-in-SDP,
-# stall watchdog, extend-loop resilience) AND these adopted community PRs, credited
-# in the README: AlexxIT/go2rtc #2351 (tillo), #2194 & #2193 (MechanicalCoderX),
-# #2327 (zephleggett).
+#
+# This project's own patches: IPv4-only ICE, keyframe PLI, sprop-in-SDP, stall
+# watchdog, extend-loop resilience, plus two fixes also filed upstream —
+#   AlexxIT/go2rtc #2378  nest: close the PeerConnection/RTSP client on a failed
+#                         dial (leaked fds and ICE mDNS :5353 sockets)
+#   AlexxIT/go2rtc #2380  h264: wait for a partition head before depayloading
+#                         (mid-fragment attach produced undecodable keyframes)
+# and it surfaces ffmpeg's stderr on a failed snapshot transcode.
+#
+# Adopted community PRs, credited in the README: AlexxIT/go2rtc #2351 (tillo),
+# #2194 & #2193 (MechanicalCoderX), #2327 (zephleggett).
 #
 # Apply:  cd go2rtc && git apply /path/to/go2rtc-nest.patch
 # (or from a tarball checkout:  patch -p1 < go2rtc-nest.patch)
-#
+diff --git a/internal/ffmpeg/jpeg.go b/internal/ffmpeg/jpeg.go
+index 63d886d..57e2e4d 100644
+--- a/internal/ffmpeg/jpeg.go
++++ b/internal/ffmpeg/jpeg.go
+@@ -2,6 +2,7 @@ package ffmpeg
+ 
+ import (
+ 	"bytes"
++	"errors"
+ 	"fmt"
+ 	"net/url"
+ 	"os/exec"
+@@ -27,7 +28,31 @@ func transcode(b []byte, args string) ([]byte, error) {
+ 	cmdArgs := shell.QuoteSplit(args)
+ 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
+ 	cmd.Stdin = bytes.NewBuffer(b)
+-	return cmd.Output()
++
++	out, err := cmd.Output()
++	if err != nil {
++		// cmd.Output captures stderr into ExitError.Stderr, but callers only see
++		// err.Error() ("exit status N"), so FFmpeg's diagnostic is lost. Attach it.
++		var exitErr *exec.ExitError
++		if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
++			err = fmt.Errorf("%w: %s", err, tailStderr(exitErr.Stderr))
++		}
++		return nil, err
++	}
++	return out, nil
++}
++
++// maxStderr bounds how much FFmpeg output is attached to an error; the string can
++// reach an HTTP body, and log.ffmpeg=debug makes the output unbounded.
++const maxStderr = 1024
++
++// tailStderr returns the last maxStderr bytes, where FFmpeg's failure reason sits.
++func tailStderr(b []byte) []byte {
++	b = bytes.TrimSpace(b)
++	if len(b) > maxStderr {
++		return append([]byte("..."), b[len(b)-maxStderr:]...)
++	}
++	return b
+ }
+ 
+ func defaultArgs() *ffmpeg.Args {
 diff --git a/internal/mjpeg/mjpeg.go b/internal/mjpeg/mjpeg.go
-index e9f973a..7cfe920 100644
+index e9f973a..338499b 100644
 --- a/internal/mjpeg/mjpeg.go
 +++ b/internal/mjpeg/mjpeg.go
-@@ -83,11 +83,24 @@ func handlerKeyframe(w http.ResponseWriter, r *http.Request) {
+@@ -83,17 +83,33 @@ func handlerKeyframe(w http.ResponseWriter, r *http.Request) {
  		return
  	}
  
@@ -35,12 +86,21 @@ index e9f973a..7cfe920 100644
  
 -	stream.RemoveConsumer(cons)
 +	if ctx.Err() != nil {
-+		b = nil     // don't let a partial/raw buffer get cached (cache defer stores non-nil b)
-+		return      // client gone before a keyframe arrived
++		b = nil // don't let a partial/raw buffer get cached (cache defer stores non-nil b)
++		return  // client gone before a keyframe arrived
 +	}
  
  	switch cons.CodecName() {
  	case core.CodecH264, core.CodecH265:
+ 		ts := time.Now()
+ 		var err error
+ 		if b, err = ffmpeg.JPEGWithQuery(b, query); err != nil {
++			b = nil // don't cache a failed/partial transcode (ffmpeg can return partial stdout + err)
++			// the 500 body is often swallowed by the client (e.g. curl -sf), so log it
++			log.Error().Err(err).Str("src", query.Get("src")).Msg("[mjpeg] transcode keyframe")
+ 			http.Error(w, err.Error(), http.StatusInternalServerError)
+ 			return
+ 		}
 diff --git a/internal/mp4/mp4.go b/internal/mp4/mp4.go
 index d0a6d97..83ce635 100644
 --- a/internal/mp4/mp4.go
@@ -69,10 +129,10 @@ index d0a6d97..83ce635 100644
  	// Apple Safari won't show frame without length
  	header := w.Header()
 diff --git a/internal/streams/preload.go b/internal/streams/preload.go
-index ac4403d..9ab0287 100644
+index 447b5ac..0465b0e 100644
 --- a/internal/streams/preload.go
 +++ b/internal/streams/preload.go
-@@ -5,6 +5,7 @@ import (
+@@ -5,12 +5,13 @@ import (
  	"maps"
  	"net/url"
  	"sync"
@@ -80,6 +140,13 @@ index ac4403d..9ab0287 100644
  
  	"github.com/AlexxIT/go2rtc/pkg/probe"
  )
+ 
+ type Preload struct {
+-	stream *Stream      // Don't output the stream to JSON to not worry about its secrets.
++	stream *Stream      // Don't include the stream in JSON to avoid leaking secrets.
+ 	Cons   *probe.Probe `json:"consumer"`
+ 	Query  string       `json:"query"`
+ }
 @@ -42,6 +43,10 @@ func AddPreload(name, rawQuery string) error {
  	cons := probe.Create("preload", query)
  
@@ -91,31 +158,47 @@ index ac4403d..9ab0287 100644
  		return err
  	}
  
-@@ -49,6 +54,30 @@ func AddPreload(name, rawQuery string) error {
+@@ -49,6 +54,46 @@ func AddPreload(name, rawQuery string) error {
  	return nil
  }
  
 +func retryPreload(name, rawQuery string, query url.Values) {
 +	for {
-+		time.Sleep(time.Minute)
++		// Gentler than 1 min: each attempt is one GenerateWebRtcStream (SDM executeCommand,
++		// counts against the 100 QPH/camera and shared 10 QPM/project quotas). 2 min keeps a
++		// recovered camera warming reasonably fast without hammering quota while it stays off.
++		time.Sleep(2 * time.Minute)
 +
++		// Decide whether we still need to retry, then release the lock BEFORE the network dial
++		// so a 429 backoff inside AddConsumer can't hold preloadsMu (blocking config reload /
++		// consumer attach for this stream for the whole backoff).
 +		preloadsMu.Lock()
 +		if preloads[name] != nil { // a successful AddPreload (or newer retry) already ran
 +			preloadsMu.Unlock()
 +			return
 +		}
 +		stream := Get(name)
++		preloadsMu.Unlock()
 +		if stream == nil { // stream removed from config
-+			preloadsMu.Unlock()
 +			return
 +		}
++
 +		cons := probe.Create("preload", query)
-+		if err := stream.AddConsumer(cons); err == nil {
++		if err := stream.AddConsumer(cons); err != nil {
++			continue // still unavailable; try again next cycle
++		}
++
++		// Dial succeeded — register under lock, but a concurrent AddPreload/retry may have won
++		// while we were dialing; if so, drop our extra consumer instead of leaking it.
++		preloadsMu.Lock()
++		if preloads[name] == nil {
 +			preloads[name] = &Preload{stream: stream, Cons: cons, Query: rawQuery}
 +			preloadsMu.Unlock()
-+			return
++		} else {
++			preloadsMu.Unlock()
++			stream.RemoveConsumer(cons)
 +		}
-+		preloadsMu.Unlock()
++		return
 +	}
 +}
 +
@@ -229,10 +312,10 @@ index 0000000..c35dae2
 +	}
 +}
 diff --git a/pkg/h264/h264.go b/pkg/h264/h264.go
-index 1223953..ae3b0c2 100644
+index 1223953..1e36fe0 100644
 --- a/pkg/h264/h264.go
 +++ b/pkg/h264/h264.go
-@@ -126,10 +126,21 @@ func GetFmtpLine(avc []byte) string {
+@@ -126,10 +126,23 @@ func GetFmtpLine(avc []byte) string {
  	s := "packetization-mode=1"
  
  	for {
@@ -242,7 +325,9 @@ index 1223953..ae3b0c2 100644
 +			return s
 +		}
  		size := 4 + int(binary.BigEndian.Uint32(avc))
-+		if size > len(avc) {
++		// size < 5 guards a huge length that overflows int on 32-bit builds (wraps
++		// negative, else avc[4:size] would panic); size > len(avc) guards truncation.
++		if size < 5 || size > len(avc) {
 +			return s
 +		}
  
@@ -254,6 +339,45 @@ index 1223953..ae3b0c2 100644
  			s += ";profile-level-id=" + hex.EncodeToString(avc[5:8])
  			s += ";sprop-parameter-sets=" + base64.StdEncoding.EncodeToString(avc[4:size])
  		case NALUTypePPS:
+diff --git a/pkg/h264/rtp.go b/pkg/h264/rtp.go
+index d093254..6f1adb3 100644
+--- a/pkg/h264/rtp.go
++++ b/pkg/h264/rtp.go
+@@ -21,7 +21,25 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
+ 
+ 	buf := make([]byte, 0, 512*1024) // 512K
+ 
++	// A depayloader attaching to a live stream can land in the middle of a
++	// fragmented NAL unit. codecs.H264Packet appends FU-A fragments without
++	// checking the start bit, so those orphan fragments are assembled and
++	// emitted under a synthesized NAL header - a NAL that looks valid (and
++	// passes IsKeyframe when the fragmented type is 5) but is missing its
++	// head, including the slice header. Consumers then fail to decode it.
++	// RFC 6184 §5.8 requires discarding fragments that follow a lost start,
++	// and pion's own SampleBuilder gates on IsPartitionHead for this reason.
++	// Wait for a partition head before feeding the depayloader anything.
++	synced := false
++
+ 	return func(packet *rtp.Packet) {
++		if !synced {
++			if !depack.IsPartitionHead(packet.Payload) {
++				return
++			}
++			synced = true
++		}
++
+ 		//log.Printf("[RTP] codec: %s, nalu: %2d, size: %6d, ts: %10d, pt: %2d, ssrc: %d, seq: %d, %v", codec.Name, packet.Payload[0]&0x1F, len(packet.Payload), packet.Timestamp, packet.PayloadType, packet.SSRC, packet.SequenceNumber, packet.Marker)
+ 
+ 		payload, err := depack.Unmarshal(packet.Payload)
+@@ -89,7 +107,7 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
+ 
+ 		// should not be that huge SPS
+ 		if NALUType(payload) == NALUTypeSPS && binary.BigEndian.Uint32(payload) >= PSMaxSize {
+-			// some Chinese buggy cameras has single packet with SPS+PPS+IFrame separated by 00 00 00 01
++			// some Chinese buggy cameras have a single packet with SPS+PPS+IFrame separated by 00 00 00 01
+ 			// https://github.com/AlexxIT/WebRTC/issues/391
+ 			// https://github.com/AlexxIT/WebRTC/issues/392
+ 			payload = annexb.FixAnnexBInAVCC(payload)
 diff --git a/pkg/homekit/helpers.go b/pkg/homekit/helpers.go
 index 625e3ab..13b4d32 100644
 --- a/pkg/homekit/helpers.go
@@ -273,10 +397,10 @@ index 625e3ab..13b4d32 100644
  			mediaCodec := &core.Codec{
  				Name:      videoCodecs[codec.CodecType],
 diff --git a/pkg/nest/api.go b/pkg/nest/api.go
-index 4e9e4db..ae69dd1 100644
+index 4e9e4db..77b2e54 100644
 --- a/pkg/nest/api.go
 +++ b/pkg/nest/api.go
-@@ -26,7 +26,10 @@ type API struct {
+@@ -26,7 +26,11 @@ type API struct {
  	StreamToken          string
  	StreamExtensionToken string
  
@@ -284,10 +408,11 @@ index 4e9e4db..ae69dd1 100644
 +
  	extendTimer *time.Timer
 +	extendStop  chan struct{}
++	extendDone  chan struct{}
  }
  
  type Auth struct {
-@@ -49,8 +52,12 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
+@@ -49,8 +53,12 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
  	key := clientID + ":" + clientSecret + ":" + refreshToken
  	now := time.Now()
  
@@ -301,7 +426,7 @@ index 4e9e4db..ae69dd1 100644
  	}
  
  	data := url.Values{
-@@ -60,7 +67,7 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
+@@ -60,7 +68,7 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
  		"refresh_token": []string{refreshToken},
  	}
  
@@ -310,7 +435,7 @@ index 4e9e4db..ae69dd1 100644
  	res, err := client.PostForm("https://www.googleapis.com/oauth2/v4/token", data)
  	if err != nil {
  		return nil, err
-@@ -89,7 +96,7 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
+@@ -89,7 +97,7 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
  
  	cache[key] = api
  
@@ -319,7 +444,7 @@ index 4e9e4db..ae69dd1 100644
  }
  
  func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
-@@ -101,7 +108,7 @@ func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
+@@ -101,7 +109,7 @@ func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
  
  	req.Header.Set("Authorization", "Bearer "+a.Token)
  
@@ -328,7 +453,7 @@ index 4e9e4db..ae69dd1 100644
  	res, err := client.Do(req)
  	if err != nil {
  		return nil, err
-@@ -178,7 +185,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
+@@ -178,7 +186,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
  
  		req.Header.Set("Authorization", "Bearer "+a.Token)
  
@@ -337,7 +462,7 @@ index 4e9e4db..ae69dd1 100644
  		res, err := client.Do(req)
  		if err != nil {
  			return "", err
-@@ -228,23 +235,12 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
+@@ -228,23 +236,12 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
  }
  
  func (a *API) refreshToken() error {
@@ -364,7 +489,7 @@ index 4e9e4db..ae69dd1 100644
  	if len(parts) != 3 {
  		return errors.New("nest: invalid cache key format")
  	}
-@@ -295,7 +291,7 @@ func (a *API) ExtendStream() error {
+@@ -295,7 +292,7 @@ func (a *API) ExtendStream() error {
  
  	req.Header.Set("Authorization", "Bearer "+a.Token)
  
@@ -373,7 +498,7 @@ index 4e9e4db..ae69dd1 100644
  	res, err := client.Do(req)
  	if err != nil {
  		return err
-@@ -348,7 +344,7 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
+@@ -348,7 +345,7 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
  
  	req.Header.Set("Authorization", "Bearer "+a.Token)
  
@@ -382,7 +507,7 @@ index 4e9e4db..ae69dd1 100644
  	res, err := client.Do(req)
  	if err != nil {
  		return "", err
-@@ -412,11 +408,12 @@ func (a *API) StopRTSPStream() error {
+@@ -412,11 +409,12 @@ func (a *API) StopRTSPStream() error {
  
  	req.Header.Set("Authorization", "Bearer "+a.Token)
  
@@ -396,7 +521,7 @@ index 4e9e4db..ae69dd1 100644
  
  	if res.StatusCode != 200 {
  		return errors.New("nest: wrong status: " + res.Status)
-@@ -469,11 +466,50 @@ func (a *API) StartExtendStreamTimer() {
+@@ -469,18 +467,71 @@ func (a *API) StartExtendStreamTimer() {
  		return
  	}
  
@@ -405,13 +530,16 @@ index 4e9e4db..ae69dd1 100644
 +	// returns a new expiresAt, so keep extending until the stream stops.
 +	timer := time.NewTimer(time.Until(a.StreamExpiresAt) - time.Minute)
 +	stop := make(chan struct{})
++	done := make(chan struct{})
 +	a.extendTimer = timer
 +	a.extendStop = stop
++	a.extendDone = done
 +
  	go func() {
 -		<-a.extendTimer.C
 -		if err := a.ExtendStream(); err != nil {
 -			return
++		defer close(done)
 +		// Retry transient extend/refresh failures a few times before giving up, so a single
 +		// blip (one 10s timeout, a 429/401) does not permanently stop extension and leave the
 +		// session to expire (which stalls the stream). If it truly can't extend, the loop exits
@@ -451,20 +579,29 @@ index 4e9e4db..ae69dd1 100644
  		}
  	}()
  }
-@@ -483,4 +519,8 @@ func (a *API) StopExtendStreamTimer() {
- 		a.extendTimer.Stop()
- 		a.extendTimer = nil
- 	}
+ 
+ func (a *API) StopExtendStreamTimer() {
 +	if a.extendStop != nil {
 +		close(a.extendStop)
 +		a.extendStop = nil
 +	}
+ 	if a.extendTimer != nil {
+ 		a.extendTimer.Stop()
+ 		a.extendTimer = nil
+ 	}
++	// Wait for the goroutine to actually exit before returning, so a caller (RTSPClient.Stop)
++	// can't race an in-flight ExtendStream writing StreamToken/StreamExtensionToken against
++	// StopRTSPStream clearing them. Bounded by the 10s HTTP client timeout.
++	if a.extendDone != nil {
++		<-a.extendDone
++		a.extendDone = nil
++	}
  }
 diff --git a/pkg/nest/client.go b/pkg/nest/client.go
-index 6a57091..a38b25d 100644
+index 6a57091..416b6cf 100644
 --- a/pkg/nest/client.go
 +++ b/pkg/nest/client.go
-@@ -97,62 +97,59 @@ func (c *WebRTCClient) MarshalJSON() ([]byte, error) {
+@@ -97,62 +97,67 @@ func (c *WebRTCClient) MarshalJSON() ([]byte, error) {
  }
  
  func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, error) {
@@ -547,6 +684,7 @@ index 6a57091..a38b25d 100644
 -		}
 +	offer, err := conn.CreateCompleteOffer(medias)
 +	if err != nil {
++		_ = pc.Close()
 +		return nil, err
 +	}
  
@@ -560,11 +698,18 @@ index 6a57091..a38b25d 100644
 +	// consumers. Let producer.go's outer reconnect handle backoff instead.
 +	answer, err := nestAPI.ExchangeSDP(projectID, deviceID, offer)
 +	if err != nil {
++		// Close the failed PeerConnection: it never reaches ICE connectivity
++		// (no answer is set), so pion's connection-state auto-close never fires
++		// and its ICE agent's mDNS socket (:5353) leaks on every failed dial.
++		// An off camera returning 400 every ~2 min otherwise accumulates sockets
++		// until host mDNS breaks. See AlexxIT/go2rtc#2378.
++		_ = pc.Close()
 +		return nil, err
 +	}
  
 -		return &WebRTCClient{conn: conn, api: nestAPI}, nil
 +	if err = conn.SetAnswer(answer); err != nil {
++		_ = pc.Close()
 +		return nil, err
  	}
  
@@ -573,7 +718,15 @@ index 6a57091..a38b25d 100644
  }
  
  func rtspConn(nestAPI *API, rawURL, projectID, deviceID string) (*RTSPClient, error) {
-@@ -187,8 +184,10 @@ func (c *RTSPClient) Start() error {
+@@ -166,6 +171,7 @@ func rtspConn(nestAPI *API, rawURL, projectID, deviceID string) (*RTSPClient, er
+ 		return nil, err
+ 	}
+ 	if err := rtspClient.Describe(); err != nil {
++		_ = rtspClient.Close()
+ 		return nil, err
+ 	}
+ 
+@@ -187,8 +193,10 @@ func (c *RTSPClient) Start() error {
  }
  
  func (c *RTSPClient) Stop() error {
@@ -586,10 +739,10 @@ index 6a57091..a38b25d 100644
  }
  
 diff --git a/pkg/webrtc/conn.go b/pkg/webrtc/conn.go
-index 924fd55..5a27bae 100644
+index 924fd55..bf45de8 100644
 --- a/pkg/webrtc/conn.go
 +++ b/pkg/webrtc/conn.go
-@@ -1,12 +1,16 @@
+@@ -1,17 +1,26 @@
  package webrtc
  
  import (
@@ -606,11 +759,53 @@ index 924fd55..5a27bae 100644
  	"github.com/pion/rtcp"
  	"github.com/pion/rtp"
  	"github.com/pion/webrtc/v4"
-@@ -87,10 +91,17 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
++	zlog "github.com/rs/zerolog/log"
+ )
+ 
++// nestConnSeq gives each Nest producer OnTrack a small unique id so the [nestdbg] logs can be
++// grouped per camera-session — Nest assigns SSRC 7777 to every camera, so SSRC can't distinguish them.
++var nestConnSeq atomic.Int64
++
+ type Conn struct {
+ 	core.Connection
+ 	core.Listener
+@@ -34,6 +43,13 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+ 		pc: pc,
+ 	}
+ 
++	// Patched (Nest): set true once the Nest video track delivers its first RTP packet.
++	// Shared between OnTrack (setter) and OnConnectionStateChange (the connect watchdog reader)
++	// via closure capture. The per-track stall watchdog inside OnTrack only arms after the
++	// first packet; this covers the "connected but no video RTP ever" zombie, which OnTrack
++	// would never see.
++	var nestVideoSeen atomic.Bool
++
+ 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+ 		// last candidate will be empty
+ 		if candidate != nil {
+@@ -87,10 +103,41 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}
  		}
  
 -		if c.Mode == core.ModePassiveProducer && remote.Kind() == webrtc.RTPCodecTypeVideo {
++		// Nest drought-recovery state, shared by the PLI ticker and the stall watchdog below.
++		// A Nest camera stops sending keyframes (sometimes all RTP) for ~12-24s while it processes
++		// its own event clip after motion; established consumers then can't decode. The camera
++		// ignores in-band keyframe requests (FIR) during this window, so recovery is a close/re-dial
++		// (a REPLACEMENT session, not an addition), which opens with a fresh IDR.
++		//
++		// isNestVideoTrack = "a Nest video track arrived" (codec-irrelevant); it only gates
++		// nestVideoSeen for the connect watchdog. isNestVideo additionally requires H264 and gates the
++		// drought logic (read-loop keyframe/timestamp updates + the stall watchdog), because
++		// isRTPKeyframe parses H264 NAL types and would misparse a non-H264 track. Keeping the two
++		// separate avoids the connect watchdog killing a healthy non-H264 stream every 30s.
++		isNestVideoTrack := c.FormatName == "nest/webrtc" && remote.Kind() == webrtc.RTPCodecTypeVideo
++		isNestVideo := isNestVideoTrack && codec.Name == core.CodecH264
++		if isNestVideoTrack {
++			nestVideoSeen.Store(true) // disarms the connect watchdog in OnConnectionStateChange
++		}
++		var lastVideoNS, lastIDRNS atomic.Int64
++
 +		// Patched: also request periodic keyframes for the Nest source (ModeActiveProducer,
 +		// FormatName "nest/webrtc"). Upstream only does this for PassiveProducer (WHIP/browser
 +		// push). Gating on FormatName (not the mode) avoids forcing 2s IDRs on other
@@ -618,15 +813,22 @@ index 924fd55..5a27bae 100644
 +		// Keeps keyframes ~2s fresh so RTSP consumers (Homebridge live view) start fast.
 +		if (c.Mode == core.ModePassiveProducer || c.FormatName == "nest/webrtc") && remote.Kind() == webrtc.RTPCodecTypeVideo {
  			go func() {
- 				pkts := []rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())}}
+-				pkts := []rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())}}
 -				for range time.NewTicker(time.Second * 2).C {
++				ssrc := uint32(remote.SSRC())
 +				t := time.NewTicker(time.Second * 2)
 +				defer t.Stop()
 +				for range t.C {
++					// Plain PLI. FIR escalation was removed: production traces (2026-07-22 17:12 UTC
++					// drought) show Nest IGNORES FIR during its post-motion upload window — idr_age
++					// climbed past 11s while FIR was sent 5 times. The only thing that ends the
++					// drought is a fresh session (the re-dial in the watchdog below), so there is no
++					// point spending RTCP on an in-band keyframe request the camera won't honor.
++					pkts := []rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: ssrc}}
  					if err := pc.WriteRTCP(pkts); err != nil {
  						return
  					}
-@@ -98,6 +109,53 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -98,6 +145,82 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}()
  		}
  
@@ -648,26 +850,55 @@ index 924fd55..5a27bae 100644
 +			!strings.Contains(codec.FmtpLine, "sprop-parameter-sets=")
 +		var spropSPS, spropPPS []byte
 +
-+		// Patched: stall watchdog for the Nest video track. An expired/quiet Nest WebRTC
-+		// session stops delivering media WITHOUT erroring the connection, so producer.go never
-+		// reconnects and the stream becomes a zombie (warm but frozen -> HomeKit live view and
-+		// snapshots break). If no video RTP arrives for 15s while connected, close the
-+		// connection to force a reconnect. With the 2s PLI above, healthy video is never quiet
-+		// this long, so 15s is unambiguous.
-+		isNestVideo := c.FormatName == "nest/webrtc" && remote.Kind() == webrtc.RTPCodecTypeVideo
-+		var lastVideoNS atomic.Int64
++		// Patched: stall watchdog for the Nest video track. An expired/quiet Nest WebRTC session
++		// stops delivering media WITHOUT erroring the connection, so producer.go never reconnects
++		// and the stream becomes a zombie (warm but frozen). Two triggers, both -> close, which makes
++		// producer.go re-dial a fresh session (a REPLACEMENT: the old pc is closed here first):
++		//   - no real video RTP at all for 8s (full stall), or
++		//   - real video flows but no keyframe for 4s (the post-motion upload drought).
++		// A fresh session is the ONLY thing that ends a drought: Nest withholds video ~12-24s after a
++		// motion event and IGNORES FIR (verified 2026-07-22 17:12 UTC: idr_age climbed past 11s while
++		// FIR was sent 5x), but a re-dialed session opens with an IDR and recovers in ~2-4s. The
++		// keyframe trigger is 4s (down from 8s) so that fresh IDR reaches an in-progress HKSV recording
++		// well under the Apple hub's ~16-23s record deadline. Healthy video keeps a keyframe every ~2s
++		// (2s PLI), so idr_age >4s means a real drought, not jitter. connID distinguishes cameras in
++		// the logs — Nest assigns SSRC 7777 to every camera, so SSRC can't tell them apart.
 +		if isNestVideo {
-+			lastVideoNS.Store(time.Now().UnixNano())
++			now := time.Now().UnixNano()
++			lastVideoNS.Store(now)
++			lastIDRNS.Store(now)
++			connID := nestConnSeq.Add(1)
++			zlog.Info().Int64("conn", connID).Msg("[nestdbg] drought-watchdog armed")
 +			stallDone := make(chan struct{})
 +			defer close(stallDone)
 +			go func() {
-+				t := time.NewTicker(5 * time.Second)
++				t := time.NewTicker(time.Second)
 +				defer t.Stop()
 +				for {
 +					select {
 +					case <-t.C:
-+						if time.Since(time.Unix(0, lastVideoNS.Load())) > 15*time.Second {
-+							_ = c.Close() // unblocks remote.Read below -> producer reconnect
++						videoAge := time.Since(time.Unix(0, lastVideoNS.Load()))
++						idrAge := time.Since(time.Unix(0, lastIDRNS.Load()))
++						if videoAge > 3*time.Second || idrAge > 3*time.Second {
++							zlog.Info().Int64("conn", connID).Dur("video_age", videoAge).Dur("idr_age", idrAge).Msg("[nestdbg] watchdog tick (drought?)")
++						}
++						// Keyframe drought: real video is still flowing (recent RTP) but no keyframe
++						// for 4s — the post-motion upload window. Re-dial for a fresh IDR. Gated on
++						// videoAge because lastIDRNS <= lastVideoNS always (a keyframe IS a video
++						// packet), so idrAge >= videoAge; without the videoAge guard this fast trigger
++						// would shadow the full-stall branch below and turn a mere 5s network blip into
++						// a teardown. "Video flowing, no keyframe" is the signature we actually want.
++						if videoAge <= 4*time.Second && idrAge > 4*time.Second {
++							zlog.Info().Int64("conn", connID).Dur("video_age", videoAge).Dur("idr_age", idrAge).Msg("[nestdbg] STALL CLOSE: no keyframe")
++							_ = c.Close()
++							return
++						}
++						// Full RTP stall: no real video at all for 8s (dead session / sustained
++						// outage). More tolerant than the keyframe path — this is a network event,
++						// not a Nest drought, and the re-dial can't help until connectivity returns.
++						if videoAge > 8*time.Second {
++							zlog.Info().Int64("conn", connID).Dur("video_age", videoAge).Dur("idr_age", idrAge).Msg("[nestdbg] STALL CLOSE: no video RTP")
++							_ = c.Close()
 +							return
 +						}
 +					case <-stallDone:
@@ -680,20 +911,23 @@ index 924fd55..5a27bae 100644
  		for {
  			b := make([]byte, ReceiveMTU)
  			n, _, err := remote.Read(b)
-@@ -106,6 +164,9 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -113,9 +236,55 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}
  
- 			c.Recv += n
-+			if isNestVideo {
-+				lastVideoNS.Store(time.Now().UnixNano())
-+			}
- 
- 			packet := &rtp.Packet{}
- 			if err := packet.Unmarshal(b[:n]); err != nil {
-@@ -116,6 +177,42 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+ 			if len(packet.Payload) == 0 {
++				// WebRTC padding / bandwidth-probe packet: not real media. Must NOT refresh
++				// lastVideoNS, or a camera that keeps probing through a drought would keep the
++				// "no video RTP" watchdog from ever firing.
  				continue
  			}
  
++			if isNestVideo {
++				lastVideoNS.Store(time.Now().UnixNano())
++				if isRTPKeyframe(packet.Payload) {
++					lastIDRNS.Store(time.Now().UnixNano())
++				}
++			}
++
 +			if captureSprop {
 +				save := func(nal []byte) {
 +					if len(nal) == 0 {
@@ -733,3 +967,58 @@ index 924fd55..5a27bae 100644
  			track.WriteRTP(packet)
  		}
  	})
+@@ -137,6 +306,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+ 			for _, sender := range c.Senders {
+ 				sender.Start()
+ 			}
++			// Patched (Nest): connect watchdog for the "connected but no video RTP ever" zombie.
++			// OnTrack (and its per-track stall watchdog) only fire once media arrives; a session
++			// that reaches connected but never delivers a video packet would otherwise sit warm
++			// forever with no reconnect. If no Nest video track has been seen 30s after connect,
++			// close so producer.go reconnects. Gated on FormatName so only Nest is affected.
++			if c.FormatName == "nest/webrtc" {
++				go func() {
++					time.Sleep(30 * time.Second)
++					if !nestVideoSeen.Load() {
++						_ = c.Close()
++					}
++				}()
++			}
+ 		case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
+ 			// disconnect event comes earlier, than failed
+ 			// but it comes only for success connections
+@@ -147,6 +329,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+ 	return c
+ }
+ 
++// isRTPKeyframe reports whether an RTP H264 payload begins or contains an IDR NAL.
++// Handles single NAL (type 5), STAP-A (24, bundled), and FU-A (28) start fragments.
++// h264.IsKeyframe expects AVCC (length-prefixed), not RTP payloads, so detect here.
++func isRTPKeyframe(pl []byte) bool {
++	if len(pl) == 0 {
++		return false
++	}
++	switch pl[0] & 0x1F {
++	case h264.NALUTypeIFrame: // 5: single-NAL IDR
++		return true
++	case 24: // STAP-A: walk bundled NALs
++		for b := pl[1:]; len(b) >= 2; {
++			sz := int(binary.BigEndian.Uint16(b))
++			b = b[2:]
++			if sz < 1 || sz > len(b) {
++				break
++			}
++			if b[0]&0x1F == h264.NALUTypeIFrame {
++				return true
++			}
++			b = b[sz:]
++		}
++	case 28: // FU-A: start fragment of an IDR
++		return len(pl) >= 2 && pl[1]&0x80 != 0 && pl[1]&0x1F == h264.NALUTypeIFrame
++	}
++	return false
++}
++
+ func (c *Conn) MarshalJSON() ([]byte, error) {
+ 	return json.Marshal(c.Connection)
+ }
