@@ -43,6 +43,10 @@ ap.add_argument("--out", required=True,
                 help="path to write the generated go2rtc.yaml")
 ap.add_argument("--container", default="go2rtc",
                 help="go2rtc docker container name to restart on config change")
+ap.add_argument("--log-level", default=None,
+                help="go2rtc log level to write (trace/debug/info/warn/error). "
+                     "Default: keep the level already in --out, or 'info' for a new file. "
+                     "Without this the regenerated config would silently reset a level you set by hand.")
 ap.add_argument("--dry-run", action="store_true")
 a = ap.parse_args()
 
@@ -76,14 +80,22 @@ for d in devices(at, proj):
 if not streams:
     print("  ERROR: no cameras discovered — refusing to write empty config"); sys.exit(1)
 
-out = ("api:\n  listen: \"127.0.0.1:1985\"\nrtsp:\n  listen: \":8554\"\n"
-       "webrtc:\n  listen: \":8555\"\nlog:\n  level: info\n\nstreams:\n"
-       + "\n".join(streams) + "\n\npreload:\n" + "\n".join(preload) + "\n")
-
 try:
     cur = open(a.out).read()
 except FileNotFoundError:
     cur = ""
+
+# Preserve a log level already in the file unless one was passed explicitly, so a
+# rebuild to pick up a new camera doesn't quietly undo a level set by hand.
+if a.log_level:
+    level = a.log_level
+else:
+    m = re.search(r"^log:\s*\n\s+level:\s*(\w+)", cur, re.M)
+    level = m.group(1) if m else "info"
+
+out = ("api:\n  listen: \"127.0.0.1:1985\"\nrtsp:\n  listen: \":8554\"\n"
+       "webrtc:\n  listen: \":8555\"\nlog:\n  level: " + level + "\n\nstreams:\n"
+       + "\n".join(streams) + "\n\npreload:\n" + "\n".join(preload) + "\n")
 if cur == out:
     print("config unchanged"); sys.exit(0)
 if a.dry_run:

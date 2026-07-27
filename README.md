@@ -244,6 +244,23 @@ python3 ~/scripts/nest-go2rtc-sync.py \
   --out ~/go2rtc-nest/go2rtc.yaml
 ```
 
+### Re-running it later (adding or removing a camera)
+
+When you add, remove, or rename a camera in the Google Home app, re-run the same command to pick it up:
+
+```bash
+python3 scripts/nest-go2rtc-sync.py \
+  --hb-config /path/to/homebridge/config.json \
+  --out /path/to/go2rtc/go2rtc.yaml \
+  --container go2rtc --dry-run     # drop --dry-run to apply
+```
+
+It is **idempotent and change-detecting**: it regenerates the config, compares it to the file on disk, and if they match it prints `config unchanged` and exits without touching go2rtc. It only rewrites and restarts when something actually changed, and it refuses to write an empty config if discovery returns nothing. That makes it safe to run whenever you like — a monthly timer is fine — because the disruptive part (the restart) only happens on a real change.
+
+It preserves the `log.level` already in your config, so a rebuild to pick up a new camera won't silently undo a level you set by hand. Pass `--log-level debug` (or `info`, `warn`, …) to set it explicitly.
+
+Note that a **newly added camera still appears in HomeKit before you do any of this** — the plugin discovers cameras from the SDM API directly. It just won't have a warm stream, so its tile shows the placeholder until you re-run the sync.
+
 You only need to re-run this when your set of cameras or rooms changes (add/remove a camera, rename a room) — not on a schedule. The generated config is static; the credentials it embeds come from Homebridge's `config.json`, and the OAuth *refresh* token is long-lived (go2rtc mints short-lived access tokens itself at runtime), so a once-written config keeps working. If you do automate it (e.g. a weekly systemd timer to pick up new cameras), be aware of the next point.
 
 > **A go2rtc restart drops every warm stream.** The sync script rewrites `go2rtc.yaml` and restarts the container to load it, and any restart tears down all active WebRTC sessions — tiles briefly fall back to the placeholder and live views drop until the streams re-warm (~30s) and re-extend. So restart go2rtc deliberately (config change, upgrade), not on a frequent timer. This is also why the config is kept static rather than regenerated every cycle.
