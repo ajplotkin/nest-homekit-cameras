@@ -36,14 +36,20 @@ There are four layers. Each builds on the last:
 
 4. **Snapshot warmer + plugin patches** — A small script that pulls a JPEG from each warm stream every 10 seconds (and immediately on motion/doorbell events), plus a patch to the Homebridge plugin that serves those images instead of the placeholder. This is the glue that connects go2rtc's capabilities to your HomeKit tiles.
 
-## Already have Homebridge + homebridge-google-nest-sdm working?
+## Start here — find your row
 
-Then you have the credentials and the plugin already, and only need the warm-stream layer and the patches. Two ways to get there:
+| What you have now | Start at | Skip |
+|---|---|---|
+| Nothing — no Google Device Access, no Homebridge | [Part 1](#part-1-google-device-access) | — |
+| Homebridge running (other accessories), no Nest plugin, no Google credentials | [Part 1](#part-1-google-device-access), then the **plugin half** of [Part 2](#part-2-homebridge-and-the-nest-plugin) | Part 2's Homebridge install |
+| Google credentials in hand, plugin not installed | [Part 2](#part-2-homebridge-and-the-nest-plugin) | Part 1 |
+| Homebridge **and** the plugin working, tiles blank | [Quick start](#quick-start-automated--if-parts-1--2-are-already-done) (installer) or [Part 3](#part-3-go2rtc--warm-streams-and-snapshots) to do it by hand | Parts 1–2 |
 
-- **Run the installer** — the Quick start immediately below.
-- **Read and do it yourself** — skip to [Part 3: go2rtc](#part-3-go2rtc--warm-streams-and-snapshots).
+**You will need on the host:** Docker, plus `git`, `curl`, `python3`, `node` and `patch`. `node` and `patch` are used by the plugin patcher, which runs on the host even if Homebridge itself is in a container. systemd for the warmer service. Building go2rtc wants roughly 1–1.5 GB of free RAM.
 
-Either way, glance at the `vEncoder: "copy"` note in [Part 2](#part-2-homebridge-and-the-nest-plugin) first — it is a one-line config change worth having.
+**The plugin must be exactly 1.1.24.** The patches are cut against it and the patcher refuses any other version — worth checking before you build anything.
+
+Whichever row you're on, the `vEncoder: "copy"` note in [Part 2](#part-2-homebridge-and-the-nest-plugin) is a one-line config change worth having.
 
 ## Quick start (automated) — if Parts 1 & 2 are already done
 
@@ -101,23 +107,31 @@ Then install the Nest plugin by [@potmat](https://github.com/potmat):
 
 ```bash
 # From the Homebridge UI (Settings > Plugins > Search), or:
-npm install homebridge-google-nest-sdm
+npm install homebridge-google-nest-sdm@1.1.24
 ```
 
-Configure it with your Device Access credentials in `config.json`:
+**Pin the version.** The patches in this repo are cut against **1.1.24** and `apply-snapshot-patch.sh` refuses to run against anything else, so an unpinned install that picks up a newer release will stop you at the patch step.
+
+Configure it with your Device Access credentials in Homebridge's `config.json`. The block goes in the top-level `platforms` array:
 
 ```json
 {
-    "platform": "homebridge-google-nest-sdm",
-    "clientId": "YOUR_GCP_CLIENT_ID",
-    "clientSecret": "YOUR_GCP_CLIENT_SECRET",
-    "projectId": "YOUR_DEVICE_ACCESS_PROJECT_UUID",
-    "refreshToken": "YOUR_REFRESH_TOKEN",
-    "subscriptionId": "projects/YOUR_GCP_PROJECT/subscriptions/YOUR_SUB_NAME",
-    "gcpProjectId": "YOUR_GCP_PROJECT_ID",
-    "vEncoder": "copy"
+    "platforms": [
+        {
+            "platform": "homebridge-google-nest-sdm",
+            "clientId": "YOUR_GCP_CLIENT_ID",
+            "clientSecret": "YOUR_GCP_CLIENT_SECRET",
+            "projectId": "YOUR_DEVICE_ACCESS_PROJECT_UUID",
+            "refreshToken": "YOUR_REFRESH_TOKEN",
+            "subscriptionId": "projects/YOUR_GCP_PROJECT/subscriptions/YOUR_SUB_NAME",
+            "gcpProjectId": "YOUR_GCP_PROJECT_ID",
+            "vEncoder": "copy"
+        }
+    ]
 }
 ```
+
+(If you already have other platforms, add this object to the existing array. `install.sh` and the sync script both look for it there.)
 
 Two things to note:
 
@@ -178,7 +192,8 @@ git checkout nestfix-1.9.14-1   # stable tag — not the dev branch
 > **Prefer to patch stock go2rtc yourself?** Instead of cloning the fork, check out upstream go2rtc at the `v1.9.14` tag and apply [`patches/go2rtc-nest.patch`](patches/go2rtc-nest.patch) from this repo (`git clone https://github.com/AlexxIT/go2rtc && cd go2rtc && git checkout v1.9.14 && git apply /path/to/go2rtc-nest.patch`), then run the same build command below. The diff is the exact set of source changes described in this guide, plus the credited community PRs.
 
 ```bash
-# Build natively on a Pi (arm64, ~3 min):
+# Build natively on a Pi (arm64, ~3 min). On a 2 GB Pi this can exhaust RAM and take
+# running services down with it — stop other containers first, or cross-compile elsewhere:
 docker run --rm -v "$PWD":/src -w /src \
   -e GOCACHE=/tmp/gocache -e GOMODCACHE=/tmp/gomod \
   golang:1.24-alpine sh -c \
@@ -240,7 +255,12 @@ Run it:
 python3 ~/scripts/nest-go2rtc-sync.py \
   --hb-config /path/to/homebridge/config.json \
   --out ~/go2rtc-nest/go2rtc.yaml
+
+# the generated file embeds your OAuth refresh token — lock it down:
+chmod 600 ~/go2rtc-nest/go2rtc.yaml
 ```
+
+On this first run the script will print `restarting go2rtc` and fail to find the container — that's expected; you start it two steps from now.
 
 ### Re-running it later (adding or removing a camera)
 
@@ -308,7 +328,7 @@ The solution is a warmer script that pre-fetches a JPEG every 10 seconds and wri
 **If your system runs on an SD card** (most Raspberry Pis), put the snapshots in tmpfs (RAM). Writing ~100KB JPEGs every 10 seconds per camera is ~1.5 GB/day of flash writes for data that's pure cache — the warmer rebuilds it in seconds after a reboot. tmpfs costs about 200KB of RAM.
 
 ```bash
-echo 'd /run/nest-snaps 0755 1000 1000 -' | sudo tee /etc/tmpfiles.d/nest-snaps.conf
+echo "d /run/nest-snaps 0755 $(id -u) $(id -g) -" | sudo tee /etc/tmpfiles.d/nest-snaps.conf
 sudo systemd-tmpfiles --create /etc/tmpfiles.d/nest-snaps.conf
 ```
 
@@ -331,10 +351,9 @@ Grab it:
 curl -fsSL https://raw.githubusercontent.com/ajplotkin/nest-homekit-snapshots/main/scripts/go2rtc-snapshot-warmer.sh -o ~/scripts/go2rtc-snapshot-warmer.sh
 ```
 
-Install as a systemd service:
+Install as a systemd service — write this to `/etc/systemd/system/go2rtc-snapshot-warmer.service` (e.g. `sudo nano`), replacing `YOUR_USER`:
 
 ```ini
-# /etc/systemd/system/go2rtc-snapshot-warmer.service
 [Unit]
 Description=Keep go2rtc snapshot cache warm for Homebridge
 After=docker.service
@@ -352,13 +371,29 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now go2rtc-snapshot-warmer.service
 ```
 
+Confirm it's actually working before moving on — within ~20 seconds you should see a JPEG per warm camera, and they should keep changing:
+
+```bash
+ls -la /run/nest-snaps/           # one <key>.jpg per warm camera, 60-100 KB
+journalctl -t go2rtc-warmer -n 20 # quiet is good; failures are logged here
+```
+
 ### Patch the Homebridge plugin
 
 Mount the snapshot directory into the Homebridge container. **Without this mount, the plugin can't see the files and tiles will show the placeholder:**
 
 ```bash
+-v /run/nest-snaps:/homebridge/nest-snaps
+```
+
+> **A running container cannot gain a bind mount.** `docker restart` will not do it — you have to recreate the container with the extra `-v`, or add the volume to your Compose file and `docker compose up -d`. If you already run Homebridge, note the flags it was created with (`docker inspect homebridge`) before you remove it. If you enable [Part 6](#part-6-optional-route-live-view-through-go2rtc-too), Homebridge also needs `--network host`, so add both in the same recreation.
+
+A from-scratch container looks like this:
+
+```bash
 docker run -d --name homebridge \
-  ... \
+  --restart unless-stopped \
+  --network host \
   -v /path/to/homebridge:/homebridge \
   -v /run/nest-snaps:/homebridge/nest-snaps \
   homebridge/homebridge:latest
@@ -384,9 +419,19 @@ HOMEBRIDGE_DIR=/path/to/homebridge ./scripts/apply-snapshot-patch.sh
 
 The script pins the plugin version it was cut against (**1.1.24**) and **refuses to run on a different one** — the compiled `dist/` layout moves between releases, so a stale patch could silently break things. It's idempotent (safe to re-run) and **exits non-zero** if any patch is missing or won't apply, so a re-apply can never leave you half-patched. Want to see exactly what changes? Read the diffs in `patches/homebridge-plugin/`.
 
-> **These patches live in `node_modules` and are wiped by any `npm install` of the plugin.** Re-run `apply-snapshot-patch.sh` after any plugin install/upgrade. Install order: (1) `npm install homebridge-google-nest-sdm` (v1.1.24+ already includes PR #212's startup optimizations — no separate install), (2) *then* run the patch script.
+**If you're on a different plugin version**, you have three options, in order of preference:
+
+1. **Install 1.1.24** (`npm install homebridge-google-nest-sdm@1.1.24`) and patch that. Simplest, and what this guide is tested against.
+2. **Open an issue** on this repo asking for the patches to be re-cut against your version.
+3. **Re-cut them yourself.** Take a pristine copy of your plugin's `dist/`, apply each hunk from `patches/homebridge-plugin/*.patch` by hand (they are small and commented), then `diff -u` pristine against patched to produce new `.patch` files, and bump `EXPECT_VER` in `apply-snapshot-patch.sh`. Check the [Related Issues and PRs](#related-issues-and-prs) list first — if a patch has since been merged upstream, you may not need it at all.
+
+> **These patches live in `node_modules` and are wiped by any `npm install` of the plugin.** Re-run `apply-snapshot-patch.sh` after any plugin install or upgrade — always in that order: `npm install` first, patch script second. (That is also how you *uninstall* them: reinstall the plugin and don't re-run the patcher.)
+>
+> **This applies all three patches, including the Part 6 live-view routing** — the script has no per-patch switch. If you don't want Part 6, read it first and be aware Homebridge needs `--network host`.
 
 ## Part 5: Verify
+
+Restart Homebridge to load the patched plugin. (If you added the snapshot mount in the previous step, you already recreated the container — that counts.)
 
 ```bash
 docker restart homebridge
@@ -436,7 +481,7 @@ Two go2rtc patches in this fork make the RTSP path viable for Nest:
 
 Both are already in the `go2rtc-nestfix` image you built in Part 3.
 
-Then patch the plugin's `dist/StreamingDelegate.js` `startStream()` — before it calls the SDM streamer, prefer the local RTSP stream when the camera is warm (a fresh snapshot exists), else fall back to the normal Google dial:
+Then patch the plugin's `dist/StreamingDelegate.js` `startStream()` — before it calls the SDM streamer, use the local RTSP stream for any camera go2rtc manages:
 
 ```javascript
 // near the top of startStream(), replacing:  const nestStreamer = await getStreamer(...)
@@ -444,21 +489,27 @@ let ffmpegArgs;
 let nestStreamer;
 let nestStream;
 const go2rtcKey = (this.camera.displayName || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-let useGo2rtc = false;
-if (go2rtcKey) {
-    try {
-        const st = require('fs').statSync('/homebridge/nest-snaps/' + go2rtcKey + '.jpg');
-        if (Date.now() - st.mtimeMs < 90000) useGo2rtc = true;   // fresh snapshot == stream is warm
-    } catch (e) {}
-}
+// A go2rtc-managed camera ALWAYS uses RTSP. Do not gate this on snapshot freshness:
+// if the stream is briefly cold, ffmpeg fails fast, which is the correct signal. Falling
+// back to a Google dial instead opens a SECOND concurrent Nest session that collides with
+// go2rtc's own — the result is a blank tile AND no live video. Only an unnamed camera
+// (go2rtcKey === '') takes the direct dial.
+const useGo2rtc = !!go2rtcKey;
 if (useGo2rtc) {
     ffmpegArgs = '-rtsp_transport tcp -analyzeduration 3000000 -probesize 5000000 -i rtsp://127.0.0.1:8554/' + go2rtcKey;
 } else {
-    nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera, this.config);
-    nestStream = await nestStreamer.initialize();
-    ffmpegArgs = nestStream.args;
+    try {
+        nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera, this.config);
+        nestStream = await nestStreamer.initialize();
+        ffmpegArgs = nestStream.args;
+    } catch (error) {
+        this.logThenCallback(callback, error);
+        return;
+    }
 }
 ```
+
+**Don't hand-apply this if you can avoid it** — [`patches/homebridge-plugin/StreamingDelegate.js.patch`](patches/homebridge-plugin/StreamingDelegate.js.patch) is the authoritative version and carries details omitted here for readability. The snippet above is to explain *what* changes and *why*.
 
 Then guard the two places that assumed a streamer object always exists:
 - the FfmpegProcess construction: pass `nestStream ? nestStream.stdin : undefined` (the RTSP path has no stdin pipe; FfmpegProcess already guards `if (stdin)`)
@@ -470,7 +521,9 @@ Then guard the two places that assumed a streamer object always exists:
 activeSession.timeout = setTimeout(() => {
     this.controller.forceStopStreamingSession(request.sessionID);
     this.stopStream(request.sessionID);
-}, 15000);   // 15s grace for a slow open; the socket 'message' handler replaces it with rtcp_interval*2 on the first RTCP
+}, useGo2rtc ? 15000 : 45000);   // 15s grace on the warm RTSP path; 45s on a direct Google dial,
+                                 // which legitimately takes longer to open. The socket 'message'
+                                 // handler replaces this with rtcp_interval*2 on the first RTCP.
 ```
 
 This `StreamingDelegate.js` change ships as [`patches/homebridge-plugin/StreamingDelegate.js.patch`](patches/homebridge-plugin/StreamingDelegate.js.patch) and is applied by the same `apply-snapshot-patch.sh`.
@@ -483,9 +536,25 @@ The same `StreamingDelegate.js` patch routes **HomeKit Secure Video recording** 
 
 By default, when motion fires, the plugin's recording handler (`handleRecordingStreamRequest`) opens **yet another** fresh Google WebRTC session — a *second* concurrent stream for that camera (a *third* if you're also viewing live). That tips Nest over its per-device concurrent-stream limit, and every recording triggers an ugly cascade: the second dial contends with go2rtc's warm stream → go2rtc's stream gets throttled/dropped → it reconnects (a burst of `retry=` in the go2rtc log) → and the recording itself decodes garbage (`concealing 3721 DC/AC/MV errors in I frame`, corrupt frames) because it started against a contended, half-broken stream. The system "self-heals" a minute later, but the clip is ruined.
 
-Routing recording through the warm RTSP stream instead (same check → `rtsp://127.0.0.1:8554/<key>`, else fall back to a Google dial) eliminates all of it: no second session, no contention, no reconnect burst, and the transcode runs against a clean, already-established stream. Measured before/after on a Pi 4: decode errors dropped from **thousands per recording to ~zero**, and recording-induced reconnect spikes went to **none**. `HksvStreamer.js` already accepts an RTSP input (no stdin pipe needed), so the only change is at the streamer-creation point in `handleRecordingStreamRequest`. It ships in the same `StreamingDelegate.js.patch`.
+Routing recording through the warm RTSP stream instead (`rtsp://127.0.0.1:8554/<key>` for any go2rtc-managed camera) eliminates all of it: no second session, no contention, no reconnect burst, and the transcode runs against a clean, already-established stream. Measured before/after on a Pi 4: decode errors dropped from **thousands per recording to ~zero**, and recording-induced reconnect spikes went to **none**. `HksvStreamer.js` already accepts an RTSP input (no stdin pipe needed), so the only change is at the streamer-creation point in `handleRecordingStreamRequest`. It ships in the same `StreamingDelegate.js.patch`.
 
-The patch also carries two teardown guards the RTSP path needs: `closeRecordingStream` must **guard `nestStreamer.teardown()`** (on the RTSP path there's no streamer object — the unguarded call throws on every recording close, harmless only because hap-nodejs catches it), and `handleRecordingStreamRequest` must **destroy any prior session before overwriting `recordingSessionInfo`**. The second matters more here than on stock, for the same reason as the watchdog above — a clobbered session's transcode would otherwise run forever (the exact shape of plugin issue #150).
+The patch also carries two teardown fixes the RTSP path needs.
+
+The first is **not optional**. On the RTSP path there is no streamer object, but the base plugin's `closeRecordingStream` calls `recordingSessionInfo.nestStreamer.teardown()` unguarded. That throws a **synchronous** `TypeError` — which `Promise.resolve` does *not* absorb — out of `closeRecordingStream`, so `recordingSessionInfo` never clears and **recording is permanently wedged after the first clip on every go2rtc camera**. The patch hands that branch a no-op streamer (`{ teardown: async () => {} }`) so the unguarded call is harmless.
+
+The second: `handleRecordingStreamRequest` must **destroy any prior session before overwriting `recordingSessionInfo`**, which matters more here than on stock for the same reason as the watchdog above — a clobbered session's transcode would otherwise run forever (the exact shape of plugin issue #150).
+
+### Confirm it's routing through RTSP
+
+Enable Homebridge debug logging, tap a camera tile, and look for the patch's own line:
+
+```bash
+docker logs homebridge 2>&1 | grep "Using local go2rtc RTSP"
+```
+
+If it appears, live view is coming from the warm stream. If instead you see the plugin opening a Google dial, `go2rtcKey` didn't match a stream name — compare the accessory name against the stream names in `curl -s http://127.0.0.1:1985/api/streams`.
+
+To undo Part 6: reinstall the plugin (`npm install homebridge-google-nest-sdm@1.1.24`) and don't re-run the patch script. That reverts all three patches, so re-apply them if you still want the snapshot fix — there is no per-patch switch.
 
 ## Reference
 

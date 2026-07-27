@@ -1,6 +1,8 @@
 # go2rtc Nest patches — apply to a clean go2rtc v1.9.14 checkout
 #
-# Generated from https://github.com/ajplotkin/go2rtc branch fix/nest-ipv6-ice-failure.
+# Corresponds to https://github.com/ajplotkin/go2rtc at the stable tag nestfix-1.9.14-1,
+# which is the tag the README tells you to build. (Development continues on the
+# fix/nest-ipv6-ice-failure branch; that work is not in this diff.)
 # Includes this project's own patches (IPv4-only ICE, keyframe PLI, sprop-in-SDP,
 # stall watchdog, extend-loop resilience) AND these adopted community PRs, credited
 # in the README: AlexxIT/go2rtc #2351 (tillo), #2194 & #2193 (MechanicalCoderX),
