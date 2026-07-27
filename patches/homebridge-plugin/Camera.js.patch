@@ -43,3 +43,18 @@
                                      this.onMotion();
                              });
                          }
+@@ -183,5 +204,12 @@
+     }
+ }
+ exports.Camera = Camera;
+-Camera.MAX_EVENT_AGE_SECONDS = 30;
++// Pub/Sub first deliveries are often LATE. Measured on a live deployment 2026-07-27:
++// late deliveries clustered at 46-57s, and the stock 30s gate silently discarded ~21%
++// of DISTINCT events -- their first delivery was already stale, so the redelivery was
++// too, and neither a HomeKit notification nor an HKSV clip was produced. Those are real
++// events, not the duplicate redeliveries this gate exists to suppress. 120s stays clear
++// of observed latency while still stopping an hours-old backlog from firing after a
++// Pub/Sub reconnect, which is the gate's actual job.
++Camera.MAX_EVENT_AGE_SECONDS = 120;
+ //# sourceMappingURL=Camera.js.map
+\ No newline at end of file
