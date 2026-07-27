@@ -38,15 +38,18 @@ There are four layers. Each builds on the last:
 
 ## Already have Homebridge + homebridge-google-nest-sdm working?
 
-If your Nest cameras are already in Apple HomeKit via Homebridge and you just want to fix the snapshot/tile-image problem, skip to [Part 3: go2rtc](#part-3-go2rtc--warm-streams-and-snapshots). You already have the credentials and the plugin — you just need the warm-stream layer and the patches.
+Then you have the credentials and the plugin already, and only need the warm-stream layer and the patches. Two ways to get there:
 
-If you also want faster live stream startup (~2s instead of ~8s), check the `vEncoder: "copy"` and PR #212 notes in [Part 2](#part-2-homebridge-and-the-nest-plugin) first.
+- **Run the installer** — the Quick start immediately below.
+- **Read and do it yourself** — skip to [Part 3: go2rtc](#part-3-go2rtc--warm-streams-and-snapshots).
+
+Either way, glance at the `vEncoder: "copy"` note in [Part 2](#part-2-homebridge-and-the-nest-plugin) first — it is a one-line config change worth having.
 
 ## Quick start (automated) — if Parts 1 & 2 are already done
 
 The one thing that **cannot** be scripted is Google Device Access (Part 1) — creating the Cloud project, the OAuth consent screen, the $5 registration, and getting a refresh token is manual clicking through Google's consoles. Once you have those credentials in a working **Homebridge + homebridge-google-nest-sdm 1.1.24** install, the rest is one script.
 
-**Option A — `install.sh`** (does everything post-credentials: builds the patched go2rtc image, sets up the tmpfs, generates the config, starts go2rtc, installs the warmer service, and applies the plugin patches — all idempotent):
+**Option A — `install.sh`** (idempotent; builds the patched go2rtc image, sets up the tmpfs, generates the config, starts go2rtc, installs the warmer service, applies the plugin patches):
 
 ```bash
 git clone https://github.com/ajplotkin/nest-homekit-snapshots.git
@@ -62,7 +65,7 @@ cd nest-homekit-snapshots
              --homebridge-container my-homebridge
 ```
 
-Every path and container name is a flag with a sensible default (`./install.sh --help`). The **one** step it deliberately leaves to you — because how you run Homebridge is yours to own — is adding `-v /run/nest-snaps:/homebridge/nest-snaps` to your Homebridge container and restarting it. The script detects whether that mount exists and tells you the exact line if it's missing.
+Every path and container name is a flag with a sensible default (`./install.sh --help`). The one step it leaves to you is adding the snapshot volume to your own Homebridge container; the script detects whether that mount exists and prints the exact line if it's missing.
 
 **Option B — Docker Compose** ([`docker-compose.yml`](docker-compose.yml)) brings up the go2rtc + warmer half of the stack. You still build the image and generate `go2rtc.yaml` first (the file's header comments walk through it), add the one volume line to your Homebridge service, and run `./scripts/apply-snapshot-patch.sh`. Compose can't patch the plugin's `node_modules` for you, so that stays a script call.
 
@@ -120,7 +123,7 @@ Two things to note:
 
 **Set `vEncoder` to `"copy"`.** Your Nest cameras send H264 video. HomeKit wants H264 video. The default setting re-encodes it with x264, which wastes CPU and adds seconds of latency. `"copy"` passes the video through untouched. The plugin's README already mentions this option but understates how much it helps.
 
-**Faster live stream startup is now in the plugin.** As of **plugin v1.1.24**, [@littlepope81](https://github.com/littlepope81)'s [PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) is **merged** — no separate install needed. It reduces time-to-first-frame from ~8s to ~2s (first keyframe fully received at **+2127ms** on a Pi 4) via keyframe/frame-rate/REMB tuning, and exposes `-analyzeduration` / `-probesize` as optional config fields. Note that these optimizations tune the plugin's own direct WebRTC dial; once you enable this guide's go2rtc live-view routing in [Part 6](#part-6-optional-route-live-view-through-go2rtc-too), live view is served from go2rtc's RTSP instead, so #212's startup win mainly benefits cameras that fall through to the direct dial. (The ~4s beyond first-frame to actually see the tile is Apple's own HomeKit setup, not addressable from Homebridge.)
+**Faster live stream startup is now in the plugin.** As of **plugin v1.1.24**, [@littlepope81](https://github.com/littlepope81)'s [PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) is **merged** — no separate install needed. It cuts time-to-first-frame from ~8s to ~2s (first keyframe at **+2127ms** on a Pi 4) and exposes `-analyzeduration` / `-probesize` as config fields. It tunes the plugin's own direct WebRTC dial, so it applies unless you enable [Part 6](#part-6-optional-route-live-view-through-go2rtc-too). (The further ~4s before the tile actually appears is Apple's own HomeKit setup, not addressable from Homebridge.)
 
 After restarting Homebridge, your cameras should appear in Apple Home. Live streams will work. But the tiles show a Google logo or a blank image — that's the problem this guide exists to solve.
 
@@ -367,7 +370,7 @@ What the patches do:
 
 - **`Camera.js`** — `getSnapshot()` returns the warm JPEG from `/homebridge/nest-snaps/<key>.jpg` instead of the Google logo, falling back to the logo if the file is missing or older than 90 seconds (so an off camera shows the honest placeholder). On a motion/person event it creates `/homebridge/nest-snaps/.refresh` (via the plugin's `fs`, no subshell) to trigger an immediate warm-frame grab. The `<key>` is derived exactly as the sync script derives it, which is how the plugin finds the file the warmer wrote.
 - **`Api.js`** — **auto-reconnects the Pub/Sub subscription**. Upstream sets it up once and, on error, just stops — so a silently dropped streaming-pull connection permanently kills all camera events (no motion alerts, no HKSV recording) until you restart Homebridge. This re-subscribes on `error`/`close` with exponential backoff, plus a 12-hour proactive recycle to catch half-open stalls. Still open upstream as [PR #216](https://github.com/potmat/homebridge-google-nest-sdm/pull/216).
-- **`StreamingDelegate.js`** — *(optional, Part 6)* routes HomeKit live view **and HKSV recording** through go2rtc's warm RTSP stream, so neither opens a second Google session. It also arms a start-of-session inactivity watchdog tuned for the warm-RTSP path.
+- **`StreamingDelegate.js`** — optional; see [Part 6](#part-6-optional-route-live-view-through-go2rtc-too).
 
 Earlier versions of this repo carried several more patches; those fixes were merged upstream and ship in plugin 1.1.24. The [Related Issues and PRs](#related-issues-and-prs) index records which.
 
@@ -470,7 +473,7 @@ activeSession.timeout = setTimeout(() => {
 }, 15000);   // 15s grace for a slow open; the socket 'message' handler replaces it with rtcp_interval*2 on the first RTCP
 ```
 
-This `StreamingDelegate.js` change ships as [`patches/homebridge-plugin/StreamingDelegate.js.patch`](patches/homebridge-plugin/StreamingDelegate.js.patch) and is applied by the same `apply-snapshot-patch.sh` — like the others, it's wiped by any `npm install` and must be re-applied.
+This `StreamingDelegate.js` change ships as [`patches/homebridge-plugin/StreamingDelegate.js.patch`](patches/homebridge-plugin/StreamingDelegate.js.patch) and is applied by the same `apply-snapshot-patch.sh`.
 
 > **Requires Homebridge on the host network.** The live-view patch dials `rtsp://127.0.0.1:8554` from *inside* the Homebridge container, so `127.0.0.1` has to be the same host go2rtc listens on. Run the Homebridge container with `--network host` (as go2rtc does). If Homebridge is on Docker's default bridge network instead, `127.0.0.1` points at the container itself and the live-view dial fails — use the host's LAN IP, or move Homebridge to `--network host`. The **snapshot** path doesn't care (it's a file bind-mount), so this only affects Part 6.
 
@@ -482,7 +485,7 @@ By default, when motion fires, the plugin's recording handler (`handleRecordingS
 
 Routing recording through the warm RTSP stream instead (same check → `rtsp://127.0.0.1:8554/<key>`, else fall back to a Google dial) eliminates all of it: no second session, no contention, no reconnect burst, and the transcode runs against a clean, already-established stream. Measured before/after on a Pi 4: decode errors dropped from **thousands per recording to ~zero**, and recording-induced reconnect spikes went to **none**. `HksvStreamer.js` already accepts an RTSP input (no stdin pipe needed), so the only change is at the streamer-creation point in `handleRecordingStreamRequest`. It ships in the same `StreamingDelegate.js.patch`.
 
-The patch also carries two teardown guards the RTSP path needs: `closeRecordingStream` must **guard `nestStreamer.teardown()`** (on the RTSP path there's no streamer object — the unguarded call throws on every recording close, harmless only because hap-nodejs catches it), and `handleRecordingStreamRequest` must **destroy any prior session before overwriting `recordingSessionInfo`**. That second one matters *more* on the go2rtc path than on stock: a Google WebRTC input self-expires after 5 minutes, but the warm RTSP input never EOFs, so a clobbered session's transcode would otherwise run **forever** (the exact shape of plugin issue #150). Both are in the patch.
+The patch also carries two teardown guards the RTSP path needs: `closeRecordingStream` must **guard `nestStreamer.teardown()`** (on the RTSP path there's no streamer object — the unguarded call throws on every recording close, harmless only because hap-nodejs catches it), and `handleRecordingStreamRequest` must **destroy any prior session before overwriting `recordingSessionInfo`**. The second matters more here than on stock, for the same reason as the watchdog above — a clobbered session's transcode would otherwise run forever (the exact shape of plugin issue #150).
 
 ## Reference
 
