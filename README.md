@@ -19,7 +19,7 @@ This guide walks through the full setup from scratch: getting API access to your
 - **This README** — the complete, from-scratch guide (start here and read top to bottom).
 - **[`install.sh`](install.sh)** — one idempotent installer that does everything after you have Google credentials (build image, tmpfs, config, go2rtc, warmer service, plugin patches, verify). See [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
 - **[`docker-compose.yml`](docker-compose.yml)** — the go2rtc + warmer half of the stack as Compose services.
-- **[`scripts/`](scripts/)** — the three helper scripts: `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), and `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches). They take all paths/credentials as arguments or env vars — nothing is hardcoded.
+- **[`scripts/`](scripts/)** — the helper scripts: `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches), and `boot-heal-homekit-bridges.sh` (optional — restarts the HomeKit bridges after a power failure so accessories don't sit at "No Response"). They take all paths/credentials as arguments or env vars — nothing is hardcoded.
 - **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout) and `homebridge-plugin/*.patch` (the plugin changes as diffs against stock plugin 1.1.24).
 
 The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-1)** — build from the stable tag **`nestfix-1.9.14-1`** (development happens on the `fix/nest-ipv6-ice-failure` branch, which may carry in-progress work and debug logging, so don't build from the branch). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
@@ -281,10 +281,10 @@ If streams show "cold", check the go2rtc logs (`docker logs go2rtc`). Common cau
 
 You now have go2rtc serving JPEG snapshots via HTTP. The obvious approach is to have the Homebridge plugin call that endpoint directly whenever HomeKit asks for a snapshot. **Don't do this.** It fails under real-world conditions:
 
-- HomeKit polls tiles roughly every 10 seconds. go2rtc's JPEG cache lasts 30 seconds. Every third poll is a **cache miss**, which spins up ffmpeg and takes ~1.5 seconds — triggering Homebridge's "snapshot handler is slow to respond" warning.
-- Worse: **two concurrent cache misses return HTTP 500**, and the plugin's error path falls back to the placeholder logo. The logo flashes back intermittently.
+- HomeKit polls tiles roughly every 10 seconds (measured: median 10s while the Home app is open, with long gaps when nobody is looking). A poll that misses go2rtc's JPEG cache spins up ffmpeg and takes ~1.5–2 seconds — triggering Homebridge's "snapshot handler is slow to respond" warning.
+- Worse: **`/api/frame.jpeg` intermittently returns HTTP 500** — measured at roughly 4–20% of transcodes on a live system, in bursts. It is *not* limited to concurrent requests; a single request in an idle system hits it too. If the plugin called the endpoint directly, that error would land straight on your tile as the placeholder logo.
 
-The solution is a warmer script that pre-fetches a JPEG every 10 seconds and writes it to a file. The plugin reads the file (~1ms, never races, never 500s). On motion or doorbell events, the plugin signals the warmer to grab a fresh frame immediately — so the tile shows *who's there*, not a 10-second-old empty porch.
+The solution is a warmer script that pre-fetches a JPEG every 10 seconds and writes it to a file, **retrying transient failures** so they never reach HomeKit. The plugin then reads a local file (~1ms — no ffmpeg, no races, no 500s on the HomeKit-facing path). On motion or doorbell events, the plugin signals the warmer to grab a fresh frame immediately — so the tile shows *who's there*, not a 10-second-old empty porch.
 
 ### SD card wear
 
@@ -297,15 +297,18 @@ sudo systemd-tmpfiles --create /etc/tmpfiles.d/nest-snaps.conf
 
 ### The warmer script
 
-The warmer auto-discovers streams from go2rtc (no hardcoded camera list) and only polls streams that have active media — cameras that are off are skipped, avoiding wasted SDM quota. Stale files are pruned after 2 minutes so an off camera shows the honest placeholder rather than a frozen frame.
+The warmer auto-discovers streams from go2rtc (no hardcoded camera list) and only polls streams that have active media — cameras that are off are skipped, avoiding wasted SDM quota. Stale files are pruned after 30 minutes (`STALE_MAX_MIN`) so a camera that is genuinely gone shows the honest placeholder, while one that is only briefly mid-reconnect keeps its last good frame.
 
 It also watches for an **event trigger**: when the plugin receives a motion or doorbell event, it touches a signal file, and the warmer grabs a fresh frame within 1 second instead of waiting for the next cycle.
 
 The script is [`scripts/go2rtc-snapshot-warmer.sh`](scripts/go2rtc-snapshot-warmer.sh) — **copy it from there**. What it does each cycle:
 
 - Asks go2rtc which streams are actually flowing bytes, and only polls those (off cameras are skipped — no wasted SDM quota).
-- Pulls a JPEG per warm stream and writes it atomically to `/run/nest-snaps/<key>.jpg`, keeping the last good file if a fetch returns something too small to be a real frame.
-- Prunes files older than 2 minutes, so a camera that went offline shows the honest placeholder instead of a frozen frame.
+- Pulls a JPEG per warm stream and writes it atomically to `/run/nest-snaps/<key>.jpg`.
+- **Retries a failed fetch** (`ATTEMPTS`, default 3, one second apart) instead of losing the whole cycle to one transient HTTP 500. This matters more than it sounds: the plugin discards any snapshot older than 90 seconds, so a handful of silently-dropped cycles is enough to put the placeholder logo back on your tile.
+- **Rejects undersized frames** (`MIN_BYTES`, default 15000) and keeps the last good file instead. ffmpeg emits a *solid grey* JPEG when it decodes H264 without a usable keyframe — around 5–6 KB at 720p, versus 60–100 KB for a real frame. Without this guard that grey image is published as a perfectly valid snapshot.
+- **Logs every failure** via `logger -t go2rtc-warmer` (`journalctl -t go2rtc-warmer`). The original script used `curl -sf`, which silently swallowed server errors — the failures were invisible for weeks.
+- Prunes files older than `STALE_MAX_MIN` (30 min), so a camera that went offline shows the honest placeholder instead of a frozen frame.
 
 Freshness: the **baseline** cycle uses a cache window *shorter* than the poll interval, so each cycle re-transcodes and the tile stays ~10s fresh. On a motion/doorbell event the plugin touches `/run/nest-snaps/.refresh` and the warmer immediately grabs a frame with a **1-second** cache — so the tile shows who's actually there, not a stale porch. (An earlier version used a 30s cache on both paths, which made "instant on motion" a lie; the shipped script fixes that.)
 
@@ -391,6 +394,17 @@ After about 30 seconds:
 **`nest: wrong status: 400 Bad Request`** in go2rtc logs: Most likely the IPv6 issue described above. Use the patched fork. Can also be a URL encoding problem — always generate URLs via the sync script or go2rtc's `GET /api/nest` endpoint.
 
 **Node v24.17.0 breaks the plugin entirely** with `ERR_STREAM_PREMATURE_CLOSE` on every OAuth call. This is a Node.js regression ([nodejs/node#63989](https://github.com/nodejs/node/issues/63989)), not a plugin bug. Fixed in Node 24.18.0. If you're on the official Homebridge Docker image, pull the latest.
+
+**A tile intermittently drops back to the placeholder, even though the camera is on and streaming.** The snapshot endpoint (`/api/frame.jpeg`) returns HTTP 500 on a few percent of transcodes, in bursts, and the plugin discards any snapshot older than 90 seconds — so a run of silently-failed warmer cycles is enough to blank the tile. The shipped warmer retries and logs, which makes this a non-event; if you have modified it, keep the retry. Diagnose with:
+
+```bash
+journalctl -t go2rtc-warmer --since -30min   # fetch failures / grey-frame rejections
+ls -la --time-style=+%H:%M:%S /run/nest-snaps/   # ages must stay well under 90s
+```
+
+A snapshot around 5–6 KB (versus a normal 60–100 KB) is a **grey frame** — ffmpeg decoding H264 without a usable keyframe. The warmer rejects those and keeps the previous good image.
+
+**Everything shows "No Response" after a power failure.** The bridges came up before the network settled and advertised into an unready mDNS environment. Restarting *avahi* does not help — Homebridge and Matterbridge each run their own mDNS responder, so avahi never sees them. Restart the **bridges** instead, and install [`scripts/boot-heal-homekit-bridges.sh`](scripts/boot-heal-homekit-bridges.sh) so it happens automatically on the next boot. It waits for the network (and Home Assistant, if you use it) to settle, then restarts whichever bridge containers exist. It runs from an `OnBootSec` timer rather than `network-online.target`, which is unreliable on Raspberry Pi OS.
 
 **Motion notifications not arriving on your phone?** HomeKit defaults motion notifications to **off** for new camera accessories. In the Apple Home app: tap the camera → scroll down → **Status and Notifications** → turn on **Motion Notifications** (and **Activity Notifications** if available). You also need an Apple Home Hub (Apple TV, HomePod, or iPad) for notifications to push when you're away.
 
