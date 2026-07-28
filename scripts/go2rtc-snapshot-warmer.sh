@@ -34,22 +34,64 @@ MIN_BYTES=15000     # v2 gray-frame guard: real 720p frames measure 60-97KB; the
 # So keep the last good frame through the gap and only reap a snapshot that has gone
 # genuinely stale (camera actually offline), not one that's briefly mid-reconnect.
 STALE_MAX_MIN=30    # reap a snapshot only after this many minutes with no refresh (was 2)
+BYTES_STATE="$DIR/.bytes"   # v3: previous cycle's per-stream receiver totals, for the liveness delta
 mkdir -p "$DIR"
 
 log() { logger -t go2rtc-warmer "$*" 2>/dev/null || true; }
 
 refresh_all() {
   local cache="${1:-$BASELINE_CACHE}"
-  WARM=$(curl -s -m 10 "$API/api/streams" | python3 -c '
-import sys, json
+  # A stream counts as live only if its received-byte total went UP since the last cycle.
+  # Receiver.Bytes is CUMULATIVE and is never reset, so "> 0" is true forever once a camera
+  # has been warm even once. When a camera is switched off, go2rtc correctly closes the
+  # connection and re-dials every ~60s (getting 400 while it stays off), but the dead
+  # producer keeps its frozen counters -- so a "> 0" test still calls it warm, we fetch it,
+  # /api/frame.jpeg attaches to the frozen receivers and blocks, and every cycle burns
+  # ATTEMPTS x FETCH_TIMEOUT seconds for nothing. Measured: ~270 wasted fetches/hour on one
+  # switched-off camera. A delta distinguishes "flowing" from "was flowing once".
+  WARM=$(curl -s -m 10 "$API/api/streams" | BYTES_STATE="$BYTES_STATE" python3 -c '
+import sys, json, os
+
+state_path = os.environ.get("BYTES_STATE", "")
+prev = {}
+try:
+    with open(state_path) as fh:
+        for line in fh:
+            k, _, v = line.strip().partition(" ")
+            if k:
+                prev[k] = int(v)
+except Exception:
+    pass
+
 try:
     d = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
+
+cur = {}
 for name, s in d.items():
+    total = 0
     for p in (s.get("producers") or []):
-        if any((r.get("bytes") or 0) > 0 for r in (p.get("receivers") or [])):
-            print(name); break
+        for r in (p.get("receivers") or []):
+            total += (r.get("bytes") or 0)
+    cur[name] = total
+
+for name, total in cur.items():
+    if total <= 0:
+        continue                      # never warmed (camera off since boot)
+    if name not in prev:
+        print(name)                   # first sighting: probe once to establish a baseline
+    elif total > prev[name]:
+        print(name)                   # bytes advanced: genuinely flowing
+
+try:
+    tmp = state_path + ".tmp"
+    with open(tmp, "w") as fh:
+        for name, total in cur.items():
+            fh.write("%s %d\n" % (name, total))
+    os.replace(tmp, state_path)
+except Exception:
+    pass
 ' 2>/dev/null || echo "")
   for s in $WARM; do
     [[ "$s" =~ ^[a-z0-9_]+$ ]] || continue
