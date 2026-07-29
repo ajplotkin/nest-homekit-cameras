@@ -82,7 +82,35 @@
              }
              catch (err) {
                  this.log.error('Error terminating SDM stream: ' + err, this.camera.getDisplayName());
-@@ -420,8 +455,41 @@
+@@ -378,13 +413,26 @@
+             "-dn",
+             "-codec:v",
+             "libx264",
++            // x264 defaults to preset=medium (rc-lookahead=40, bframes=3). Lookahead is a bet that
++            // the next frames already exist -- true for a file, false for a live camera, so it is
++            // pure latency here. Worse, a live source caps throughput at 1x, so a deficit taken at
++            // startup can never be recovered. Measured 2026-07-28 on a Pi 4: 96% of frames landed
++            // in 4-long B-frame runs, a recording sat at frame=0 for 9s, and the clip ended with 2
++            // fragments instead of 8. With zerolatency + veryfast the same camera produced 7
++            // fragments / 380 frames / 25s. The plugin already defaults the LIVE path to
++            // "ultrafast -tune zerolatency" (see vEncoder); recording just never inherited it.
++            "-preset", "veryfast",
++            "-tune", "zerolatency",
+             "-pix_fmt",
+             "yuv420p",
+             "-profile:v", profile,
+             "-level:v", level,
+             "-b:v", `${this.cameraRecordingConfiguration.videoCodec.parameters.bitRate}k`,
+             "-force_key_frames", `expr:eq(t,n_forced*${this.cameraRecordingConfiguration.videoCodec.parameters.iFrameInterval / 1000})`,
+-            "-r", this.cameraRecordingConfiguration.videoCodec.resolution[2].toString(),
++            // HomeKit negotiates a target fps (usually 30) but the go2rtc source runs at ~15.
++            // Encoding 30 from 15 makes ffmpeg duplicate every frame (observed dup=38), doubling
++            // libx264 work for no extra detail. Cap at the source rate.
++            "-r", Math.min(this.cameraRecordingConfiguration.videoCodec.resolution[2], 15).toString(),
+         ];
+         let samplerate;
+         switch (this.cameraRecordingConfiguration.audioCodec.samplerate) {
+@@ -420,8 +468,41 @@
                  "-ac", `${this.cameraRecordingConfiguration.audioCodec.audioChannels}`,
              ]
              : [];
@@ -126,7 +154,7 @@
          const hksvStreamer = new HksvStreamer_1.default(this.log, nestStream, audioArgs, videoArgs, this.platform.debugMode);
          // Tear down any prior recording session before overwriting it. A HomeKit hub
          // can start a new recording (e.g. after a brief reconnect) before the previous
-@@ -465,6 +533,12 @@
+@@ -465,6 +546,12 @@
          catch (error) {
              this.log.error("Encountered unexpected error on generator " + error.stack);
          }
