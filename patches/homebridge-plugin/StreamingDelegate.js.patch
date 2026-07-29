@@ -96,7 +96,18 @@
              }
              catch (err) {
                  this.log.error('Error terminating SDM stream: ' + err, this.camera.getDisplayName());
-@@ -378,13 +418,26 @@
+@@ -373,18 +413,36 @@
+         const level = this.cameraRecordingConfiguration.videoCodec.parameters.level === 2 /* LEVEL4_0 */ ? "4.0"
+             : this.cameraRecordingConfiguration.videoCodec.parameters.level === 1 /* LEVEL3_2 */ ? "3.2" : "3.1";
+         const videoArgs = [
+-            "-an",
++            // No "-an" here. HksvStreamer appends videoArgs AFTER audioArgs, so an unconditional
++            // -an at the head of videoArgs silently overrode the entire AAC-ELD setup below and
++            // every HKSV clip was recorded mute -- confirmed 2026-07-29: the recording ffmpeg
++            // emitted "Output #0, mp4" with a video stream and no audio stream at all, while the
++            // LIVE path on the same camera showed "opus -> aac (libfdk_aac)". Audio is now
++            // disabled in audioArgs instead, and only when the characteristic actually says so.
+             "-sn",
              "-dn",
              "-codec:v",
              "libx264",
@@ -124,12 +135,27 @@
          ];
          let samplerate;
          switch (this.cameraRecordingConfiguration.audioCodec.samplerate) {
-@@ -420,8 +473,41 @@
+@@ -410,6 +468,11 @@
+                 throw new Error("Unsupported audio sample rate: " + this.cameraRecordingConfiguration.audioCodec.samplerate);
+         }
+         const audioArgs = ((_b = (_a = this.controller) === null || _a === void 0 ? void 0 : _a.recordingManagement) === null || _b === void 0 ? void 0 : _b.recordingManagementService.getCharacteristic(this.platform.Characteristic.RecordingAudioActive))
++            // .value -- getCharacteristic() returns the Characteristic OBJECT, which is
++            // always truthy, so this branch was taken no matter how the Home app's
++            // "Record Audio" switch was set. (Moot until the -an above was removed,
++            // which is probably why it went unnoticed.)
++            ?.value
+             ? [
+                 "-acodec", "libfdk_aac",
+                 ...(this.cameraRecordingConfiguration.audioCodec.type === 0 /* AAC_LC */ ?
+@@ -419,9 +482,43 @@
+                 "-b:a", `${this.cameraRecordingConfiguration.audioCodec.bitrate}k`,
                  "-ac", `${this.cameraRecordingConfiguration.audioCodec.audioChannels}`,
              ]
-             : [];
+-            : [];
 -        const nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera, this.config);
 -        const nestStream = await nestStreamer.initialize();
++            // Audio off is now expressed HERE, where it can be conditional.
++            : ["-an"];
 +        // PATCHED: prefer local go2rtc warm RTSP for HKSV recording — same pattern as
 +        // startStream. Avoids opening a SECOND concurrent Google WebRTC session, which
 +        // exhausts Google's per-device stream limit and causes RECONNECT-SPIKEs.
@@ -168,7 +194,7 @@
          const hksvStreamer = new HksvStreamer_1.default(this.log, nestStream, audioArgs, videoArgs, this.platform.debugMode);
          // Tear down any prior recording session before overwriting it. A HomeKit hub
          // can start a new recording (e.g. after a brief reconnect) before the previous
-@@ -465,6 +551,12 @@
+@@ -465,6 +562,12 @@
          catch (error) {
              this.log.error("Encountered unexpected error on generator " + error.stack);
          }
