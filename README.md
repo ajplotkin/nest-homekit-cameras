@@ -22,7 +22,7 @@ This guide walks through the full setup from scratch: getting API access to your
 - **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), and `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches).
 - **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), four plugin diffs against stock 1.1.24 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`), and `homebridge-plugin/new-files/PrebufferManager.js` (a new file, copied in rather than patched — it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)).
 
-The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-2)** — build from the stable tag **`nestfix-1.9.14-2`** (development happens on the `fix/nest-ipv6-ice-failure` branch, which may carry in-progress work, so don't build from the branch. **Note:** the current `nestfix-1.9.14-2` tag still emits a few `[nestdbg]` lines at Info level from the stall watchdog — including a per-second tick during Nest's post-motion droughts. They are harmless but noisy; they will be dropped to Debug in the next tag). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
+The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-3)** — build from the stable tag **`nestfix-1.9.14-3`** (development happens on the `fix/nest-ipv6-ice-failure` branch, which may carry in-progress work, so don't build from the branch.). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
 
 Two things worth calling out for anyone arriving because their recordings are unreliable:
 **HKSV clips from the stock plugin are silent** (an `-an` overrides the whole audio block —
@@ -196,7 +196,7 @@ The fork also removes an inner retry loop in `rtcConn` that burned ~130 SDM API 
 ```bash
 git clone https://github.com/ajplotkin/go2rtc.git
 cd go2rtc
-git checkout nestfix-1.9.14-2   # stable tag — not the dev branch
+git checkout nestfix-1.9.14-3   # stable tag — not the dev branch
 ```
 
 > **Prefer to patch stock go2rtc yourself?** Instead of cloning the fork, check out upstream go2rtc at the `v1.9.14` tag and apply [`patches/go2rtc-nest.patch`](patches/go2rtc-nest.patch) from this repo (`git clone https://github.com/AlexxIT/go2rtc && cd go2rtc && git checkout v1.9.14 && git apply /path/to/go2rtc-nest.patch`), then run the same build command below. The diff is the exact set of source changes described in this guide, plus the credited community PRs.
