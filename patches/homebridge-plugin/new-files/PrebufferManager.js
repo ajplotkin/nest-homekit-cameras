@@ -19,7 +19,7 @@
  *
  * Separately, HomeKit *asks* for footage before the trigger (`prebufferLength`);
  * that requirement is additive to the lateness above. To honestly serve a 4s
- * advertised prebuffer we need 4 + ~3.3 = ~7.3s of history, hence the 12s default.
+ * advertised prebuffer we need 4 + ~3.3 = ~7.3s of history, hence the 15s default.
  *
  * THE APPROACH
  * ------------
@@ -31,7 +31,7 @@
  * Fragmented MP4 rather than mpegts because every `moof` starts at a keyframe and
  * box headers are self-describing, so safe cut points need no codec parsing. This
  * is also exactly the format HksvStreamer already consumes. Measured here:
- * ~1.67s per fragment, init segment 1285 bytes, ~150KB/s => ~1.8MB per camera.
+ * ~1.67s per fragment, init segment 1285 bytes, ~150KB/s => ~2.3MB per camera.
  *
  * ANCHORING
  * ---------

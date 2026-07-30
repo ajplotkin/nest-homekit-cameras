@@ -38,7 +38,9 @@ fi
 # go2rtc integration: snapshot-from-disk + warmer .refresh (Camera.js), the Pub/Sub
 # auto-reconnect that is still open as #216 (Api.js), and the go2rtc RTSP live/record
 # routing (StreamingDelegate.js). Sentinels must match OUR additions, NOT anything now in
-# stock — Camera.js uses 'nest-snaps' (its isEventStale is upstream's as of 1.1.24).
+# stock — Camera.js uses 'nest-snaps'. (Camera.js.patch DOES still modify stale-event
+# handling: it raises MAX_EVENT_AGE_SECONDS 30->120 and adds a throttled drop warning, per
+# issue #231. Upstream's isEventStale from PR #219 is the base it builds on.)
 applied=0
 failed=0
 
@@ -64,8 +66,13 @@ for entry in "${new_files[@]}"; do
   [ -f "$s" ] || { echo "  ERROR: missing new file $s"; failed=1; continue; }
   if [ -f "$t" ] && cmp -s "$s" "$t"; then
     echo "  ok: $target already present and identical"
+  elif cp "$s" "$t"; then
+    echo "  INSTALLED: $target"; applied=1
   else
-    cp "$s" "$t" && echo "  INSTALLED: $target" && applied=1
+    # A failed cp used to set neither applied nor failed, so a re-run whose sentinels were
+    # all present would report success with this file missing -- and the patched
+    # StreamingDelegate requires it, so Homebridge dies with MODULE_NOT_FOUND.
+    echo "  ERROR: could not install $target (permissions? root-owned node_modules?)"; failed=1
   fi
 done
 
@@ -80,7 +87,12 @@ for entry in "${patches[@]}"; do
     continue
   fi
   if patch -p1 -d "$PLUGIN" --dry-run <"$patchfile" >/dev/null 2>&1; then
-    patch -p1 -d "$PLUGIN" <"$patchfile" >/dev/null && { echo "  PATCHED: $target"; applied=1; }
+    if patch -p1 -d "$PLUGIN" <"$patchfile" >/dev/null; then
+      echo "  PATCHED: $target"; applied=1
+    else
+      # Dry-run passing does not guarantee the real apply succeeds (disk, permissions).
+      echo "  ERROR: $pf passed --dry-run but failed to apply to $target"; failed=1
+    fi
   else
     echo "  ERROR: $pf does not apply cleanly to $target (wrong plugin version, or already edited?)"
     failed=1

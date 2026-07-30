@@ -7,9 +7,9 @@ This is harder than it should be. Google does not offer Nest cameras through Hom
 This guide walks through the full setup from scratch: getting API access to your Nest cameras, bridging them into HomeKit, and then solving the snapshot problem by keeping a warm stream and serving frames from it. By the end you'll have:
 
 - **Real camera images on your HomeKit tiles** — refreshed every 10 seconds, and instantly on motion or doorbell events (so the tile shows *who's there*, not a stale frame)
-- **~2 second live stream startup** — down from ~8 seconds stock (on the plugin's direct dial; the optional RTSP routing in [Part 6](#part-6-optional-route-live-view-through-go2rtc-too) trades a little of that for consistency)
+- **~2 second live stream startup** — down from ~8 seconds stock (on the plugin's direct dial; the optional RTSP routing in [Part 6](#part-6-route-live-view-and-recording-through-go2rtc) trades a little of that for consistency)
 - **Motion and doorbell event notifications** in Apple Home
-- **HomeKit Secure Video recording** — motion-triggered clips saved to iCloud also work through this setup (confirmed on a Pi 4; the software H.264 encode keeps up, so no hardware encoder is needed). Requires iCloud+ and a Home Hub, like any HKSV camera.
+- **HomeKit Secure Video recording** — motion-triggered clips saved to iCloud also work through this setup (confirmed on a Pi 4; no hardware encoder is needed — and as of the copy change below, recording does not re-encode at all). Requires iCloud+ and a Home Hub, like any HKSV camera.
 - **Automatic camera discovery** — new cameras appear without editing config files
 
 **Everything here is open source and runs on a Raspberry Pi.**
@@ -17,12 +17,12 @@ This guide walks through the full setup from scratch: getting API access to your
 ### What's in this repo
 
 - **This README** — the complete, from-scratch guide (start here and read top to bottom).
-- **[`install.sh`](install.sh)** — one-shot installer for everything after your Google credentials; see [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
+- **[`install.sh`](install.sh)** — one-shot installer for everything after your Google credentials. Re-running is safe but **not** a no-op: it recreates the go2rtc container (dropping every warm stream) and rewrites the warmer unit. see [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
 - **[`docker-compose.yml`](docker-compose.yml)** — the go2rtc + warmer half of the stack as Compose services.
 - **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), and `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches).
-- **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), `homebridge-plugin/*.patch` (the plugin changes as diffs against stock plugin 1.1.24), and `homebridge-plugin/new-files/PrebufferManager.js` (a new file, copied in rather than patched — it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)).
+- **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), four plugin diffs against stock 1.1.24 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`), and `homebridge-plugin/new-files/PrebufferManager.js` (a new file, copied in rather than patched — it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)).
 
-The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-2)** — build from the stable tag **`nestfix-1.9.14-2`** (development happens on the `fix/nest-ipv6-ice-failure` branch, which may carry in-progress work and debug logging, so don't build from the branch). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
+The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-2)** — build from the stable tag **`nestfix-1.9.14-2`** (development happens on the `fix/nest-ipv6-ice-failure` branch, which may carry in-progress work, so don't build from the branch. **Note:** the current `nestfix-1.9.14-2` tag still emits a few `[nestdbg]` lines at Info level from the stall watchdog — including a per-second tick during Nest's post-motion droughts. They are harmless but noisy; they will be dropped to Debug in the next tag). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
 
 Two things worth calling out for anyone arriving because their recordings are unreliable:
 **HKSV clips from the stock plugin are silent** (an `-an` overrides the whole audio block —
@@ -145,7 +145,7 @@ Two things to note:
 
 **Set `vEncoder` to `"copy"`.** Your Nest cameras send H264 video. HomeKit wants H264 video. The default setting re-encodes it with x264, which wastes CPU and adds seconds of latency. `"copy"` passes the video through untouched. The plugin's README already mentions this option but understates how much it helps.
 
-**Faster live stream startup is now in the plugin.** As of **plugin v1.1.24**, [@littlepope81](https://github.com/littlepope81)'s [PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) is **merged** — no separate install needed. It cuts time-to-first-frame from ~8s to ~2s (first keyframe at **+2127ms** on a Pi 4) and exposes `-analyzeduration` / `-probesize` as config fields. It tunes the plugin's own direct WebRTC dial, so it applies unless you enable [Part 6](#part-6-optional-route-live-view-through-go2rtc-too). (The further ~4s before the tile actually appears is Apple's own HomeKit setup, not addressable from Homebridge.)
+**Faster live stream startup is now in the plugin.** As of **plugin v1.1.24**, [@littlepope81](https://github.com/littlepope81)'s [PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) is **merged** — no separate install needed. It cuts time-to-first-frame from ~8s to ~2s (first keyframe at **+2127ms** on a Pi 4) and exposes `-analyzeduration` / `-probesize` as config fields. It tunes the plugin's own direct WebRTC dial, so it applies unless you enable [Part 6](#part-6-route-live-view-and-recording-through-go2rtc). (The further ~4s before the tile actually appears is Apple's own HomeKit setup, not addressable from Homebridge.)
 
 After restarting Homebridge, your cameras should appear in Apple Home. Live streams will work. But the tiles show a Google logo or a blank image — that's the problem this guide exists to solve.
 
@@ -173,6 +173,8 @@ If this matters to you, the only levers are on Google's side — you can file fe
 This is the piece that makes real snapshots possible: keep one stream warm per camera, and grab a frame whenever HomeKit asks.
 
 ### The IPv6 bug
+
+> The fork also adds Google's public STUN server (`stun:stun.l.google.com:19302`) to the PeerConnection > config, where stock go2rtc passes none. That changes ICE candidate gathering and means the host will > contact a Google STUN endpoint when negotiating a Nest stream. Noted because it is a functional change > beyond the udp4 filter.
 
 **Stock go2rtc (v1.9.14 as of this writing) cannot stream Nest cameras on many home networks.** Its `nest:` source uses [pion/webrtc](https://github.com/pion/webrtc) for WebRTC negotiation, and pion gathers ICE candidates on all network types including IPv6. On hosts where IPv6 addresses exist but have no working route — which is extremely common — the ICE agent fails silently and no media flows. You'll see `nest: wrong status: 400 Bad Request` in the logs or streams that start but never produce video.
 
@@ -394,7 +396,7 @@ Mount the snapshot directory into the Homebridge container. **Without this mount
 -v /run/nest-snaps:/homebridge/nest-snaps
 ```
 
-> **A running container cannot gain a bind mount.** `docker restart` will not do it — you have to recreate the container with the extra `-v`, or add the volume to your Compose file and `docker compose up -d`. If you already run Homebridge, note the flags it was created with (`docker inspect homebridge`) before you remove it. If you enable [Part 6](#part-6-optional-route-live-view-through-go2rtc-too), Homebridge also needs `--network host`, so add both in the same recreation.
+> **A running container cannot gain a bind mount.** `docker restart` will not do it — you have to recreate the container with the extra `-v`, or add the volume to your Compose file and `docker compose up -d`. If you already run Homebridge, note the flags it was created with (`docker inspect homebridge`) before you remove it. If you enable [Part 6](#part-6-route-live-view-and-recording-through-go2rtc), Homebridge also needs `--network host`, so add both in the same recreation.
 
 A from-scratch container looks like this:
 
@@ -413,7 +415,7 @@ What the patches do:
 
 - **`Camera.js`** — `getSnapshot()` returns the warm JPEG from `/homebridge/nest-snaps/<key>.jpg` instead of the Google logo, falling back to the logo if the file is missing or older than 90 seconds (so an off camera shows the honest placeholder). On a motion/person event it creates `/homebridge/nest-snaps/.refresh` (via the plugin's `fs`, no subshell) to trigger an immediate warm-frame grab. The `<key>` is derived exactly as the sync script derives it, which is how the plugin finds the file the warmer wrote.
 - **`Api.js`** — **auto-reconnects the Pub/Sub subscription**. Upstream sets it up once and, on error, just stops — so a silently dropped streaming-pull connection permanently kills all camera events (no motion alerts, no HKSV recording) until you restart Homebridge. This re-subscribes on `error`/`close` with exponential backoff, plus a 12-hour proactive recycle to catch half-open stalls. Still open upstream as [PR #216](https://github.com/potmat/homebridge-google-nest-sdm/pull/216).
-- **`StreamingDelegate.js`** — optional; see [Part 6](#part-6-optional-route-live-view-through-go2rtc-too).
+- **`StreamingDelegate.js`** — optional; see [Part 6](#part-6-route-live-view-and-recording-through-go2rtc).
 
 Earlier versions of this repo carried several more patches; those fixes were merged upstream and ship in plugin 1.1.24. The [Related Issues and PRs](#related-issues-and-prs) index records which.
 
@@ -476,7 +478,9 @@ To make that automatic, run a one-shot unit on a `systemd` **timer** (`OnBootSec
 
 **Motion notifications not arriving on your phone?** HomeKit defaults motion notifications to **off** for new camera accessories. In the Apple Home app: tap the camera → scroll down → **Status and Notifications** → turn on **Motion Notifications** (and **Activity Notifications** if available). You also need an Apple Home Hub (Apple TV, HomePod, or iPad) for notifications to push when you're away.
 
-## Part 6 (optional): route live view through go2rtc too
+## Part 6: route live view and recording through go2rtc
+
+> **Not actually optional once you patch.** `apply-snapshot-patch.sh` has no per-patch switch, and the > routing is unconditional — `useGo2rtc` is true for every camera that has a name, which is all of them. > So after patching, a Homebridge whose go2rtc is missing, stopped, or serving different stream names > **loses live view and all HKSV recording**, because ffmpeg dials `rtsp://127.0.0.1:8554/<key>` and fails. > If you only want snapshot tiles, stop after Part 4 and do not run the patch script.
 
 By default `homebridge-google-nest-sdm` opens its **own** WebRTC connection to Google every time you tap a camera tile — separate from the warm stream go2rtc is already holding. That means 2–3 concurrent Google streams per camera (go2rtc's preload + each HomeKit view + the Google Home app). Nest enforces a concurrent-stream limit, and hitting it is what causes tiles that hang for many seconds or "never load."
 
@@ -544,13 +548,13 @@ The same `StreamingDelegate.js` patch routes **HomeKit Secure Video recording** 
 
 By default, when motion fires, the plugin's recording handler (`handleRecordingStreamRequest`) opens **yet another** fresh Google WebRTC session — a *second* concurrent stream for that camera (a *third* if you're also viewing live). That tips Nest over its per-device concurrent-stream limit, and every recording triggers an ugly cascade: the second dial contends with go2rtc's warm stream → go2rtc's stream gets throttled/dropped → it reconnects (a burst of `retry=` in the go2rtc log) → and the recording itself decodes garbage (`concealing 3721 DC/AC/MV errors in I frame`, corrupt frames) because it started against a contended, half-broken stream. The system "self-heals" a minute later, but the clip is ruined.
 
-Routing recording through the warm RTSP stream instead (`rtsp://127.0.0.1:8554/<key>` for any go2rtc-managed camera) eliminates all of it: no second session, no contention, no reconnect burst, and the recorder runs against a clean, already-established stream. (As of the prebuffer work below, that recorder no longer transcodes video at all — see *Recording copies video*.) Measured before/after on a Pi 4: decode errors dropped from **thousands per recording to ~zero**, and recording-induced reconnect spikes went to **none**. `HksvStreamer.js` already accepts an RTSP input (no stdin pipe needed), so the only change is at the streamer-creation point in `handleRecordingStreamRequest`. It ships in the same `StreamingDelegate.js.patch`.
+Routing recording through the warm RTSP stream instead (`rtsp://127.0.0.1:8554/<key>` for any go2rtc-managed camera) eliminates all of it: no second session, no contention, no reconnect burst, and the recorder runs against a clean, already-established stream. (As of the prebuffer work below, that recorder no longer transcodes video at all — see *Recording copies video*.) Measured before/after on a Pi 4: decode errors dropped from **thousands per recording to ~zero**, and recording-induced reconnect spikes went to **none**. This ships in `StreamingDelegate.js.patch`. It is no longer the only change in that function — the same patch also carries the audio fix, the video-copy change, and the prebuffer feed described below — and `HksvStreamer.js` now has its own patch too (it must accept a `Readable` on stdin for the prebuffer, and end ffmpeg's stdin on source close).
 
 The patch also carries two teardown fixes the RTSP path needs.
 
 The first is **not optional**. On the RTSP path there is no streamer object, but the base plugin's `closeRecordingStream` calls `recordingSessionInfo.nestStreamer.teardown()` unguarded. That throws a **synchronous** `TypeError` — which `Promise.resolve` does *not* absorb — out of `closeRecordingStream`, so `recordingSessionInfo` never clears and **recording is permanently wedged after the first clip on every go2rtc camera**. The patch hands that branch a no-op streamer (`{ teardown: async () => {} }`) so the unguarded call is harmless.
 
-The second: `handleRecordingStreamRequest` must **destroy any prior session before overwriting `recordingSessionInfo`**, which matters more here than on stock for the same reason as the watchdog above — a clobbered session's transcode would otherwise run forever (the exact shape of plugin issue #150).
+The second: the recording session must be reset in a `finally`, so a generator that throws cannot leave `handlingRecordingStreamingRequest` stuck true and block every later recording. (The related destroy-prior-session fix for issue #150 is **not** ours to claim here — it merged upstream as PR #217 and is already in stock 1.1.24; the patch carries it only as context.)
 
 ### The prebuffer: why clips used to open *after* the person had gone
 
@@ -723,6 +727,10 @@ A camera that's **switched off** costs a little more than an active one: the for
 - [homebridge-google-nest-sdm #233](https://github.com/potmat/homebridge-google-nest-sdm/issues/233) — `prebufferLength: 4000` advertised to HomeKit with no prebuffer implemented behind it — **open**; answered by `PrebufferManager.js` here
 - [homebridge-google-nest-sdm #234](https://github.com/potmat/homebridge-google-nest-sdm/issues/234) — every HKSV clip recorded **silent**: an unconditional `-an` at the head of `videoArgs` overrode the whole AAC-ELD block, because `HksvStreamer` appends videoArgs *after* audioArgs — **open**; fixed here in `StreamingDelegate.js.patch`
 
+- [homebridge-google-nest-sdm #235](https://github.com/potmat/homebridge-google-nest-sdm/issues/235) — HKSV recording re-encodes video unnecessarily; `-codec:v copy` works and the `-profile:v` requirement is self-imposed — **open**
+- [homebridge-google-nest-sdm PR #237](https://github.com/potmat/homebridge-google-nest-sdm/pull/237) — the silent-recordings fix from this repo (issue #234) — **open**
+- [homebridge-google-nest-sdm PR #238](https://github.com/potmat/homebridge-google-nest-sdm/pull/238) — copy the camera H.264 for HKSV recording on the WebRTC path, dropping the libx264 transcode (issue #235); RTSP cameras keep transcoding — **open**
+
 **Upstream go2rtc work this fork builds on (credit to the authors):**
 
 - [go2rtc PR #2368](https://github.com/AlexxIT/go2rtc/pull/2368) — the Nest keyframe-request + `sprop-parameter-sets`-in-SDP patches from this fork, submitted upstream
@@ -735,4 +743,4 @@ A camera that's **switched off** costs a little more than an active one: the for
 
 ## License
 
-go2rtc is [MIT licensed](https://github.com/AlexxIT/go2rtc/blob/master/LICENSE). This fork carries a small set of Nest-focused patches: IPv4-only ICE in `pkg/nest/client.go`; keyframe-request, `sprop-parameter-sets`, and a stall watchdog in `pkg/webrtc/conn.go`; and stream-extension resilience in `pkg/nest/api.go`. It also incorporates the community PRs credited above. All changes are gated to the Nest source (`FormatName == "nest/webrtc"`) so nothing else in go2rtc is affected.
+go2rtc is [MIT licensed](https://github.com/AlexxIT/go2rtc/blob/master/LICENSE). This fork carries a small set of Nest-focused patches: IPv4-only ICE in `pkg/nest/client.go`; keyframe-request, `sprop-parameter-sets`, and a stall watchdog in `pkg/webrtc/conn.go`; and stream-extension resilience in `pkg/nest/api.go`. It also incorporates the community PRs credited above. Only the `pkg/webrtc/conn.go` additions are gated to the Nest source (`FormatName == "nest/webrtc"`). The rest are **not** Nest-specific and affect any source that exercises them: `pkg/h264/rtp.go` (partition-head sync — every H264 RTP source), `internal/streams/preload.go` (preload retry), `internal/mjpeg/mjpeg.go` and `internal/mp4/mp4.go` (consumer reaping), `internal/ffmpeg/jpeg.go` (stderr surfacing), `pkg/core/writebuffer.go`, and `pkg/homekit/helpers.go`. They are bug fixes rather than Nest behaviour changes — three are upstream PRs (#2368/#2378/#2380) — but if you run other sources through this fork, know that they are in the path.

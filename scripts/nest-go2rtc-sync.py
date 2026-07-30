@@ -13,7 +13,7 @@ those use customName (e.g. "Primary Bedroom Upstairs") and would not match.
 
 Restarts go2rtc only when the generated config actually changes.
 """
-import json, sys, urllib.parse, urllib.request, subprocess, argparse, re
+import json, os, sys, urllib.parse, urllib.request, subprocess, argparse, re
 
 def token(cid, cs, rt):
     d = urllib.parse.urlencode({"client_id": cid, "client_secret": cs,
@@ -99,8 +99,24 @@ out = ("api:\n  listen: \"127.0.0.1:1985\"\nrtsp:\n  listen: \":8554\"\n"
 if cur == out:
     print("config unchanged"); sys.exit(0)
 if a.dry_run:
-    print("--- would write ---"); sys.exit(0)
-open(a.out, "w").write(out)
+    print("--- would write ---")
+    print(out)
+    sys.exit(0)
+# Write 0600 from the start via a temp file: the output embeds an OAuth refresh
+# token, and the previous open() created it 0644 until something chmod'd it later.
+_tmp = a.out + ".tmp"
+_fd = os.open(_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(_fd, "w") as _f:
+    _f.write(out)
+os.replace(_tmp, a.out)
 print(f"config changed -> wrote {a.out}; restarting {a.container}")
-subprocess.run(["docker", "restart", a.container], check=False,
-               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+# Do NOT discard this. A user who needs `sudo docker` would otherwise see
+# "restarting go2rtc" while go2rtc kept serving the OLD config -- new cameras
+# never get warm streams, with no error anywhere.
+_r = subprocess.run(["docker", "restart", a.container], check=False,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+if _r.returncode != 0:
+    _e = (_r.stderr or b"").decode("utf-8", "replace").strip()
+    print(f"WARNING: could not restart {a.container} (exit {_r.returncode}): {_e}")
+    print("         go2rtc is STILL RUNNING THE OLD CONFIG -- restart it yourself.")
+    sys.exit(1)

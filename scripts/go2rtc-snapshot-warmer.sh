@@ -17,8 +17,8 @@
 #   3. Reject near-uniform GRAY frames: ffmpeg emits a solid-gray JPEG when it decodes
 #      H264 without a keyframe. One was caught on disk at 5618 bytes, YAVG=128 exactly,
 #      and the old `-gt 1000` gate happily published it as a "valid" snapshot.
-DIR=/run/nest-snaps
-API=http://127.0.0.1:1985
+DIR="${SNAPS_DIR:-/run/nest-snaps}"   # install.sh --snaps-dir passes SNAPS_DIR via the unit
+API="${GO2RTC_API:-http://127.0.0.1:1985}"
 INTERVAL=10
 BASELINE_CACHE=8s   # < INTERVAL so the baseline cycle gets a fresh frame each time
 EVENT_CACHE=1s      # motion/doorbell: force a near-fresh transcode
@@ -37,7 +37,10 @@ STALE_MAX_MIN=30    # reap a snapshot only after this many minutes with no refre
 BYTES_STATE="$DIR/.bytes"   # v3: previous cycle's per-stream receiver totals, for the liveness delta
 mkdir -p "$DIR"
 
-log() { logger -t go2rtc-warmer "$*" 2>/dev/null || true; }
+# Always emit to stderr as well as syslog: under docker-compose the warmer runs in a bare
+# alpine with no syslog socket, so a logger-only implementation silently discarded every
+# failure -- the exact blindness this logging was added to remove.
+log() { logger -t go2rtc-warmer "$*" 2>/dev/null || true; echo "go2rtc-warmer: $*" >&2; }
 
 refresh_all() {
   local cache="${1:-$BASELINE_CACHE}"

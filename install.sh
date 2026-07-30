@@ -73,7 +73,10 @@ if ! docker info >/dev/null 2>&1; then DOCKER="sudo docker"; fi
 
 # ---- phase 0: preflight -----------------------------------------------------
 say "Preflight checks"
-for c in git curl python3; do command -v "$c" >/dev/null 2>&1 || die "$c not found (install it first)"; done
+# node and patch are needed by the plugin-patch phase. Checking them here rather than
+# there: without node, the version probe returns empty and you get "REFUSING: plugin is
+# ''" long after containers and services are already up.
+for c in git curl python3 node patch; do command -v "$c" >/dev/null 2>&1 || die "$c not found (install it first)"; done
 $DOCKER info >/dev/null 2>&1 || die "cannot talk to docker (need sudo or docker group)"
 [ -f "$HB_CONFIG" ] || die "Homebridge config not found: $HB_CONFIG (pass --hb-config)"
 python3 - "$HB_CONFIG" <<'PY' || die "no homebridge-google-nest-sdm platform (with clientId/refreshToken) in the config"
@@ -149,6 +152,7 @@ Description=Keep go2rtc snapshot cache warm for Homebridge/HomeKit
 After=docker.service
 Wants=docker.service
 [Service]
+Environment=SNAPS_DIR=$SNAPS_DIR
 ExecStart=$SCRIPTS_DIR/go2rtc-snapshot-warmer.sh
 Restart=always
 RestartSec=10
