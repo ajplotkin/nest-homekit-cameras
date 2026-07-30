@@ -340,7 +340,7 @@
          // Tear down any prior recording session before overwriting it. A HomeKit hub
          // can start a new recording (e.g. after a brief reconnect) before the previous
          // session's close event fires. Without this, the previous HksvStreamer — and
-@@ -437,12 +636,16 @@
+@@ -437,12 +636,15 @@
              hksvStreamer: hksvStreamer,
              nestStreamer: nestStreamer
          };
@@ -349,7 +349,6 @@
 -            throw new Error('Streaming server already closed.');
 -        }
          const pending = [];
-+        let _lastFragmentAt = 0;
          try {
 +            // H-2: inside the try. If start() rejects (listen/spawn failure) or the
 +            // destroyed-check throws, the finally must still run to destroy the prebuffer
@@ -361,24 +360,39 @@
              for await (const box of this.recordingSessionInfo.hksvStreamer.generator()) {
                  pending.push(box.header, box.data);
                  const motionDetected = (_c = this.accessory.getService(this.hap.Service.MotionSensor)) === null || _c === void 0 ? void 0 : _c.getCharacteristic(this.platform.Characteristic.MotionDetected).value;
-@@ -450,6 +653,14 @@
+@@ -450,6 +652,16 @@
                  if (box.type === "moov" || box.type === "mdat") {
                      const fragment = Buffer.concat(pending);
                      pending.splice(0, pending.length);
-+                    // A fragment longer than the negotiated fragmentLength is the one case
-+                    // with no evidence for how the hub reacts. Should not occur (Google's IDR
-+                    // cadence is ~1.67s), so surface it rather than silently rely on that.
-+                    const _nowMs = Date.now();
-+                    if (_lastFragmentAt && (_nowMs - _lastFragmentAt) > 4500) {
-+                        this.log.warn(`HKSV fragment spacing ${_nowMs - _lastFragmentAt}ms exceeds the negotiated 4000ms`, this.camera.getDisplayName());
-+                    }
-+                    _lastFragmentAt = _nowMs;
++                    // NOTE: no fragment-duration check here. Wall-clock arrival spacing --
++                    // the obvious proxy -- is the WRONG measure: buffered history arrives
++                    // milliseconds apart (so an over-long fragment is invisible), and a Nest
++                    // post-motion drought makes a normal 1.67s fragment arrive seconds late
++                    // (a false positive). Measuring this properly means diffing tfdt
++                    // (traf/tfdt baseMediaDecodeTime) between consecutive moofs against the
++                    // moov timescale. Not implemented: observed cadence is 1.67-2s even at
++                    // night frame rates, which indicates Nest's IDR interval is time-based
++                    // rather than frame-count-based, so exceeding the negotiated 4000ms
++                    // should not arise.
                      const isLast = STOP_AFTER_MOTION_STOP && !motionDetected;
                      yield {
                          data: fragment,
-@@ -465,10 +676,45 @@
+@@ -463,12 +675,57 @@
+             }
+         }
          catch (error) {
-             this.log.error("Encountered unexpected error on generator " + error.stack);
+-            this.log.error("Encountered unexpected error on generator " + error.stack);
++            // A normal, successful clip ends this way: the hub acknowledges, we destroy the
++            // streamer, the socket closes, and a pending read() rejects. That is not an
++            // error worth shouting about -- it was being logged alongside a clean
++            // reason=NORMAL close, which reads as a contradiction.
++            const _m = String((error && error.message) || "");
++            if (/socket|closed|Unexpected state|premature close|EPIPE/i.test(_m)) {
++                this.log.debug("Recording generator ended: " + _m, this.camera.getDisplayName());
++            }
++            else {
++                this.log.error("Encountered unexpected error on generator " + error.stack);
++            }
          }
 +        finally {
 +            // Clear the session even if the controller never calls closeRecordingStream (e.g. the

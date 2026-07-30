@@ -109,6 +109,10 @@ class CameraBuffer {
         // backoff is allowed to grow much further than a camera that was working
         // and then dropped.
         this.everProduced = false;
+        // Timestamp of the last published fragment. A camera that worked earlier but has
+        // been dark for a while (AJ switches two off overnight) should not keep poking
+        // go2rtc -> SDM once a minute all night for nothing.
+        this.lastProducedAt = 0;
     }
 
     start() {
@@ -146,7 +150,16 @@ class CameraBuffer {
         // cost real debugging time on this deployment before.
         child.stderr.on("data", d => {
             const s = d.toString().trim();
-            if (s) {
+            if (!s) {
+                return;
+            }
+            // Before this camera has EVER produced a fragment, ffmpeg's complaint is the
+            // only thing that explains why the prebuffer is silently inert (e.g. an older
+            // ffmpeg refusing Opus-in-MP4 without -strict experimental). Do not bury it.
+            if (!this.everProduced) {
+                this.log.warn(`[prebuffer:${this.name}] ffmpeg (ring never started): ${s}`);
+            }
+            else {
                 this.log.debug(`[prebuffer:${this.name}] ffmpeg: ${s}`);
             }
         });
@@ -160,6 +173,12 @@ class CameraBuffer {
             // old fragments; keeping them risks handing a consumer a mismatched init.
             this.initSegment = Buffer.alloc(0);
             this.fragments = [];
+            // Drop half-parsed state HERE too, not just in killChild(): stdout buffered
+            // before 'exit' can still arrive afterwards, and completing an old-timeline
+            // moof+mdat into the new array is a backward-DTS splice that -codec:v copy
+            // cannot mask. start() also resets these, but only after the backoff delay.
+            this.pending = Buffer.alloc(0);
+            this.pendingMoof = undefined;
             this.resetConsumers("prebuffer reader restarted; timeline discontinuity");
             // Reset backoff if it had been healthy: a stream that ran for minutes
             // and then dropped deserves a prompt retry, not the delay earned by one
@@ -192,7 +211,8 @@ class CameraBuffer {
             return;
         }
         const delay = this.backoffMs;
-        const cap = this.everProduced ? 60000 : 300000;
+        const sustainedOutage = this.lastProducedAt > 0 && (Date.now() - this.lastProducedAt) > 300000;
+        const cap = (this.everProduced && !sustainedOutage) ? 60000 : 300000;
         this.backoffMs = Math.min(this.backoffMs * 2, cap);
         this.restartTimer = setTimeout(() => {
             this.restartTimer = undefined;
@@ -287,6 +307,7 @@ class CameraBuffer {
     publish(fragment) {
         this.everProduced = true;
         const now = Date.now();
+        this.lastProducedAt = now;
         this.fragments.push({ t: now, data: fragment });
         this.totalFragments++;
         const cutoff = now - this.bufferSeconds * 1000;

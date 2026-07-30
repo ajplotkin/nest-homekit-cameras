@@ -1,6 +1,19 @@
 --- a/dist/HksvStreamer.js
 +++ b/dist/HksvStreamer.js
-@@ -53,9 +53,37 @@
+@@ -37,6 +37,12 @@
+         this.server.listen(); // listen on random port
+         await promise;
+         if (this.destroyed) {
++            // destroy() ran while we were awaiting 'listening', so its server.close() was a
++            // no-op on a not-yet-listening socket. Close it here or the fd leaks for good.
++            try {
++                this.server.close(() => { });
++            }
++            catch (e) { /* nothing further to do */ }
+             return;
+         }
+         const port = this.server.address().port;
+@@ -53,9 +59,37 @@
          }
          if (this.childProcess.stdin) {
              if (this.nestStream.stdin) {
@@ -41,7 +54,7 @@
              }
          }
          if (this.debugMode) {
-@@ -69,13 +97,23 @@
+@@ -69,13 +103,23 @@
          (_a = this.childProcess) === null || _a === void 0 ? void 0 : _a.kill();
          this.childProcess = undefined;
          this.destroyed = true;
@@ -69,7 +82,7 @@
          (_b = this.connectResolve) === null || _b === void 0 ? void 0 : _b.call(this);
      }
      handleDisconnect() {
-@@ -83,13 +121,13 @@
+@@ -83,13 +127,13 @@
          this.log.debug('Socket destroyed.');
          (_a = this.socket) === null || _a === void 0 ? void 0 : _a.destroy();
          this.socket = undefined;
