@@ -20,9 +20,17 @@ This guide walks through the full setup from scratch: getting API access to your
 - **[`install.sh`](install.sh)** — one-shot installer for everything after your Google credentials; see [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
 - **[`docker-compose.yml`](docker-compose.yml)** — the go2rtc + warmer half of the stack as Compose services.
 - **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), and `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches).
-- **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout) and `homebridge-plugin/*.patch` (the plugin changes as diffs against stock plugin 1.1.24).
+- **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), `homebridge-plugin/*.patch` (the plugin changes as diffs against stock plugin 1.1.24), and `homebridge-plugin/new-files/PrebufferManager.js` (a new file, copied in rather than patched — it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)).
 
 The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-2)** — build from the stable tag **`nestfix-1.9.14-2`** (development happens on the `fix/nest-ipv6-ice-failure` branch, which may carry in-progress work and debug logging, so don't build from the branch). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
+
+Two things worth calling out for anyone arriving because their recordings are unreliable:
+**HKSV clips from the stock plugin are silent** (an `-an` overrides the whole audio block —
+[#234](https://github.com/potmat/homebridge-google-nest-sdm/issues/234)), and they **begin
+~3.6s after Google's event timestamp**, which is late enough that HomeKit's own
+People/Animals/Vehicles analysis often finds nobody in the footage and **silently discards the
+clip**. Both are fixed here — see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)
+and [Recording copies video](#recording-copies-video--the-transcode-was-never-necessary).
 
 ## What You'll Set Up
 
@@ -427,7 +435,7 @@ The script pins the plugin version it was cut against (**1.1.24**) and **refuses
 
 > **These patches live in `node_modules` and are wiped by any `npm install` of the plugin.** Re-run `apply-snapshot-patch.sh` after any plugin install or upgrade — always in that order: `npm install` first, patch script second. (That is also how you *uninstall* them: reinstall the plugin and don't re-run the patcher.)
 >
-> **This applies all three patches, including the Part 6 live-view routing** — the script has no per-patch switch. If you don't want Part 6, read it first and be aware Homebridge needs `--network host`.
+> **This applies all four patches plus one new file, including the Part 6 live-view routing** — the script has no per-patch switch. If you don't want Part 6, read it first and be aware Homebridge needs `--network host`.
 
 ## Part 5: Verify
 
@@ -536,13 +544,122 @@ The same `StreamingDelegate.js` patch routes **HomeKit Secure Video recording** 
 
 By default, when motion fires, the plugin's recording handler (`handleRecordingStreamRequest`) opens **yet another** fresh Google WebRTC session — a *second* concurrent stream for that camera (a *third* if you're also viewing live). That tips Nest over its per-device concurrent-stream limit, and every recording triggers an ugly cascade: the second dial contends with go2rtc's warm stream → go2rtc's stream gets throttled/dropped → it reconnects (a burst of `retry=` in the go2rtc log) → and the recording itself decodes garbage (`concealing 3721 DC/AC/MV errors in I frame`, corrupt frames) because it started against a contended, half-broken stream. The system "self-heals" a minute later, but the clip is ruined.
 
-Routing recording through the warm RTSP stream instead (`rtsp://127.0.0.1:8554/<key>` for any go2rtc-managed camera) eliminates all of it: no second session, no contention, no reconnect burst, and the transcode runs against a clean, already-established stream. Measured before/after on a Pi 4: decode errors dropped from **thousands per recording to ~zero**, and recording-induced reconnect spikes went to **none**. `HksvStreamer.js` already accepts an RTSP input (no stdin pipe needed), so the only change is at the streamer-creation point in `handleRecordingStreamRequest`. It ships in the same `StreamingDelegate.js.patch`.
+Routing recording through the warm RTSP stream instead (`rtsp://127.0.0.1:8554/<key>` for any go2rtc-managed camera) eliminates all of it: no second session, no contention, no reconnect burst, and the recorder runs against a clean, already-established stream. (As of the prebuffer work below, that recorder no longer transcodes video at all — see *Recording copies video*.) Measured before/after on a Pi 4: decode errors dropped from **thousands per recording to ~zero**, and recording-induced reconnect spikes went to **none**. `HksvStreamer.js` already accepts an RTSP input (no stdin pipe needed), so the only change is at the streamer-creation point in `handleRecordingStreamRequest`. It ships in the same `StreamingDelegate.js.patch`.
 
 The patch also carries two teardown fixes the RTSP path needs.
 
 The first is **not optional**. On the RTSP path there is no streamer object, but the base plugin's `closeRecordingStream` calls `recordingSessionInfo.nestStreamer.teardown()` unguarded. That throws a **synchronous** `TypeError` — which `Promise.resolve` does *not* absorb — out of `closeRecordingStream`, so `recordingSessionInfo` never clears and **recording is permanently wedged after the first clip on every go2rtc camera**. The patch hands that branch a no-op streamer (`{ teardown: async () => {} }`) so the unguarded call is harmless.
 
 The second: `handleRecordingStreamRequest` must **destroy any prior session before overwriting `recordingSessionInfo`**, which matters more here than on stock for the same reason as the watchdog above — a clobbered session's transcode would otherwise run forever (the exact shape of plugin issue #150).
+
+### The prebuffer: why clips used to open *after* the person had gone
+
+Recording only starts once HomeKit asks for it, which is downstream of Google's Pub/Sub
+delivery. Measured on this deployment:
+
+```
+Google event timestamp -> Pub/Sub delivery :  ~2.0s typical (median 7.5s across a day)
+delivery -> ffmpeg connected + keyframe    :  ~1.0s
+                                              ------
+event timestamp -> first recorded frame    :  ~3.6s
+```
+
+Worse, Google's timestamp is itself late. For one doorbell event Google's *own* clip began
+**6.1s before** the timestamp it published to us, so we were ~9.7s behind what Google
+captured. A person walking to a door is gone by the first frame.
+
+That mattered far more than it sounds, because of what HomeKit does next. If a camera's
+**Recording Options** are set to People/Animals/Vehicles (rather than Any Motion), the hub
+runs its *own* analysis on the footage and **silently discards the clip if it finds no
+qualifying subject**. Every layer reports success — `closeRecordingStream` returns
+`reason=NORMAL`, no error anywhere — and the clip simply never appears. That is the real
+cause of "the doorbell missed someone", and it is not fixable by anything on the camera side.
+
+`PrebufferManager.js` (new file) fixes it. Per camera it continuously remuxes the warm go2rtc
+stream with `-c copy` into a rolling in-memory ring of fragmented-MP4 fragments, each
+beginning on a keyframe. **No encoding**, so it costs roughly 150 KB/s and a few percent of
+one core per camera, and about 2 MB of RAM. When a recording starts, the recorder is fed
+`[buffered history][live]` through stdin, so the clip opens *before* the trigger.
+
+Two design points worth keeping if you modify it:
+
+- **Anchor to the event timestamp, not to "now".** Connection time varies with Pub/Sub
+  latency (median 7.5s, p75 47.8s here), so anchoring to the moment ffmpeg connects makes the
+  recovered window vary by seconds run to run. `Camera.js` latches the Google timestamp when
+  a STARTED motion/person event fires; the recorder anchors to that.
+- **Size the window from the hub's *selected* `prebufferLength`, not from what you
+  advertise.** The advertised value is only a maximum — the hub picks its own (Apple hubs
+  select ~4000 ms) and anything beyond the selection is delivered and then discarded. Serving
+  15 s when the hub keeps 4 s is pure waste.
+
+Verified: a real doorbell event now opens on an empty porch **5 seconds before** the subject
+appears, where it previously opened on their back as they left.
+
+Config keys (both optional; the feature is **off** unless the first is set):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `hksvPrebufferSeconds` | unset (off) | Upper bound on pre-trigger footage to serve, in seconds. `6` is ample given hubs select 4 s. |
+| `hksvPrebufferRetainSeconds` | `15` | How much history to hold in RAM per camera. Must comfortably exceed `hksvPrebufferSeconds` plus Pub/Sub delivery latency. |
+
+```json
+{
+  "platform": "homebridge-google-nest-sdm",
+  "hksvPrebufferSeconds": 6,
+  "hksvPrebufferRetainSeconds": 15
+}
+```
+
+Confirm it is working:
+
+```bash
+docker logs homebridge 2>&1 | grep "prebuffer.*serving"
+# [prebuffer:front_door] serving 5 buffered fragments (~8.7s of history)
+```
+
+### Recording copies video — the transcode was never necessary
+
+The stock recording path re-encodes with libx264. It does not need to, and the reason it did
+is a chain of two unrelated-looking lines: the plugin advertises
+`video.parameters.profiles: [HIGH]` for recording, and `handleRecordingStreamRequest` then
+derives `-profile:v` from whatever the controller selected. Since Nest emits **Main**, that
+combination forces a re-encode on every clip.
+
+Nothing on the HomeKit side compares delivered bytes against the negotiation — hap-nodejs
+treats each fragment as an opaque buffer and never parses `moof`/`mdat`/SPS. The proof is in
+this very plugin: its **live** path already advertises Main and streams with `-codec:v copy`.
+Upstream precedent too — homebridge-unifi-protect advertises Main *only* and records with
+copy; scrypted copies whatever the camera emits and treats transcoding as a debug option.
+
+So on any go2rtc-sourced camera the recorder now uses `-codec:v copy`. Only audio is
+transcoded (Opus → AAC-ELD, which HomeKit genuinely requires). Measured on a Pi 4 with a
+1600×1200 doorbell:
+
+| | transcode | copy |
+|---|---|---|
+| CPU | ~1.8 of 4 cores | remux only |
+| Encoder throughput | ~1.37× realtime | n/a |
+| Frame rate | had to be capped to 15 to keep up | the source's native rate |
+| Video | a re-encode of Google's encode | Google's original bytes |
+
+That throughput figure was the margin against the hub's fragment timeout; under concurrent
+load the transcode could fall below realtime, which is when clips truncate. With no encoder
+there is nothing to fall behind.
+
+Two things to know:
+
+- **Fragment length becomes the source's IDR cadence** (~1.67 s here) rather than the
+  negotiated 4000 ms. That is within contract: hap-nodejs documents `fragmentLength` as a
+  maximum ("must not be longer than"), and `-movflags frag_keyframe` guarantees every
+  fragment starts on a keyframe. Don't try to group fragments to reach 4000 ms — it is
+  unnecessary and multi-`moof`-per-yield isn't something the spec describes.
+- **The advertisement is deliberately left as `[HIGH]`.** Changing it would alter the
+  supported-configuration hash, which makes hap-nodejs discard every hub's persisted selected
+  configuration and forces a renegotiation. Copy needs no such change. `[LEVEL4_0]` must stay
+  regardless — 1600×1200 is 7,500 macroblocks per frame, which exceeds Level 3.1/3.2's
+  maximum frame size at *any* frame rate.
+
+The libx264 block is retained for the non-go2rtc fallback path only.
 
 ### Confirm it's routing through RTSP
 
@@ -554,7 +671,7 @@ docker logs homebridge 2>&1 | grep "Using local go2rtc RTSP"
 
 If it appears, live view is coming from the warm stream. If instead you see the plugin opening a Google dial, `go2rtcKey` didn't match a stream name — compare the accessory name against the stream names in `curl -s http://127.0.0.1:1985/api/streams`.
 
-To undo Part 6: reinstall the plugin (`npm install homebridge-google-nest-sdm@1.1.24`) and don't re-run the patch script. That reverts all three patches, so re-apply them if you still want the snapshot fix — there is no per-patch switch.
+To undo Part 6: reinstall the plugin (`npm install homebridge-google-nest-sdm@1.1.24`) and don't re-run the patch script. That reverts all four patches and removes `PrebufferManager.js`, so re-apply them if you still want the snapshot fix — there is no per-patch switch.
 
 ## Reference
 
@@ -583,6 +700,10 @@ A camera that's **switched off** costs a little more than an active one: the for
 | Bandwidth per camera | ~1.5 Mbps continuous |
 | RAM for snapshot files | ~200 KB |
 | Stream startup (with PR #212 + `vEncoder: "copy"`) | First keyframe at +2127ms |
+| CPU per HKSV recording (transcode, before) | ~1.8 of 4 cores, ~1.37x realtime |
+| CPU per HKSV recording (copy, now) | remux + audio only |
+| Prebuffer ring, per camera | ~150 KB/s, ~2 MB RAM, a few % of one core |
+| Pre-trigger footage recovered | ~10.7s (clip opens ~5s before the subject appears) |
 
 ### Related Issues and PRs
 
@@ -596,6 +717,11 @@ A camera that's **switched off** costs a little more than an active one: the for
 - [homebridge-google-nest-sdm PR #224](https://github.com/potmat/homebridge-google-nest-sdm/pull/224) — reset the recording session in a `finally` (follow-up to #223) — **open**; still carried here in `StreamingDelegate.js.patch`
 - [homebridge-google-nest-sdm PR #218](https://github.com/potmat/homebridge-google-nest-sdm/pull/218) by [@littlepope81](https://github.com/littlepope81) — hardens the Pub/Sub handler against `relationUpdate`/malformed events ([issue #214](https://github.com/potmat/homebridge-google-nest-sdm/issues/214)) — **merged in 1.1.24** (this repo's `Api.js.patch` now reuses the base guard and only adds reconnect)
 - [homebridge-google-nest-sdm PR #219](https://github.com/potmat/homebridge-google-nest-sdm/pull/219) by [@littlepope81](https://github.com/littlepope81) — drops replayed/stale events so a reconnect/restart backlog can't fire phantom motion/recordings — **merged in 1.1.24** (this repo relies on the base plugin's version; the standalone Camera.js/Doorbell.js stale-event patches were dropped once it merged)
+
+- [homebridge-google-nest-sdm #231](https://github.com/potmat/homebridge-google-nest-sdm/issues/231) — `MAX_EVENT_AGE_SECONDS = 30` discards real events, because Pub/Sub first deliveries are routinely 46-57s late — **open**; this repo raises the gate to 120s in `Camera.js.patch`
+- [homebridge-google-nest-sdm #232](https://github.com/potmat/homebridge-google-nest-sdm/issues/232) — HKSV clips truncated by x264 lookahead/B-frames, which a live source can never recover from — **open**; now moot on the go2rtc path, which no longer encodes at all
+- [homebridge-google-nest-sdm #233](https://github.com/potmat/homebridge-google-nest-sdm/issues/233) — `prebufferLength: 4000` advertised to HomeKit with no prebuffer implemented behind it — **open**; answered by `PrebufferManager.js` here
+- [homebridge-google-nest-sdm #234](https://github.com/potmat/homebridge-google-nest-sdm/issues/234) — every HKSV clip recorded **silent**: an unconditional `-an` at the head of `videoArgs` overrode the whole AAC-ELD block, because `HksvStreamer` appends videoArgs *after* audioArgs — **open**; fixed here in `StreamingDelegate.js.patch`
 
 **Upstream go2rtc work this fork builds on (credit to the authors):**
 
