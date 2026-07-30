@@ -19,7 +19,7 @@
  *
  * Separately, HomeKit *asks* for footage before the trigger (`prebufferLength`);
  * that requirement is additive to the lateness above. To honestly serve a 4s
- * advertised prebuffer we need 4 + ~3.3 = ~7.3s of history, hence the 15s default.
+ * advertised prebuffer we need 4 + ~3.3 = ~7.3s of history, hence the 12s default.
  *
  * THE APPROACH
  * ------------
@@ -31,7 +31,7 @@
  * Fragmented MP4 rather than mpegts because every `moof` starts at a keyframe and
  * box headers are self-describing, so safe cut points need no codec parsing. This
  * is also exactly the format HksvStreamer already consumes. Measured here:
- * ~1.67s per fragment, init segment 1285 bytes, ~150KB/s => ~2.3MB per camera.
+ * ~1.67s per fragment, init segment 1285 bytes, ~150KB/s => ~1.8MB per camera.
  *
  * ANCHORING
  * ---------
@@ -161,6 +161,11 @@ class CameraBuffer {
         this.child = child;
         const startedAt = Date.now();
         this.startedAt = startedAt;
+        // Reset the produced-marker on every spawn. Without this the stall watchdog compares a
+        // brand-new child against a timestamp from the PREVIOUS child and kills it within
+        // seconds -- the reader never gets the chance to produce, stallKills climbs, and the
+        // camera is backed off to five minutes despite being perfectly healthy.
+        this.lastProducedAt = 0;
 
         this.pending = Buffer.alloc(0);
         this.pendingMoof = undefined;
@@ -177,6 +182,11 @@ class CameraBuffer {
             // without this it wedges the ring until Homebridge restarts. Measure from spawn.
             const since = this.lastProducedAt || this.startedAt || 0;
             if (!since) {
+                return;
+            }
+            // Never judge a child younger than the stall threshold: a fresh reader legitimately
+            // takes a few seconds to connect and reach its first keyframe.
+            if (Date.now() - this.startedAt < READER_STALL_MS) {
                 return;
             }
             const idle = Date.now() - since;
