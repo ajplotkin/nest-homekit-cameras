@@ -733,6 +733,49 @@ defaults (500 KB per 30s interval before a frozen receiver counts as evidence) a
 source whose audio is ~4–8 KB/s; a source with high-bitrate audio needs re-tuning, because
 `bytes_recv` counts audio RTP too while the signal is video-only.
 
+To run it continuously, write this to `/etc/systemd/system/go2rtc-wedge-detector.service`,
+replacing `YOUR_USER` (who must be in the `docker` group for the recovery command to work
+once armed):
+
+```ini
+[Unit]
+Description=Detect a go2rtc stream that receives media but forwards none of it
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=YOUR_USER
+# No --arm: this only observes and logs. Append --arm once you have confirmed a quiet
+# period, then: sudo systemctl daemon-reload && sudo systemctl restart go2rtc-wedge-detector
+ExecStart=/usr/bin/python3 /home/YOUR_USER/scripts/go2rtc-wedge-detector.py \
+  --api http://127.0.0.1:1985/api/streams --interval 30
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now go2rtc-wedge-detector.service
+journalctl -u go2rtc-wedge-detector -f
+```
+
+Confirm what is actually running before trusting it — the log line states it, and so does the
+process:
+
+```bash
+journalctl -u go2rtc-wedge-detector -n 3 | grep armed=
+ps -eo args | grep "[w]edge-detector.py"
+```
+
+One caveat worth knowing: `/api/streams` marshals the full stream map without holding
+`streamsMu`, so polling it concurrently with a config-time stream mutation is theoretically
+unsafe. Nothing mutates streams at runtime in this setup, but it is a reason not to poll far
+more aggressively than the 30s default.
+
 ## Reference
 
 ### SDM API Quotas
