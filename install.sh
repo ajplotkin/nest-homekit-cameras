@@ -198,5 +198,32 @@ sleep 12
 n=$(ls "$SNAPS_DIR"/*.jpg 2>/dev/null | wc -l | tr -d ' ')
 [ "$n" -gt 0 ] && ok "$n snapshot file(s) on disk in $SNAPS_DIR" || warn "no snapshot files yet — check 'journalctl -u go2rtc-snapshot-warmer' and that cameras are on"
 echo
+# The prebuffer ships with the patches but is OFF unless hksvPrebufferSeconds is set. Say so
+# rather than leaving the user with dormant code and no hint it exists. Deliberately NOT
+# auto-edited: config.json holds their OAuth credentials and is theirs to own.
+if ! python3 - "$HB_CONFIG" <<'PY' 2>/dev/null
+import json, sys
+d = json.load(open(sys.argv[1]))
+ps = [p for p in d.get("platforms", []) if "nest" in str(p.get("platform", "")).lower()]
+sys.exit(0 if ps and (float(ps[0].get("hksvPrebufferSeconds") or 0) > 0) else 1)
+PY
+then
+  warn "HKSV prebuffer is installed but NOT enabled."
+  cat <<EOF
+   Without it, recordings begin ~3.6s after Google's event timestamp — late enough
+   that HomeKit's own People/Animals/Vehicles analysis often finds nobody in the
+   clip and silently discards it. To enable, add to the
+   homebridge-google-nest-sdm platform block in $HB_CONFIG:
+
+       "hksvPrebufferSeconds": 6,
+       "hksvPrebufferRetainSeconds": 15
+
+   then restart Homebridge. Verify with:
+       docker logs $HB_CONTAINER 2>&1 | grep "prebuffer.*serving"
+EOF
+else
+  ok "HKSV prebuffer is enabled in $HB_CONFIG"
+fi
+echo
 say "Done. Open Apple Home — tiles should show real images within a minute."
 [ "$MOUNTED" = 0 ] && warn "…once you add the snapshot bind mount to Homebridge (see above)."
