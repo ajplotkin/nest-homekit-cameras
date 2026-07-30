@@ -79,6 +79,18 @@ const MAX_BOX_BYTES = 16 * 1024 * 1024;
 // Backstop for a consumer that stops draining (see the destroy-before-start case
 // in HksvStreamer): without this the queue grows at ~150KB/s indefinitely.
 const MAX_QUEUED_FRAGMENTS = 240;
+// A ring whose newest fragment is older than this is not usable for pre-trigger history.
+// Generous relative to the ~1.67s IDR cadence, but well inside the hub's ~16s patience.
+const STALE_RING_MS = 20000;
+// If a reader that HAS produced goes this long without a fragment, it has stalled silently.
+// Nest drops to very low frame rates when idle, so this must be well clear of that; 60s is
+// ~36x the observed cadence and still recovers long before the next likely event.
+const READER_STALL_MS = 60000;
+// If a consumer has been served history but no LIVE fragment arrives within this long, the
+// reader has stalled since we snapshotted. Ending the stream lets ffmpeg finalize what it has,
+// so HomeKit gets a short history-only clip instead of timing out and discarding everything.
+// Must be comfortably under the hub's ~16s patience.
+const LIVE_FLOW_DEADMAN_MS = 8000;
 
 class CameraBuffer {
     constructor(log, name, url, ffmpegPath, bufferSeconds) {
@@ -113,6 +125,11 @@ class CameraBuffer {
         // been dark for a while (AJ switches two off overnight) should not keep poking
         // go2rtc -> SDM once a minute all night for nothing.
         this.lastProducedAt = 0;
+        // Watchdog bookkeeping, deliberately separate from lastProducedAt (see the stall
+        // watchdog): consecutive kills with no fragment in between mean this camera is not
+        // recovering, and it should back off like any other dead camera.
+        this.lastStallKillAt = 0;
+        this.stallKills = 0;
     }
 
     start() {
@@ -122,6 +139,9 @@ class CameraBuffer {
         const args = [
             "-hide_banner", "-loglevel", "error",
             "-rtsp_transport", "tcp",
+            // Die on a stalled socket instead of blocking forever. 15s is inside the ring's
+            // retention, so a stall is normally recovered before history even goes stale.
+            "-timeout", "15000000",
             "-i", this.url,
             "-c", "copy",
             "-f", "mp4",
@@ -140,11 +160,40 @@ class CameraBuffer {
         }
         this.child = child;
         const startedAt = Date.now();
+        this.startedAt = startedAt;
 
         this.pending = Buffer.alloc(0);
         this.pendingMoof = undefined;
 
         child.stdout.on("data", chunk => this.consume(chunk));
+        // Stall watchdog. Only meaningful once the reader has produced something: a camera
+        // that is switched off simply never produces, and the backoff logic owns that case.
+        this.stallTimer = setInterval(() => {
+            if (this.stopped) {
+                return;
+            }
+            // A reader that has NEVER produced can also stall silently on its first connect
+            // (go2rtc accepts, then sends nothing). It has no exit and no lastProducedAt, so
+            // without this it wedges the ring until Homebridge restarts. Measure from spawn.
+            const since = this.lastProducedAt || this.startedAt || 0;
+            if (!since) {
+                return;
+            }
+            const idle = Date.now() - since;
+            if (idle > READER_STALL_MS) {
+                this.log.warn(`[prebuffer:${this.name}] reader alive but silent for ${Math.round(idle / 1000)}s; restarting it`);
+                // Do NOT touch lastProducedAt: scheduleRestart() reads it to decide whether
+                // this camera is in a sustained outage, and the healthy-backoff-reset reads it
+                // too. Refreshing it here made a repeatedly-stalling camera look permanently
+                // healthy, pinning backoff at 1s and hammering go2rtc every minute.
+                this.lastStallKillAt = Date.now();
+                this.stallKills++;
+                this.killChild();
+            }
+        }, 15000);
+        if (this.stallTimer.unref) {
+            this.stallTimer.unref();
+        }
         // Never discard ffmpeg's stderr. A reader that silently produces nothing
         // is indistinguishable from a healthy idle camera, and that ambiguity has
         // cost real debugging time on this deployment before.
@@ -165,6 +214,10 @@ class CameraBuffer {
         });
         child.on("error", e => this.log.error(`[prebuffer:${this.name}] ffmpeg error: ${e}`));
         child.on("exit", (code, signal) => {
+            if (this.stallTimer) {
+                clearInterval(this.stallTimer);
+                this.stallTimer = undefined;
+            }
             if (this.stopped) {
                 return;
             }
@@ -211,8 +264,11 @@ class CameraBuffer {
             return;
         }
         const delay = this.backoffMs;
+        // Two ways a camera earns the long cap: it has produced nothing for five minutes,
+        // or the stall watchdog has had to kill it repeatedly without a fragment in between.
         const sustainedOutage = this.lastProducedAt > 0 && (Date.now() - this.lastProducedAt) > 300000;
-        const cap = (this.everProduced && !sustainedOutage) ? 60000 : 300000;
+        const notRecovering = this.stallKills >= 3;
+        const cap = (this.everProduced && !sustainedOutage && !notRecovering) ? 60000 : 300000;
         this.backoffMs = Math.min(this.backoffMs * 2, cap);
         this.restartTimer = setTimeout(() => {
             this.restartTimer = undefined;
@@ -308,6 +364,7 @@ class CameraBuffer {
         this.everProduced = true;
         const now = Date.now();
         this.lastProducedAt = now;
+        this.stallKills = 0;
         this.fragments.push({ t: now, data: fragment });
         this.totalFragments++;
         const cutoff = now - this.bufferSeconds * 1000;
@@ -335,15 +392,36 @@ class CameraBuffer {
         if (!this.initSegment.length) {
             return null;
         }
+        // An init segment alone is NOT a usable ring. If there are no fragments -- or the
+        // newest is stale, meaning the reader is alive but has stopped producing -- report
+        // unavailable so the caller dials go2rtc directly instead of being fed a pipe that
+        // never delivers media. A missing prebuffer costs pre-trigger footage; a silent one
+        // costs the entire clip.
+        if (!this.fragments.length) {
+            return null;
+        }
+        const newest = this.fragments[this.fragments.length - 1].t;
+        if (Date.now() - newest > STALE_RING_MS) {
+            this.log.warn(`[prebuffer:${this.name}] newest fragment is ${Math.round((Date.now() - newest) / 1000)}s old; treating ring as unavailable`);
+            return null;
+        }
+        const usable = this.fragments.filter(f => f.t >= sinceEpochMs).map(f => f.data);
+        if (!usable.length) {
+            return null;
+        }
         return {
             init: this.initSegment,
-            fragments: this.fragments.filter(f => f.t >= sinceEpochMs).map(f => f.data),
-            oldestAvailable: this.fragments.length ? this.fragments[0].t : undefined,
+            fragments: usable,
+            oldestAvailable: this.fragments[0].t,
         };
     }
 
     stop() {
         this.stopped = true;
+        if (this.stallTimer) {
+            clearInterval(this.stallTimer);
+            this.stallTimer = undefined;
+        }
         this.resetConsumers("prebuffer stopped");
         if (this.restartTimer) {
             clearTimeout(this.restartTimer);
@@ -437,7 +515,29 @@ class PrebufferManager {
         let flowing = false;
         let stream;
 
+        // Deadman: armed once history is queued, cleared by each live fragment. A reader that
+        // stalls between our snapshot and the live continuation would otherwise leave ffmpeg
+        // waiting on input that never comes -- we would have handed over perfectly good
+        // pre-trigger footage and then hung, and the hub discards the clip entirely on timeout.
+        let deadman;
+        const armDeadman = () => {
+            if (deadman) {
+                clearTimeout(deadman);
+            }
+            deadman = setTimeout(() => {
+                this.log.warn(`[prebuffer:${cameraKey}] no live fragment for ${LIVE_FLOW_DEADMAN_MS / 1000}s; closing the stream so the clip finalizes with the history we already sent`);
+                try {
+                    stream.push(null);
+                }
+                catch (e) { /* already ended */ }
+            }, LIVE_FLOW_DEADMAN_MS);
+            if (deadman.unref) {
+                deadman.unref();
+            }
+        };
+
         const onFragment = f => {
+            armDeadman();
             // H1 backstop: if the consumer never drains (ffmpeg died before its stdin
             // was piped, or was killed while the reader was down so no write ever
             // raised EPIPE), this queue would otherwise grow at ~150KB/s forever.
@@ -469,7 +569,10 @@ class PrebufferManager {
         const hist = buf.history(sinceEpochMs);
         if (!hist) {
             buf.subscribers.delete(onFragment);
-            this.log.warn(`[prebuffer:${cameraKey}] no init segment yet, caller must fall back`);
+            const why = !buf.initSegment.length ? "no init segment yet"
+                : !buf.fragments.length ? "ring is empty"
+                    : "no fragments within the requested window";
+            this.log.warn(`[prebuffer:${cameraKey}] ${why}; falling back to a direct go2rtc dial`);
             return null;
         }
 
@@ -487,8 +590,15 @@ class PrebufferManager {
             buf.activeStreams.delete(stream);
             queue.length = 0;
         };
-        stream.once("close", cleanup);
-        stream.once("error", cleanup);
+        const cleanupAll = () => {
+            if (deadman) {
+                clearTimeout(deadman);
+                deadman = undefined;
+            }
+            cleanup();
+        };
+        stream.once("close", cleanupAll);
+        stream.once("error", cleanupAll);
 
         queue.unshift(...hist.fragments);
         queue.unshift(hist.init);
@@ -497,6 +607,7 @@ class PrebufferManager {
             ? Math.round((Date.now() - Math.max(hist.oldestAvailable, sinceEpochMs)) / 100) / 10
             : 0;
         this.log.info(`[prebuffer:${cameraKey}] serving ${hist.fragments.length} buffered fragments (~${recovered}s of history)`);
+        armDeadman();
         return stream;
     }
 

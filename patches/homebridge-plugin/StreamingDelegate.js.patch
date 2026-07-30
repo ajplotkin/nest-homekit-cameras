@@ -138,18 +138,22 @@
              }
              catch (err) {
                  this.log.error('Error terminating SDM stream: ' + err, this.camera.getDisplayName());
-@@ -325,6 +393,10 @@
+@@ -325,6 +393,14 @@
      }
      closeRecordingStream(streamId, reason) {
          var _a, _b;
 +        // DIAG 2026-07-29: HomeKit's close reason is the only signal that says whether the hub
-+        // ACCEPTED the clip or threw it away. 0=NORMAL 1=NOT_ALLOWED 2=BUSY 3=CANCELLED
-+        // 4=UNEXPECTED_FAILURE 5=TIMEOUT; undefined = our own finally/acknowledge path.
++        // ACCEPTED the clip or threw it away. Verified against the installed hap-nodejs (dist/lib/datastream/DataStreamServer.js):
++        // 0=NORMAL 1=NOT_ALLOWED 2=BUSY 3=CANCELLED 4=UNSUPPORTED 5=UNEXPECTED_FAILURE
++        // 6=TIMEOUT 7=BAD_DATA 8=PROTOCOL_ERROR 9=INVALID_CONFIGURATION.
++        // undefined = our own finally/acknowledge path. reason=6 is what a starved recording
++        // looks like: we fed the hub a pipe that never delivered media.
++        
 +        this.log.info(`[hksv-diag] closeRecordingStream streamId=${streamId} reason=${reason}`, this.camera.getDisplayName());
          // Only tear down if this close targets the session we're actually running. A HomeKit hub can
          // send a late close for an already-replaced (orphaned) session; without this guard that stale
          // close would destroy the *current* recording.
-@@ -341,6 +413,8 @@
+@@ -341,6 +417,8 @@
          this.handlingRecordingStreamingRequest = false;
      }
      acknowledgeStream(streamId) {
@@ -158,7 +162,7 @@
          this.closeRecordingStream(streamId, undefined);
      }
      /**
-@@ -353,7 +427,7 @@
+@@ -353,7 +431,7 @@
       *   when the HomeKit Controller requests it (see the documentation of `CameraRecordingDelegate`).
       */
      async *handleRecordingStreamRequest(streamId) {
@@ -167,7 +171,7 @@
          this.log.debug('Recording request received.');
          if (!this.cameraRecordingConfiguration)
              throw new Error('No recording configuration for this camera.');
-@@ -368,23 +442,45 @@
+@@ -368,23 +446,45 @@
          this.handlingRecordingStreamingRequest = true;
          if (this.cameraRecordingConfiguration.videoCodec.type !== 0 /* H264 */)
              throw new Error('Unsupported recording codec type.');
@@ -215,7 +219,7 @@
          ];
          let samplerate;
          switch (this.cameraRecordingConfiguration.audioCodec.samplerate) {
-@@ -410,6 +506,11 @@
+@@ -410,6 +510,11 @@
                  throw new Error("Unsupported audio sample rate: " + this.cameraRecordingConfiguration.audioCodec.samplerate);
          }
          const audioArgs = ((_b = (_a = this.controller) === null || _a === void 0 ? void 0 : _a.recordingManagement) === null || _b === void 0 ? void 0 : _b.recordingManagementService.getCharacteristic(this.platform.Characteristic.RecordingAudioActive))
@@ -227,7 +231,7 @@
              ? [
                  "-acodec", "libfdk_aac",
                  ...(this.cameraRecordingConfiguration.audioCodec.type === 0 /* AAC_LC */ ?
-@@ -419,10 +520,108 @@
+@@ -419,10 +524,108 @@
                  "-b:a", `${this.cameraRecordingConfiguration.audioCodec.bitrate}k`,
                  "-ac", `${this.cameraRecordingConfiguration.audioCodec.audioChannels}`,
              ]
@@ -340,7 +344,7 @@
          // Tear down any prior recording session before overwriting it. A HomeKit hub
          // can start a new recording (e.g. after a brief reconnect) before the previous
          // session's close event fires. Without this, the previous HksvStreamer — and
-@@ -437,12 +636,15 @@
+@@ -437,12 +640,15 @@
              hksvStreamer: hksvStreamer,
              nestStreamer: nestStreamer
          };
@@ -360,7 +364,7 @@
              for await (const box of this.recordingSessionInfo.hksvStreamer.generator()) {
                  pending.push(box.header, box.data);
                  const motionDetected = (_c = this.accessory.getService(this.hap.Service.MotionSensor)) === null || _c === void 0 ? void 0 : _c.getCharacteristic(this.platform.Characteristic.MotionDetected).value;
-@@ -450,6 +652,16 @@
+@@ -450,6 +656,16 @@
                  if (box.type === "moov" || box.type === "mdat") {
                      const fragment = Buffer.concat(pending);
                      pending.splice(0, pending.length);
@@ -377,7 +381,7 @@
                      const isLast = STOP_AFTER_MOTION_STOP && !motionDetected;
                      yield {
                          data: fragment,
-@@ -463,12 +675,57 @@
+@@ -463,12 +679,57 @@
              }
          }
          catch (error) {
