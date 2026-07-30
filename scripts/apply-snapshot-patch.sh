@@ -39,14 +39,36 @@ fi
 # auto-reconnect that is still open as #216 (Api.js), and the go2rtc RTSP live/record
 # routing (StreamingDelegate.js). Sentinels must match OUR additions, NOT anything now in
 # stock — Camera.js uses 'nest-snaps' (its isEventStale is upstream's as of 1.1.24).
+applied=0
+failed=0
+
+# 2026-07-29: added the HKSV prebuffer. HksvStreamer.js is patched again (it must accept a
+# Readable on stdin, not only an SDP string), and PrebufferManager.js is a NEW file that has
+# to be COPIED IN before StreamingDelegate.js can require() it.
 patches=(
   "Camera.js.patch|dist/sdm/Camera.js|nest-snaps"
   "Api.js.patch|dist/sdm/Api.js|subscribeToEvents"
   "StreamingDelegate.js.patch|dist/StreamingDelegate.js|go2rtcKey"
+  "HksvStreamer.js.patch|dist/HksvStreamer.js|prebuffer consumer dies"
 )
 
-applied=0
-failed=0
+# New files, copied rather than patched. Must land BEFORE the patches that require them,
+# otherwise a patched StreamingDelegate.js would throw MODULE_NOT_FOUND at startup.
+new_files=(
+  "PrebufferManager.js|dist/PrebufferManager.js"
+)
+for entry in "${new_files[@]}"; do
+  IFS='|' read -r src target <<<"$entry"
+  s="$PATCH_DIR/new-files/$src"
+  t="$PLUGIN/$target"
+  [ -f "$s" ] || { echo "  ERROR: missing new file $s"; failed=1; continue; }
+  if [ -f "$t" ] && cmp -s "$s" "$t"; then
+    echo "  ok: $target already present and identical"
+  else
+    cp "$s" "$t" && echo "  INSTALLED: $target" && applied=1
+  fi
+done
+
 for entry in "${patches[@]}"; do
   IFS='|' read -r pf target sentinel <<<"$entry"
   patchfile="$PATCH_DIR/$pf"

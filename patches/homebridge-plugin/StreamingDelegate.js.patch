@@ -1,6 +1,37 @@
 --- a/dist/StreamingDelegate.js
 +++ b/dist/StreamingDelegate.js
-@@ -54,7 +54,12 @@
+@@ -9,6 +9,7 @@
+ const systeminformation_1 = require("systeminformation");
+ const FfMpegProcess_1 = require("./FfMpegProcess");
+ const NestStreamer_1 = require("./NestStreamer");
++const PrebufferManager_1 = require("./PrebufferManager");
+ const HksvStreamer_1 = __importDefault(require("./HksvStreamer"));
+ const pick_port_1 = __importDefault(require("pick-port"));
+ class StreamingDelegate {
+@@ -23,6 +24,22 @@
+         this.config = platform.platformConfig;
+         this.camera = camera;
+         this.accessory = accessory;
++        // Start the prebuffer ring NOW, not on first use. It exists to hold history
++        // from before a trigger, so lazily creating it at trigger time would leave it
++        // empty precisely when it is needed.
++        try {
++            const _preSec = Number(this.config.hksvPrebufferSeconds) || 0;
++            if (_preSec > 0) {
++                const _key = (camera.displayName || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
++                if (_key) {
++                    (0, PrebufferManager_1.getPrebufferManager)(log, require('ffmpeg-for-homebridge') || 'ffmpeg', 'rtsp://127.0.0.1:8554', Number(this.config.hksvPrebufferRetainSeconds) || 15).ensure(_key);
++                    log.info(`[prebuffer:${_key}] ring started (${_preSec}s pre-roll requested)`);
++                }
++            }
++        }
++        catch (e) {
++            log.error('Failed to start prebuffer ring: ' + e);
++        }
+         api.on("shutdown" /* SHUTDOWN */, () => {
+             for (const session in this.ongoingSessions) {
+                 this.stopStream(session);
+@@ -54,7 +71,23 @@
              recording: {
                  delegate: this,
                  options: {
@@ -10,11 +41,22 @@
 +                    // would start 4s BEFORE the trigger; measured reality is ~5s AFTER it.
 +                    // Report what we actually deliver until a real prebuffer exists.
 +                    // Upstream: potmat/homebridge-google-nest-sdm#233
-+                    prebufferLength: 0,
++                    // Truthful only because a prebuffer now exists. With
++                    // hksvPrebufferSeconds set we genuinely deliver several seconds of
++                    // pre-trigger media (measured: ~11.8s of history on a real clip), so
++                    // advertising Apple's usual 4000ms understates rather than overstates.
++                    // With the feature off we still deliver nothing, so claim nothing.
++                    // Advertise the pre-roll we actually serve, not a token 4000ms. A real
++                    // event (4:06 PM 2026-07-29) showed the HK clip beginning at exactly
++                    // trigger-minus-4s while we had served ~11s of history -- i.e. HomeKit
++                    // appears to TRIM the clip to the advertised prebufferLength and discard
++                    // anything earlier. Advertising the configured pre-roll (ms) tells it to
++                    // keep what we hand it. Capped at 15000ms as a sanity bound.
++                    prebufferLength: (Number(this.config.hksvPrebufferSeconds) || 0) > 0 ? Math.min(Number(this.config.hksvPrebufferSeconds) * 1000, 15000) : 0,
                      mediaContainerConfiguration: {
                          type: 0 /* FRAGMENTED_MP4 */,
                          fragmentLength: 4000,
-@@ -193,16 +198,36 @@
+@@ -193,16 +226,36 @@
          const bitrate = request.video.max_bit_rate * 4;
          const vEncoder = this.config.vEncoder || 'libx264 -preset ultrafast -tune zerolatency';
          this.log.debug(`Video stream requested: ${request.video.width} x ${request.video.height}, ${request.video.fps} fps, ${request.video.max_bit_rate} kbps`, this.camera.getDisplayName());
@@ -58,7 +100,7 @@
          }
          ffmpegArgs += // Video
              ' -an -sn -dn' +
-@@ -264,12 +289,26 @@
+@@ -264,12 +317,26 @@
                  }, request.video.rtcp_interval * 2 * 1000);
              });
              activeSession.socket.bind(sessionInfo.videoReturnPort, sessionInfo.localAddress);
@@ -86,7 +128,7 @@
          this.ongoingSessions[request.sessionID] = activeSession;
          delete this.pendingSessions[request.sessionID];
      }
-@@ -314,7 +353,8 @@
+@@ -314,7 +381,8 @@
                  this.log.error('Error occurred terminating two-way FFmpeg process: ' + err, this.camera.getDisplayName());
              }
              try {
@@ -96,7 +138,45 @@
              }
              catch (err) {
                  this.log.error('Error terminating SDM stream: ' + err, this.camera.getDisplayName());
-@@ -373,18 +413,36 @@
+@@ -325,6 +393,10 @@
+     }
+     closeRecordingStream(streamId, reason) {
+         var _a, _b;
++        // DIAG 2026-07-29: HomeKit's close reason is the only signal that says whether the hub
++        // ACCEPTED the clip or threw it away. 0=NORMAL 1=NOT_ALLOWED 2=BUSY 3=CANCELLED
++        // 4=UNEXPECTED_FAILURE 5=TIMEOUT; undefined = our own finally/acknowledge path.
++        this.log.info(`[hksv-diag] closeRecordingStream streamId=${streamId} reason=${reason}`, this.camera.getDisplayName());
+         // Only tear down if this close targets the session we're actually running. A HomeKit hub can
+         // send a late close for an already-replaced (orphaned) session; without this guard that stale
+         // close would destroy the *current* recording.
+@@ -341,6 +413,8 @@
+         this.handlingRecordingStreamingRequest = false;
+     }
+     acknowledgeStream(streamId) {
++        // Reaching here means the hub took the clip successfully.
++        this.log.info(`[hksv-diag] acknowledgeStream streamId=${streamId} -- HUB ACCEPTED THE CLIP`, this.camera.getDisplayName());
+         this.closeRecordingStream(streamId, undefined);
+     }
+     /**
+@@ -353,7 +427,7 @@
+      *   when the HomeKit Controller requests it (see the documentation of `CameraRecordingDelegate`).
+      */
+     async *handleRecordingStreamRequest(streamId) {
+-        var _a, _b, _c;
++        var _a, _b, _c, _d;
+         this.log.debug('Recording request received.');
+         if (!this.cameraRecordingConfiguration)
+             throw new Error('No recording configuration for this camera.');
+@@ -368,23 +442,45 @@
+         this.handlingRecordingStreamingRequest = true;
+         if (this.cameraRecordingConfiguration.videoCodec.type !== 0 /* H264 */)
+             throw new Error('Unsupported recording codec type.');
++        // H-1: per-invocation, NOT on `this`. A shared slot meant an overlapping session B
++        // would overwrite it, and then session A's finally destroyed B's live stream --
++        // deterministically killing the retry recording on every hub session overlap.
++        let preStream;
+         const profile = this.cameraRecordingConfiguration.videoCodec.parameters.profile === 2 /* HIGH */ ? "high"
+             : this.cameraRecordingConfiguration.videoCodec.parameters.profile === 1 /* MAIN */ ? "main" : "baseline";
          const level = this.cameraRecordingConfiguration.videoCodec.parameters.level === 2 /* LEVEL4_0 */ ? "4.0"
              : this.cameraRecordingConfiguration.videoCodec.parameters.level === 1 /* LEVEL3_2 */ ? "3.2" : "3.1";
          const videoArgs = [
@@ -135,7 +215,7 @@
          ];
          let samplerate;
          switch (this.cameraRecordingConfiguration.audioCodec.samplerate) {
-@@ -410,6 +468,11 @@
+@@ -410,6 +506,11 @@
                  throw new Error("Unsupported audio sample rate: " + this.cameraRecordingConfiguration.audioCodec.samplerate);
          }
          const audioArgs = ((_b = (_a = this.controller) === null || _a === void 0 ? void 0 : _a.recordingManagement) === null || _b === void 0 ? void 0 : _b.recordingManagementService.getCharacteristic(this.platform.Characteristic.RecordingAudioActive))
@@ -147,13 +227,14 @@
              ? [
                  "-acodec", "libfdk_aac",
                  ...(this.cameraRecordingConfiguration.audioCodec.type === 0 /* AAC_LC */ ?
-@@ -419,9 +482,43 @@
+@@ -419,10 +520,108 @@
                  "-b:a", `${this.cameraRecordingConfiguration.audioCodec.bitrate}k`,
                  "-ac", `${this.cameraRecordingConfiguration.audioCodec.audioChannels}`,
              ]
 -            : [];
 -        const nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera, this.config);
 -        const nestStream = await nestStreamer.initialize();
+-        const hksvStreamer = new HksvStreamer_1.default(this.log, nestStream, audioArgs, videoArgs, this.platform.debugMode);
 +            // Audio off is now expressed HERE, where it can be conditional.
 +            : ["-an"];
 +        // PATCHED: prefer local go2rtc warm RTSP for HKSV recording — same pattern as
@@ -176,7 +257,44 @@
 +            // ffmpeg does not need a long probe to learn the H264 params; a shorter analyzeduration
 +            // lets the first media fragment be written ~2.5s sooner, buying margin against the Apple
 +            // hub's fixed ~16s HKSV record timeout during a Nest post-motion video drought.
-+            nestStream = { args: "-rtsp_transport tcp -analyzeduration 500000 -probesize 5000000 -i rtsp://127.0.0.1:8554/" + go2rtcKeyRec, stdin: undefined };
++            // PREBUFFER: when enabled, feed the encoder from the rolling in-memory ring
++            // so the clip begins BEFORE the trigger. Measured 2026-07-29: Google Home's
++            // own clip for an event began 6.1s before the SDM timestamp Google gave us,
++            // and our first frame landed 3.6s after it -- a ~9.7s gap during which the
++            // person walks out of shot, leaving HomeKit's People/Animals/Vehicles
++            // analysis nothing to find, so it discards the clip with no error anywhere.
++            // Falls back to dialling go2rtc directly whenever the ring is not ready.
++            const preCfg = Number(this.config.hksvPrebufferSeconds) || 0;
++            if (preCfg > 0) {
++                // Serve what the hub SELECTED, not what we advertised. Our value is only an
++                // upper bound; anything beyond the selection is encoded and then discarded.
++                const selMs = Number((_d = this.cameraRecordingConfiguration) === null || _d === void 0 ? void 0 : _d.prebufferLength) || 0;
++                // One fragment (~1.67s) of slack: fragments are stamped when they COMPLETE, so
++                // the one containing the anchor instant would otherwise be filtered out.
++                const preMs = Math.min(selMs > 0 ? selMs + 2000 : preCfg * 1000, preCfg * 1000);
++                try {
++                    const mgr = (0, PrebufferManager_1.getPrebufferManager)(this.log, require('ffmpeg-for-homebridge') || 'ffmpeg', 'rtsp://127.0.0.1:8554', Number(this.config.hksvPrebufferRetainSeconds) || 15);
++                    // M-4: clamp the anchor. lastEventTimestamp is never cleared and is not
++                    // latched for doorbell-chime-triggered recordings, so it can be hours old --
++                    // which would make the `f.t >= since` filter pass the ENTIRE ring and
++                    // maximise the backlog. Never reach back more than 30s.
++                    const anchor = Math.max(this.camera.lastEventTimestamp || Date.now(), Date.now() - 30000);
++                    preStream = mgr.createStream(go2rtcKeyRec, anchor - preMs);
++                    if (preStream) {
++                        this.log.debug(`Prebuffer: hub selected ${selMs}ms, serving ${preMs}ms`, this.camera.getDisplayName());
++                    }
++                }
++                catch (e) {
++                    this.log.error('Prebuffer unavailable, falling back to direct go2rtc dial: ' + e, this.camera.getDisplayName());
++                    preStream = undefined;
++                }
++            }
++            if (preStream) {
++                nestStream = { args: "-f mp4 -i pipe:0", stdin: preStream };
++            }
++            else {
++                nestStream = { args: "-rtsp_transport tcp -analyzeduration 500000 -probesize 5000000 -i rtsp://127.0.0.1:8554/" + go2rtcKeyRec, stdin: undefined };
++            }
 +            // go2rtc owns the Google session, so there is NO SDM streamer to tear down on this path.
 +            // But stock 1.1.24's merged teardown (closeRecordingStream + the #150 prior-session cleanup)
 +            // calls recordingSessionInfo.nestStreamer.teardown() UNGUARDED — upstream never has an
@@ -191,10 +309,74 @@
 +            nestStreamer = await (0, NestStreamer_1.getStreamer)(this.log, this.camera, this.config);
 +            nestStream = await nestStreamer.initialize();
 +        }
-         const hksvStreamer = new HksvStreamer_1.default(this.log, nestStream, audioArgs, videoArgs, this.platform.debugMode);
++        // COPY INSTEAD OF TRANSCODE on any go2rtc-sourced recording.
++        //
++        // The transcode was never required. It was self-imposed: videoArgs derives
++        // -profile:v from the hub-SELECTED config, and because this plugin advertises
++        // profiles: [HIGH] while Nest emits Main, that forced libx264. Nothing on the
++        // HomeKit side ever compares the delivered bytes against the negotiation --
++        // hap-nodejs treats each yielded fragment as opaque and never parses moof/mdat/SPS.
++        // homebridge-unifi-protect advertises Main ONLY and records with -codec:v copy;
++        // scrypted copies whatever the camera emits regardless of what was selected. Both
++        // ship this at scale. The [HIGH] line here is verbatim from hap-nodejs's own
++        // Camera_accessory example -- an unexamined sample-code default.
++        //
++        // Requirements that still hold, and are satisfied:
++        //  * every fragment must START on a keyframe -> `-movflags frag_keyframe` does this.
++        //  * fragmentLength (4000ms) is a MAXIMUM, not a target: hap-nodejs's delegate
++        //    contract says a fragment "must not be longer than" it. Google's IDR cadence is
++        //    ~1.67s, comfortably under, so no grouping is needed.
++        //  * audio still transcodes (Opus -> AAC-ELD); one muxer interleaves both tracks.
++        //
++        // The advertisement is deliberately left alone: changing it would alter the
++        // supported-config hash and force every camera to renegotiate. Copy needs no such
++        // change, so this carries no renegotiation risk.
++        let recVideoArgs = videoArgs;
++        if (useGo2rtcRec) {
++            recVideoArgs = ["-sn", "-dn", "-codec:v", "copy"];
++            this.log.debug('HKSV recording: copying video (no transcode)', this.camera.getDisplayName());
++        }
++        const hksvStreamer = new HksvStreamer_1.default(this.log, nestStream, audioArgs, recVideoArgs, this.platform.debugMode);
          // Tear down any prior recording session before overwriting it. A HomeKit hub
          // can start a new recording (e.g. after a brief reconnect) before the previous
-@@ -465,6 +562,12 @@
+         // session's close event fires. Without this, the previous HksvStreamer — and
+@@ -437,12 +636,16 @@
+             hksvStreamer: hksvStreamer,
+             nestStreamer: nestStreamer
+         };
+-        await hksvStreamer.start();
+-        if (!hksvStreamer || hksvStreamer.destroyed) {
+-            throw new Error('Streaming server already closed.');
+-        }
+         const pending = [];
++        let _lastFragmentAt = 0;
+         try {
++            // H-2: inside the try. If start() rejects (listen/spawn failure) or the
++            // destroyed-check throws, the finally must still run to destroy the prebuffer
++            // consumer and clear the session.
++            await hksvStreamer.start();
++            if (!hksvStreamer || hksvStreamer.destroyed) {
++                throw new Error('Streaming server already closed.');
++            }
+             for await (const box of this.recordingSessionInfo.hksvStreamer.generator()) {
+                 pending.push(box.header, box.data);
+                 const motionDetected = (_c = this.accessory.getService(this.hap.Service.MotionSensor)) === null || _c === void 0 ? void 0 : _c.getCharacteristic(this.platform.Characteristic.MotionDetected).value;
+@@ -450,6 +653,14 @@
+                 if (box.type === "moov" || box.type === "mdat") {
+                     const fragment = Buffer.concat(pending);
+                     pending.splice(0, pending.length);
++                    // A fragment longer than the negotiated fragmentLength is the one case
++                    // with no evidence for how the hub reacts. Should not occur (Google's IDR
++                    // cadence is ~1.67s), so surface it rather than silently rely on that.
++                    const _nowMs = Date.now();
++                    if (_lastFragmentAt && (_nowMs - _lastFragmentAt) > 4500) {
++                        this.log.warn(`HKSV fragment spacing ${_nowMs - _lastFragmentAt}ms exceeds the negotiated 4000ms`, this.camera.getDisplayName());
++                    }
++                    _lastFragmentAt = _nowMs;
+                     const isLast = STOP_AFTER_MOTION_STOP && !motionDetected;
+                     yield {
+                         data: fragment,
+@@ -465,10 +676,45 @@
          catch (error) {
              this.log.error("Encountered unexpected error on generator " + error.stack);
          }
@@ -202,8 +384,42 @@
 +            // Clear the session even if the controller never calls closeRecordingStream (e.g. the
 +            // generator threw and HAP moved on): otherwise handlingRecordingStreamingRequest stays
 +            // true and blocks all future recordings. closeRecordingStream is idempotent.
++            try {
++                if (preStream) {
++                    preStream.destroy();
++                }
++            }
++            catch (e) { /* already destroyed */ }
 +            this.closeRecordingStream(streamId, undefined);
 +        }
      }
      updateRecordingActive(active) {
-         // we haven't implemented a prebuffer
+-        // we haven't implemented a prebuffer
+         this.log.debug("Recording active set to " + active);
++        // L4: stop holding video in RAM for a camera whose HKSV recording the user has
++        // switched off, and resume when they switch it back on. Previously the ring ran
++        // regardless, buffering for cameras that would never record.
++        try {
++            const preSec = Number(this.config.hksvPrebufferSeconds) || 0;
++            if (!preSec) {
++                return;
++            }
++            const key = (this.camera.displayName || "").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
++            if (!key) {
++                return;
++            }
++            const mgr = (0, PrebufferManager_1.getPrebufferManager)(this.log, require('ffmpeg-for-homebridge') || 'ffmpeg', 'rtsp://127.0.0.1:8554', Number(this.config.hksvPrebufferRetainSeconds) || 15);
++            if (active) {
++                mgr.ensure(key);
++            }
++            else {
++                this.log.info(`[prebuffer:${key}] HKSV recording disabled for this camera; stopping ring`);
++                mgr.release(key);
++            }
++        }
++        catch (e) {
++            this.log.error('Prebuffer updateRecordingActive failed: ' + e);
++        }
+     }
+     updateRecordingConfiguration(configuration) {
+         this.cameraRecordingConfiguration = configuration;

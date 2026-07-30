@@ -1,0 +1,89 @@
+--- a/dist/HksvStreamer.js
++++ b/dist/HksvStreamer.js
+@@ -53,9 +53,37 @@
+         }
+         if (this.childProcess.stdin) {
+             if (this.nestStream.stdin) {
+-                const sdpStream = this.convertStringToStream(this.nestStream.stdin);
+-                sdpStream.resume();
+-                sdpStream.pipe(this.childProcess.stdin);
++                // stdin was originally only ever an SDP *string* (the direct Google
++                // WebRTC path). The prebuffer feeds a continuous fragmented-MP4 byte
++                // stream instead, so accept a Readable and pipe it straight through.
++                if (typeof this.nestStream.stdin === 'string') {
++                    const sdpStream = this.convertStringToStream(this.nestStream.stdin);
++                    sdpStream.resume();
++                    sdpStream.pipe(this.childProcess.stdin);
++                }
++                else if (typeof this.nestStream.stdin.pipe === 'function') {
++                    const src = this.nestStream.stdin;
++                    // ffmpeg exiting first would otherwise raise EPIPE on the writer.
++                    this.childProcess.stdin.on('error', () => { try { src.destroy(); } catch (e) { } });
++                    // Destroying a piped Readable does NOT end the destination Writable, so
++                    // without this ffmpeg blocks on input forever whenever the prebuffer
++                    // consumer dies (reader restart, HKSV disabled mid-recording, stall
++                    // backstop) -- the generator yields nothing and the only exit is the
++                    // Apple hub's ~16s timeout, losing the clip's tail or the whole clip.
++                    // Ending stdin lets ffmpeg flush and finalize the fragmented MP4.
++                    src.once('close', () => {
++                        try {
++                            if (this.childProcess && this.childProcess.stdin && !this.childProcess.stdin.destroyed) {
++                                this.childProcess.stdin.end();
++                            }
++                        }
++                        catch (e) { /* ffmpeg already gone */ }
++                    });
++                    src.pipe(this.childProcess.stdin);
++                }
++                else {
++                    this.log.error('HksvStreamer: unsupported stdin type ' + typeof this.nestStream.stdin);
++                }
+             }
+         }
+         if (this.debugMode) {
+@@ -69,13 +97,23 @@
+         (_a = this.childProcess) === null || _a === void 0 ? void 0 : _a.kill();
+         this.childProcess = undefined;
+         this.destroyed = true;
+-        // Close the listening server if a client never connected (otherwise the socket leaks for the
+-        // life of the process), and resolve connectPromise so a generator still awaiting a connection
+-        // that will now never come unblocks (it then throws the "Unexpected state!" guard below).
++        // H1: the prebuffer feeds a Readable that never ends on its own. If it is not
++        // destroyed here it stays subscribed and accumulates fragments forever --
++        // notably when start() bailed early on `destroyed` and never piped it, so no
++        // write ever raised EPIPE to trigger the pipe-side cleanup.
+         try {
++            const src = this.nestStream && this.nestStream.stdin;
++            if (src && typeof src.destroy === 'function') {
++                src.destroy();
++            }
++        }
++        catch (e) { /* nothing further to do */ }
++        // Close the listening server if a client never connected (else the socket fd leaks), and
++        // unblock a generator still awaiting connectPromise (it then throws "Unexpected state!").
++        try {
+             this.server.close(() => { });
+         }
+-        catch (e) { /* not listening */ }
++        catch (e) { }
+         (_b = this.connectResolve) === null || _b === void 0 ? void 0 : _b.call(this);
+     }
+     handleDisconnect() {
+@@ -83,13 +121,13 @@
+         this.log.debug('Socket destroyed.');
+         (_a = this.socket) === null || _a === void 0 ? void 0 : _a.destroy();
+         this.socket = undefined;
+-        // If ffmpeg exits or errors before ever connecting (e.g. a bad input), connectPromise would
+-        // otherwise never settle and generator() would await it forever, hanging the recording and
+-        // leaking the server. Close it and resolve so the generator fails fast and visibly instead.
++        // If ffmpeg exited/errored before ever connecting, connectPromise would never settle and
++        // generator() would hang forever. Close the server and resolve so the generator proceeds
++        // to its "Unexpected state!" throw (a fast, visible failure) instead of leaking a session.
+         try {
+             this.server.close(() => { });
+         }
+-        catch (e) { /* not listening */ }
++        catch (e) { }
+         (_b = this.connectResolve) === null || _b === void 0 ? void 0 : _b.call(this);
+     }
+     handleConnection(socket) {

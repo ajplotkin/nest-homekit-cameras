@@ -24,7 +24,51 @@
          //Nest cams do not have any method to get a current snapshot,
          //starting streams up just to retrieve one is slow and will cause
          //the SDM API to hit a rate limit of creating too many streams
-@@ -156,13 +173,17 @@
+@@ -130,21 +147,25 @@
+     }
+     isEventStale(event) {
+         const ageSeconds = (Date.now() - new Date(event.timestamp).getTime()) / 1000;
+-        // Both a missing timestamp and an unparseable one land here: new Date(undefined)
+-        // and new Date('nonsense') each yield NaN from getTime(). Fail OPEN in that case
+-        // — treat the event as fresh and let it through. A malformed or absent timestamp
+-        // must never be able to silently swallow real motion or a doorbell ring; the cost
+-        // of being wrong that way is a missed alert, versus a duplicate one the other way.
++        // Fail open when the event timestamp cannot be parsed.
+         if (Number.isNaN(ageSeconds))
+             return false;
+         if (ageSeconds > Camera.MAX_EVENT_AGE_SECONDS) {
+             this.log.debug(`Camera event is too old (${ageSeconds} sec), ignoring.`, this.getDisplayName());
++            // Dropping is silent by design (a stale drop is usually a Pub/Sub duplicate). But if the
++            // system clock runs fast, FRESH events look stale and get dropped invisibly — so surface a
++            // throttled warning once drops become frequent, pointing at the clock as the likely cause.
++            this._staleDrops = (this._staleDrops || 0) + 1;
++            if (this._staleDrops % 20 === 0)
++                this.log.warn(`Dropped ${this._staleDrops} stale camera events (latest ${Math.round(ageSeconds)}s old). Occasional drops are normal (duplicate redelivery); if this keeps climbing, check the system clock.`, this.getDisplayName());
+             return true;
+         }
+         return false;
+     }
+     event(event) {
+         super.event(event);
++        // Drop replayed/stale events (e.g. a backlog redelivered on reconnect or restart)
++        // before they fire phantom motion/HKSV. See potmat/homebridge-google-nest-sdm#219.
+         if (this.isEventStale(event))
+             return;
+         lodash_1.default.forEach(event.resourceUpdate.events, (value, key) => {
+@@ -153,16 +174,30 @@
+                 case Events.Constants.CameraPerson:
+                     if (event.eventThreadState && event.eventThreadState != Events_1.ThreadStateType.STARTED)
+                         return;
++                    // Latch the prebuffer anchor HERE -- only for a STARTED motion/person
++                    // event that actually triggers a recording. See the note above the
++                    // removed assignment: anchoring on every event let a later UPDATE or
++                    // ENDED overwrite it and shrink the pre-roll.
++                    try {
++                        const _ts = Date.parse(event.timestamp);
++                        if (!isNaN(_ts))
++                            this.lastEventTimestamp = _ts;
++                    }
++                    catch (e) { }
                      this.getVideoProtocol()
                          .then(protocol => {
                          if (protocol === Traits.ProtocolType.WEB_RTC) {
@@ -43,18 +87,18 @@
                                      this.onMotion();
                              });
                          }
-@@ -183,5 +204,12 @@
+@@ -183,5 +218,12 @@
      }
  }
  exports.Camera = Camera;
 -Camera.MAX_EVENT_AGE_SECONDS = 30;
-+// Pub/Sub first deliveries are often LATE. Measured on a live deployment 2026-07-27:
-+// late deliveries clustered at 46-57s, and the stock 30s gate silently discarded ~21%
-+// of DISTINCT events -- their first delivery was already stale, so the redelivery was
-+// too, and neither a HomeKit notification nor an HKSV clip was produced. Those are real
-+// events, not the duplicate redeliveries this gate exists to suppress. 120s stays clear
-+// of observed latency while still stopping an hours-old backlog from firing after a
-+// Pub/Sub reconnect, which is the gate's actual job.
++// Pub/Sub first deliveries are OFTEN LATE. Measured on a live deployment 2026-07-27:
++// late deliveries clustered at 46-57s, and a 30s gate silently discarded ~21% of
++// DISTINCT events (their first delivery was already stale, so the redelivery was too) --
++// no HomeKit notification and no HKSV clip for any of them. Those are real events, not
++// the duplicate redeliveries this gate is meant to suppress. 120s stays well clear of
++// observed latency while still preventing an hours-old backlog from firing after a
++// Pub/Sub reconnect, which is what the gate is actually for.
 +Camera.MAX_EVENT_AGE_SECONDS = 120;
  //# sourceMappingURL=Camera.js.map
 \ No newline at end of file
