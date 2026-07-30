@@ -677,6 +677,62 @@ If it appears, live view is coming from the warm stream. If instead you see the 
 
 To undo Part 6: reinstall the plugin (`npm install homebridge-google-nest-sdm@1.1.24`) and don't re-run the patch script. That reverts all four patches and removes `PrebufferManager.js`, so re-apply them if you still want the snapshot fix — there is no per-patch switch.
 
+### When go2rtc receives but forwards nothing — check this FIRST
+
+On 2026-07-30 a doorbell stream spent a morning in a state where go2rtc kept pulling from
+Google at ~150 KB/s while delivering **nothing** to its consumers. Measured over 60s:
+
+| | producer `bytes_recv` | video receiver `bytes` (consumers attached) |
+|---|---|---|
+| broken stream | 45.9 → 50.5 → 54.6 MB, climbing | frozen, unchanged |
+| healthy stream | climbing | climbing |
+
+go2rtc logged **no error at all**. Everything downstream looked like a different bug: the
+prebuffer ring reader was starved and stall-killed every 60s, the fallback direct dial was
+starved too, and every clip was lost with `closeRecordingStream reason=6`. Hours were spent
+on the plugin before the real fault was found one layer down.
+
+**This is the opposite of a "drought."** A drought is *inbound* drying up, which the fork's
+watchdog in `pkg/webrtc/conn.go` already handles by re-dialling. This is *outbound* dying
+while inbound stays healthy — so the drought watchdog cannot see it, by construction. Same
+symptom, inverted mechanism.
+
+Root cause is upstream, in stock go2rtc's producer reconnect (`internal/streams/producer.go`):
+a receiver that fails to match a media/codec on re-dial is skipped by a bare `continue`, and
+the following `conn.Stop()` closes it, severing every consumer attached to it — permanently
+and silently. It is directly visible in the API: a consumer whose sender reports a `parent`
+receiver id that no longer exists in the producer.
+
+Diagnose (**note the API is on 1985 here, not go2rtc's default 1984**), sampling twice at
+least 30s apart, since these are cumulative counters and one sample proves nothing:
+
+```bash
+curl -s http://127.0.0.1:1985/api/streams
+```
+
+Compare each producer's `bytes_recv` against the `bytes` on its **video** receivers that have
+a non-empty `childs` list. Producer climbing + receiver frozen = wedged. Two counters that
+look useful and are **not**: an RTSP consumer's `bytes_send` increments only in the error
+branch (it counts *failed* writes), and the `preload` consumer's counter freezes permanently
+once that consumer has been severed, even while everything else is healthy.
+
+Recovery is `docker restart go2rtc`. There is no per-stream restart in the API — `PATCH` only
+calls `SetSource` and never touches the wedged connection, and `DELETE`+`PUT` rewrites the
+config while leaking the running stream. Expect ~10 minutes of reader churn afterwards as
+streams settle; that is normal, not a second fault.
+
+`scripts/go2rtc-wedge-detector.py` automates the detection. It is **dry-run by default** —
+run it unarmed first:
+
+```bash
+python3 scripts/go2rtc-wedge-detector.py --api http://127.0.0.1:1985/api/streams
+```
+
+Add `--arm` only after a quiet period confirms no false positives on your cameras. Its
+defaults (500 KB per 30s interval before a frozen receiver counts as evidence) assume a Nest
+source whose audio is ~4–8 KB/s; a source with high-bitrate audio needs re-tuning, because
+`bytes_recv` counts audio RTP too while the signal is video-only.
+
 ## Reference
 
 ### SDM API Quotas
