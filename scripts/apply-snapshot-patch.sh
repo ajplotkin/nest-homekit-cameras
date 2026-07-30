@@ -49,7 +49,7 @@ patches=(
   "Camera.js.patch|dist/sdm/Camera.js|nest-snaps"
   "Api.js.patch|dist/sdm/Api.js|subscribeToEvents"
   "StreamingDelegate.js.patch|dist/StreamingDelegate.js|go2rtcKey"
-  "HksvStreamer.js.patch|dist/HksvStreamer.js|prebuffer consumer dies"
+  "HksvStreamer.js.patch|dist/HksvStreamer.js|SIGKILL"
 )
 
 # New files, copied rather than patched. Must land BEFORE the patches that require them,
