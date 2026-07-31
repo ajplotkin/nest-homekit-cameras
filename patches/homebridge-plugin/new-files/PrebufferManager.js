@@ -1,4 +1,8 @@
 "use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.getPrebufferManager = exports.PrebufferManager = void 0;
+const child_process_1 = require("child_process");
+const stream_1 = require("stream");
 /**
  * PrebufferManager — a rolling pre-trigger buffer for HKSV recordings.
  *
@@ -40,16 +44,11 @@
  * recovered window vary by seconds run to run. The plugin knows the Google
  * timestamp, so it can ask for exactly what it needs.
  */
-
-const { spawn } = require("child_process");
-const { Readable } = require("stream");
-
 // Boxes that together form the init segment every consumer needs first.
 const INIT_BOXES = new Set(["ftyp", "moov"]);
 // `mfra` is a random-access index ffmpeg writes at end-of-file; it never appears
 // mid-live-stream and would be meaningless to forward. The others are padding.
 const SKIP_BOXES = new Set(["mfra", "free", "skip"]);
-
 // Sizing, derived from a measured event (2026-07-29 12:44) rather than picked:
 //
 //   Google Home's own clip started  12:44:42.0
@@ -86,22 +85,42 @@ const STALE_RING_MS = 20000;
 // Nest drops to very low frame rates when idle, so this must be well clear of that; 60s is
 // ~36x the observed cadence and still recovers long before the next likely event.
 const READER_STALL_MS = 60000;
+// Much tighter deadline for a reader that has written its init segment this run but has not
+// produced a single fragment. Once ffmpeg has emitted ftyp+moov the RTSP session is
+// established and the stream parameters are known, so the only thing left to wait for is a
+// keyframe -- measured here at 3.9-4.9s to the first fragment and ~1.4-1.6s between them.
+// 20s is ~4x the slowest observed first-fragment time, and is measured FROM THE INIT SEGMENT
+// rather than from spawn, so a slow cold dial spends its time before the clock starts.
+//
+// This exists because "session up, audio flowing, video never arrives" is a real state: the
+// audio traffic keeps ffmpeg's socket timeout from firing, and -movflags frag_keyframe never
+// cuts a fragment without video keyframes, so ffmpeg sits alive and silent with no stderr.
+// Waiting the full 60s for that leaves the ring empty three times longer than necessary.
+const READER_NO_FRAGMENT_MS = 20000;
 // If a consumer has been served history but no LIVE fragment arrives within this long, the
 // reader has stalled since we snapshotted. Ending the stream lets ffmpeg finalize what it has,
 // so HomeKit gets a short history-only clip instead of timing out and discarding everything.
 // Must be comfortably under the hub's ~16s patience.
 const LIVE_FLOW_DEADMAN_MS = 8000;
-
 class CameraBuffer {
     constructor(log, name, url, ffmpegPath, bufferSeconds) {
+        this.startedAt = 0;
+        // Per-RUN counters, reset on every spawn. `everProduced`/`lastProducedAt` are lifetime
+        // values and cannot answer "is THIS child working?", which is the question both the
+        // fast-fail deadline and the backoff reset actually need.
+        this.fragmentsThisRun = 0;
+        this.sawInitThisRun = false;
+        this.initAtThisRun = 0;
+        // Guards the two paths that can end a run ('exit', and 'error' when spawn itself
+        // failed) from both scheduling a restart.
+        this.exitHandled = false;
         this.log = log;
         this.name = name;
         this.url = url;
         this.ffmpegPath = ffmpegPath;
         this.bufferSeconds = bufferSeconds;
-
         this.initSegment = Buffer.alloc(0);
-        this.fragments = [];        // [{ t: epoch_ms, data: Buffer }]
+        this.fragments = []; // [{ t: epoch_ms, data: Buffer }]
         this.subscribers = new Set();
         // Streams currently being served. A restarted ffmpeg emits a fresh moov and
         // restarts mfhd/tfdt at ~0, so its fragments CANNOT be appended to a
@@ -122,7 +141,7 @@ class CameraBuffer {
         // and then dropped.
         this.everProduced = false;
         // Timestamp of the last published fragment. A camera that worked earlier but has
-        // been dark for a while (AJ switches two off overnight) should not keep poking
+        // been dark for a while (cameras are often switched off overnight) should not keep poking
         // go2rtc -> SDM once a minute all night for nothing.
         this.lastProducedAt = 0;
         // Watchdog bookkeeping, deliberately separate from lastProducedAt (see the stall
@@ -131,7 +150,6 @@ class CameraBuffer {
         this.lastStallKillAt = 0;
         this.stallKills = 0;
     }
-
     start() {
         if (this.stopped) {
             return;
@@ -149,11 +167,11 @@ class CameraBuffer {
             "pipe:1",
         ];
         this.log.debug(`[prebuffer:${this.name}] starting reader ${this.url}`);
-
         let child;
         try {
-            child = spawn(this.ffmpegPath, args, { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
-        } catch (e) {
+            child = (0, child_process_1.spawn)(this.ffmpegPath, args, { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+        }
+        catch (e) {
             this.log.error(`[prebuffer:${this.name}] cannot spawn ffmpeg: ${e}`);
             this.scheduleRestart();
             return;
@@ -161,37 +179,57 @@ class CameraBuffer {
         this.child = child;
         const startedAt = Date.now();
         this.startedAt = startedAt;
-        // Reset the produced-marker on every spawn. Without this the stall watchdog compares a
-        // brand-new child against a timestamp from the PREVIOUS child and kills it within
-        // seconds -- the reader never gets the chance to produce, stallKills climbs, and the
-        // camera is backed off to five minutes despite being perfectly healthy.
-        this.lastProducedAt = 0;
-
+        this.fragmentsThisRun = 0;
+        this.sawInitThisRun = false;
+        this.initAtThisRun = 0;
+        this.exitHandled = false;
         this.pending = Buffer.alloc(0);
         this.pendingMoof = undefined;
-
+        // Non-null: stdio is spawned as ["ignore", "pipe", "pipe"] just above.
         child.stdout.on("data", chunk => this.consume(chunk));
-        // Stall watchdog. Only meaningful once the reader has produced something: a camera
-        // that is switched off simply never produces, and the backoff logic owns that case.
+        // Stall watchdog. Covers three shapes: a reader that produced and then went silent
+        // (60s from its last fragment), one whose session came up but never delivered video
+        // (20s from the init segment), and one that never produced anything at all -- a hung
+        // connect, or a camera that answers and then sends nothing (60s from spawn). Only a
+        // reader that exits on its own is left to the backoff path.
         this.stallTimer = setInterval(() => {
             if (this.stopped) {
                 return;
             }
-            // A reader that has NEVER produced can also stall silently on its first connect
-            // (go2rtc accepts, then sends nothing). It has no exit and no lastProducedAt, so
-            // without this it wedges the ring until Homebridge restarts. Measure from spawn.
-            const since = this.lastProducedAt || this.startedAt || 0;
+            // A reader that has written its init segment this run but produced no fragment is
+            // in the "session up, video never arrived" state and will not recover on its own.
+            // Gate on sawInitThisRun rather than the ring's initSegment. They happen to agree
+            // today (the exit handler wipes initSegment), but the ring's copy answers "does the
+            // ring hold an init segment", not "did THIS child emit one" -- and only the second
+            // question means the session is up. Keeping them separate is what stops a future
+            // change to the wipe from silently cutting short a reader that is still connecting.
+            const starvedThisRun = this.sawInitThisRun && this.fragmentsThisRun === 0;
+            // EVERY basis here must be per-run.
+            //
+            // Reading lifetime `lastProducedAt` directly was a serious bug: after any stall
+            // kill it is >=60s old by construction, so the next child was judged against its
+            // predecessor's timestamp, the deadline was already blown on its first tick, and a
+            // recovered healthy reader was killed ~5s after spawn -- typically ~1s before its
+            // first fragment -- on every attempt. The camera never came back until Homebridge
+            // restarted.
+            //
+            // Starved runs measure from the INIT segment, not from spawn: that is the moment
+            // the session is established and the only outstanding thing is a keyframe, which
+            // is what the 20s budget is actually for. On a cold dial (fresh Nest WebRTC:
+            // OAuth + ExchangeSDP) init can be ~16s in, and measuring from spawn would leave
+            // a working stream only ~4s to produce.
+            const since = starvedThisRun
+                ? this.initAtThisRun
+                : Math.max(this.lastProducedAt, this.startedAt);
             if (!since) {
                 return;
             }
-            // Never judge a child younger than the stall threshold: a fresh reader legitimately
-            // takes a few seconds to connect and reach its first keyframe.
-            if (Date.now() - this.startedAt < READER_STALL_MS) {
-                return;
-            }
             const idle = Date.now() - since;
-            if (idle > READER_STALL_MS) {
-                this.log.warn(`[prebuffer:${this.name}] reader alive but silent for ${Math.round(idle / 1000)}s; restarting it`);
+            const limit = starvedThisRun ? READER_NO_FRAGMENT_MS : READER_STALL_MS;
+            if (idle > limit) {
+                this.log.warn(starvedThisRun
+                    ? `[prebuffer:${this.name}] reader connected but delivered no video for ${Math.round(idle / 1000)}s; restarting it`
+                    : `[prebuffer:${this.name}] reader alive but silent for ${Math.round(idle / 1000)}s; restarting it`);
                 // Do NOT touch lastProducedAt: scheduleRestart() reads it to decide whether
                 // this camera is in a sustained outage, and the healthy-backoff-reset reads it
                 // too. Refreshing it here made a repeatedly-stalling camera look permanently
@@ -200,7 +238,11 @@ class CameraBuffer {
                 this.stallKills++;
                 this.killChild();
             }
-        }, 15000);
+            // 5s, not 15s: the tick is the granularity of both deadlines above, so a 15s tick
+            // turned the 20s fast-fail into an effective 30s and the 60s deadline into 60-75s
+            // (the observed kill messages said "60s" and "75s" for exactly this reason). The
+            // extra wakeups are negligible and the timer is unref'd.
+        }, 5000);
         if (this.stallTimer.unref) {
             this.stallTimer.unref();
         }
@@ -222,8 +264,35 @@ class CameraBuffer {
                 this.log.debug(`[prebuffer:${this.name}] ffmpeg: ${s}`);
             }
         });
-        child.on("error", e => this.log.error(`[prebuffer:${this.name}] ffmpeg error: ${e}`));
+        // A failure to spawn at all (bad ffmpegPath -> ENOENT) emits 'error' and NEVER 'exit',
+        // and only the exit handler schedules a restart. Without this the camera would sit
+        // dead forever while the stall watchdog logged a warning every tick. `exitHandled`
+        // keeps the two paths from both scheduling.
+        child.on("error", e => {
+            this.log.error(`[prebuffer:${this.name}] ffmpeg error: ${e}`);
+            if (this.exitHandled || this.stopped) {
+                return;
+            }
+            // `!child.pid` alone is the correct "never spawned" test. Do NOT also require
+            // exitCode === null: on a spawn failure Node sets exitCode to the NEGATED ERRNO
+            // (-2 for ENOENT) BEFORE emitting 'error', so that condition is never true and the
+            // whole branch is dead -- which is exactly the bug this block was added to fix. A
+            // kill-failure error on a live child always has a pid, so it cannot match here.
+            if (!child.pid) {
+                this.exitHandled = true;
+                if (this.stallTimer) {
+                    clearInterval(this.stallTimer);
+                    this.stallTimer = undefined;
+                }
+                this.log.warn(`[prebuffer:${this.name}] ffmpeg never started; retrying in ${this.backoffMs}ms`);
+                this.scheduleRestart();
+            }
+        });
         child.on("exit", (code, signal) => {
+            if (this.exitHandled) {
+                return;
+            }
+            this.exitHandled = true;
             if (this.stallTimer) {
                 clearInterval(this.stallTimer);
                 this.stallTimer = undefined;
@@ -246,14 +315,28 @@ class CameraBuffer {
             // Reset backoff if it had been healthy: a stream that ran for minutes
             // and then dropped deserves a prompt retry, not the delay earned by one
             // that fails instantly.
-            if (this.everProduced && Date.now() - startedAt > 30000) {
+            //
+            // Gate on fragments produced BY THIS RUN, not on `everProduced`. `everProduced` is
+            // a lifetime flag, so a reader that connected, delivered nothing for 60s and was
+            // killed still satisfied "everProduced && ran > 30s" and reset the backoff to 1s.
+            // That made the escalating backoff -- and the `stallKills >= 3` five-minute cap it
+            // feeds -- unreachable for exactly the failure they exist to damp, turning a
+            // starved camera into a 60s metronome of kill/respawn/re-dial against SDM.
+            // The run must ALSO have still been producing when it ended. Without the
+            // recency test, a "trickle" run -- one fragment early, then starvation until the
+            // 60s stall kill -- satisfies "produced && ran > 30s" and resets the backoff to
+            // 1s, resurrecting the very metronome this gating exists to stop. A run that
+            // exits or is killed while genuinely healthy has a recent lastProducedAt; one
+            // killed for 60s of silence cannot.
+            if (this.fragmentsThisRun > 0
+                && Date.now() - startedAt > 30000
+                && Date.now() - this.lastProducedAt < 30000) {
                 this.backoffMs = 1000;
             }
             this.log.debug(`[prebuffer:${this.name}] reader exited (code=${code} signal=${signal}), retry in ${this.backoffMs}ms`);
             this.scheduleRestart();
         });
     }
-
     /** Destroy every in-flight consumer; their timeline is no longer valid. */
     resetConsumers(reason) {
         const streams = Array.from(this.activeStreams);
@@ -268,7 +351,6 @@ class CameraBuffer {
             this.log.warn(`[prebuffer:${this.name}] ${reason} -- dropped ${streams.length} in-flight consumer(s)`);
         }
     }
-
     scheduleRestart() {
         if (this.stopped || this.restartTimer) {
             return;
@@ -288,8 +370,17 @@ class CameraBuffer {
             this.restartTimer.unref();
         }
     }
-
     consume(chunk) {
+        // Once the run has ended, drop anything still arriving on its stdout. The exit handler
+        // wipes the ring for a fresh timeline, and a COMPLETE late moof+mdat would otherwise
+        // parse straight through to publish() and seed the new ring with an old-timeline
+        // fragment -- a backward-DTS splice that `-codec:v copy` cannot mask. Resetting
+        // `pending` there only covers a HALF-parsed box. Not reproducible on macOS (pipe data
+        // is delivered before 'exit' in flowing mode), but this ships on Linux/arm64 where
+        // that ordering has not been verified, and the guard costs one comparison.
+        if (this.exitHandled) {
+            return;
+        }
         this.pending = this.pending.length ? Buffer.concat([this.pending, chunk]) : chunk;
         for (;;) {
             if (this.pending.length < 8) {
@@ -329,8 +420,13 @@ class CameraBuffer {
             }
             const box = this.pending.subarray(0, size);
             this.pending = this.pending.subarray(size);
-
             if (INIT_BOXES.has(type)) {
+                // ffmpeg only emits ftyp/moov once it has parsed the RTSP stream info, so
+                // this marks "the session is established" for the fast-fail deadline.
+                if (!this.sawInitThisRun) {
+                    this.initAtThisRun = Date.now();
+                }
+                this.sawInitThisRun = true;
                 this.initSegment = this.initSegment.length
                     ? Buffer.concat([this.initSegment, box])
                     : Buffer.from(box);
@@ -356,7 +452,6 @@ class CameraBuffer {
             // Unknown box: ignore rather than guess at its meaning.
         }
     }
-
     killChild() {
         // Drop half-parsed state with the child. Otherwise buffered stdout from the
         // dying process keeps hitting the corrupt-parse path, and a late chunk can
@@ -367,14 +462,15 @@ class CameraBuffer {
             if (this.child) {
                 this.child.kill("SIGKILL");
             }
-        } catch (e) { /* exit handler schedules the restart */ }
+        }
+        catch (e) { /* exit handler schedules the restart */ }
     }
-
     publish(fragment) {
         this.everProduced = true;
         const now = Date.now();
         this.lastProducedAt = now;
         this.stallKills = 0;
+        this.fragmentsThisRun++;
         this.fragments.push({ t: now, data: fragment });
         this.totalFragments++;
         const cutoff = now - this.bufferSeconds * 1000;
@@ -387,12 +483,12 @@ class CameraBuffer {
         for (const sub of this.subscribers) {
             try {
                 sub(fragment);
-            } catch (e) {
+            }
+            catch (e) {
                 this.log.debug(`[prebuffer:${this.name}] subscriber threw: ${e}`);
             }
         }
     }
-
     /**
      * Fragments buffered at or after `sinceEpochMs`, plus the init segment.
      * Returns null when no init segment has been seen yet -- the caller must fall
@@ -425,7 +521,6 @@ class CameraBuffer {
             oldestAvailable: this.fragments[0].t,
         };
     }
-
     stop() {
         this.stopped = true;
         if (this.stallTimer) {
@@ -441,7 +536,6 @@ class CameraBuffer {
         this.child = undefined;
         this.subscribers.clear();
     }
-
     stats() {
         const span = this.fragments.length >= 2
             ? (this.fragments[this.fragments.length - 1].t - this.fragments[0].t) / 1000
@@ -456,7 +550,6 @@ class CameraBuffer {
         };
     }
 }
-
 class PrebufferManager {
     /**
      * @param log            Homebridge logger
@@ -471,7 +564,6 @@ class PrebufferManager {
         this.bufferSeconds = bufferSeconds || DEFAULT_BUFFER_SECONDS;
         this.buffers = new Map();
     }
-
     /** Stop one camera's ring (HKSV switched off for it) without touching others. */
     release(cameraKey) {
         const buf = this.buffers.get(cameraKey);
@@ -480,18 +572,15 @@ class PrebufferManager {
             this.buffers.delete(cameraKey);
         }
     }
-
     ensure(cameraKey) {
         let buf = this.buffers.get(cameraKey);
         if (!buf) {
-            buf = new CameraBuffer(this.log, cameraKey, `${this.rtspBase}/${cameraKey}`,
-                this.ffmpegPath, this.bufferSeconds);
+            buf = new CameraBuffer(this.log, cameraKey, `${this.rtspBase}/${cameraKey}`, this.ffmpegPath, this.bufferSeconds);
             this.buffers.set(cameraKey, buf);
             buf.start();
         }
         return buf;
     }
-
     /**
      * A Readable delivering [init][history since sinceEpochMs][live...].
      *
@@ -512,7 +601,7 @@ class PrebufferManager {
      * back to dialling go2rtc directly.
      */
     createStream(cameraKey, sinceEpochMs) {
-        // M-5a: look up, do NOT ensure(). Implicitly creating the ring here resurrected
+        // Look up, do NOT create. Implicitly creating the ring here resurrected
         // rings that updateRecordingActive(false) had just released, and they then ran
         // until the next toggle. A missing ring means the caller falls back to dialling
         // go2rtc directly, which is the correct behaviour.
@@ -524,7 +613,6 @@ class PrebufferManager {
         const queue = [];
         let flowing = false;
         let stream;
-
         // Deadman: armed once history is queued, cleared by each live fragment. A reader that
         // stalls between our snapshot and the live continuation would otherwise leave ffmpeg
         // waiting on input that never comes -- we would have handed over perfectly good
@@ -545,10 +633,9 @@ class PrebufferManager {
                 deadman.unref();
             }
         };
-
-        const onFragment = f => {
+        const onFragment = (f) => {
             armDeadman();
-            // H1 backstop: if the consumer never drains (ffmpeg died before its stdin
+            // Backstop: if the consumer never drains (ffmpeg died before its stdin
             // was piped, or was killed while the reader was down so no write ever
             // raised EPIPE), this queue would otherwise grow at ~150KB/s forever.
             if (queue.length >= MAX_QUEUED_FRAGMENTS) {
@@ -574,7 +661,6 @@ class PrebufferManager {
             }
             flowing = true;
         };
-
         buf.subscribers.add(onFragment);
         const hist = buf.history(sinceEpochMs);
         if (!hist) {
@@ -585,8 +671,7 @@ class PrebufferManager {
             this.log.warn(`[prebuffer:${cameraKey}] ${why}; falling back to a direct go2rtc dial`);
             return null;
         }
-
-        stream = new Readable({
+        stream = new stream_1.Readable({
             read() {
                 flowing = true;
                 pump();
@@ -609,10 +694,8 @@ class PrebufferManager {
         };
         stream.once("close", cleanupAll);
         stream.once("error", cleanupAll);
-
         queue.unshift(...hist.fragments);
         queue.unshift(hist.init);
-
         const recovered = hist.oldestAvailable
             ? Math.round((Date.now() - Math.max(hist.oldestAvailable, sinceEpochMs)) / 100) / 10
             : 0;
@@ -620,7 +703,6 @@ class PrebufferManager {
         armDeadman();
         return stream;
     }
-
     stats() {
         const out = {};
         for (const [k, v] of this.buffers) {
@@ -628,7 +710,6 @@ class PrebufferManager {
         }
         return out;
     }
-
     stopAll() {
         for (const buf of this.buffers.values()) {
             buf.stop();
@@ -636,17 +717,16 @@ class PrebufferManager {
         this.buffers.clear();
     }
 }
-
+exports.PrebufferManager = PrebufferManager;
 // StreamingDelegate is constructed per camera, but the buffers must be shared and
 // long-lived (they run whether or not a recording is in progress), so the manager
 // is a module singleton rather than per-delegate state.
 let _manager;
-
 function getPrebufferManager(log, ffmpegPath, rtspBase, bufferSeconds) {
     if (!_manager) {
         _manager = new PrebufferManager(log, ffmpegPath, rtspBase, bufferSeconds);
     }
     return _manager;
 }
-
-module.exports = { PrebufferManager, getPrebufferManager };
+exports.getPrebufferManager = getPrebufferManager;
+//# sourceMappingURL=PrebufferManager.js.map

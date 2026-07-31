@@ -776,6 +776,64 @@ One caveat worth knowing: `/api/streams` marshals the full stream map without ho
 unsafe. Nothing mutates streams at runtime in this setup, but it is a reason not to poll far
 more aggressively than the 30s default.
 
+### The wrong-receiver bug — why a cold dial delivers audio but never video
+
+A separate go2rtc fault, and the one behind most "the ring never fills" symptoms.
+
+Every Nest producer ends up with **two** video receivers, and only one is ever fed:
+
+```
+receiver 34852  childs=true   bytes=0        profile=<nil>   <- the reader is attached HERE
+receiver 34856  childs=false  bytes=3546841  profile=Main    <- all the video arrives HERE
+rtsp video sender  parent=34852  bytes=None
+rtsp audio sender  parent=34854  bytes=55349                 <- audio flows normally
+```
+
+`getMediaCodec` resolves the codec from the payload type Nest actually transmits, but the
+narrowing of `media.Codecs` to that entry happens *after* `Connection.GetTrack`. A consumer
+that wired up earlier matched the **first** codec in the answer's list, and `GetTrack` compares
+receivers by `*Codec` **pointer** identity — so the two disagree and a second receiver is
+created. `Codec.Match` elsewhere compares by name/clock-rate/channels, so the codebase matches
+by value in one place and by pointer in another.
+
+Audio is unaffected (one Opus payload type, no ambiguity), and that is exactly what makes it so
+quiet: ffmpeg keeps reading audio, so its socket timeout never fires, and `-movflags
+frag_keyframe` cannot cut a fragment without video keyframes. The reader sits alive, silent,
+with nothing on stderr.
+
+**It is deterministic, not intermittent.** A *cold* dial always mis-binds; a *warm* attach
+always binds correctly, because by then `OnTrack` has narrowed `media.Codecs` to the single real
+codec. That is why a camera can be healthy for hours and then break the moment everything
+re-dials at once (a Homebridge or go2rtc restart).
+
+Diagnose — a video receiver with `childs` but zero `bytes`, beside one with bytes and no
+`childs`:
+
+```bash
+curl -s http://127.0.0.1:1985/api/streams | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for n,s in d.items():
+    for p in s.get('producers') or []:
+        for r in p.get('receivers') or []:
+            c=r.get('codec') or {}
+            if c.get('codec_type')=='video':
+                print(n, r.get('id'), 'childs=%s'%bool(r.get('childs')),
+                      'bytes=%s'%r.get('bytes'), 'profile=%s'%c.get('profile'))"
+```
+
+**Workaround until the fix ships: warm the stream before the reader attaches.** One snapshot
+request forces the producer up and lets `OnTrack` narrow the codec, so the reader's next
+connection is a warm attach and binds correctly:
+
+```bash
+curl -s -o /dev/null "http://127.0.0.1:1985/api/frame.jpeg?src=front_door"
+```
+
+Verified on this deployment: both cameras went from a repeating 22s fast-fail loop to
+`reader_video_parent == fed_receiver` and stayed healthy. This is also why the snapshot warmer
+service matters for more than snapshots.
+
 ## Reference
 
 ### SDM API Quotas
