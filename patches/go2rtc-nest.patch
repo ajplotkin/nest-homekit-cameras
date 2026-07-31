@@ -1,6 +1,6 @@
 # go2rtc Nest patches — apply to a clean go2rtc v1.9.14 checkout
 #
-# Corresponds to https://github.com/ajplotkin/go2rtc at the stable tag nestfix-1.9.14-3,
+# Corresponds to https://github.com/ajplotkin/go2rtc at the stable tag nestfix-1.9.14-4,
 # which is the tag the README tells you to build. (Development continues on the
 # fix/nest-ipv6-ice-failure branch; that work is not in this diff.)
 #
@@ -739,7 +739,7 @@ index 6a57091..416b6cf 100644
  }
  
 diff --git a/pkg/webrtc/conn.go b/pkg/webrtc/conn.go
-index 924fd55..bf45de8 100644
+index 924fd55..4b574e3 100644
 --- a/pkg/webrtc/conn.go
 +++ b/pkg/webrtc/conn.go
 @@ -1,17 +1,26 @@
@@ -783,7 +783,44 @@ index 924fd55..bf45de8 100644
  	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
  		// last candidate will be empty
  		if candidate != nil {
-@@ -87,10 +103,41 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -74,6 +90,36 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+ 			return
+ 		}
+ 
++		// Adopt the transmitted codec into a receiver a consumer is already on, so the
++		// GetTrack below (Conn.GetTrack, pkg/webrtc/producer.go:8 -- it shadows
++		// core.Connection.GetTrack) finds it by pointer identity instead of minting a second
++		// receiver.
++		//
++		// getMediaCodec resolves `codec` from the payload type actually being transmitted, but
++		// media.Codecs is narrowed to that entry only BELOW. A consumer that wired up earlier
++		// matched the FIRST codec in the answer, which for Nest need not be the transmitted
++		// one -- so OnTrack ends up feeding a receiver with no consumers while the consumer
++		// sits on one that never receives. Observed live: receiver A childs=true bytes=0
++		// profile=<nil> beside receiver B childs=false bytes=3546841 profile=Main. Audio is
++		// unaffected (single Opus payload type), which is why it is so quiet: ffmpeg keeps
++		// reading audio so its socket timeout never fires, and frag_keyframe cannot cut a
++		// fragment without video keyframes.
++		//
++		// Deliberately not the reverse (moving senders onto the new receiver): that receiver is
++		// absent from Producer.receivers, so stopProducers would see no attached senders and
++		// stop a producer that still has live consumers.
++		//
++		// Gated to Nest to bound the blast radius here; the pointer-vs-value mismatch is
++		// generic to any producer whose answer keeps several codecs on one media.
++		if c.FormatName == "nest/webrtc" {
++			for _, recv := range c.Receivers {
++				if recv.Media == media && recv.Codec != codec && recv.Codec.Match(codec) {
++					recv.Codec = codec
++					break
++				}
++			}
++		}
++
+ 		track, err := c.GetTrack(media, codec)
+ 		if err != nil {
+ 			return
+@@ -87,10 +133,41 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}
  		}
  
@@ -828,7 +865,7 @@ index 924fd55..bf45de8 100644
  					if err := pc.WriteRTCP(pkts); err != nil {
  						return
  					}
-@@ -98,6 +145,82 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -98,6 +175,82 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}()
  		}
  
@@ -911,7 +948,7 @@ index 924fd55..bf45de8 100644
  		for {
  			b := make([]byte, ReceiveMTU)
  			n, _, err := remote.Read(b)
-@@ -113,9 +236,55 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -113,9 +266,55 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}
  
  			if len(packet.Payload) == 0 {
@@ -967,7 +1004,7 @@ index 924fd55..bf45de8 100644
  			track.WriteRTP(packet)
  		}
  	})
-@@ -137,6 +306,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -137,6 +336,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			for _, sender := range c.Senders {
  				sender.Start()
  			}
@@ -987,7 +1024,7 @@ index 924fd55..bf45de8 100644
  		case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
  			// disconnect event comes earlier, than failed
  			// but it comes only for success connections
-@@ -147,6 +329,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -147,6 +359,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  	return c
  }
  
