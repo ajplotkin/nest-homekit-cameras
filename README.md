@@ -887,6 +887,13 @@ A camera that's **switched off** costs a little more than an active one: the for
 - [homebridge-google-nest-sdm #235](https://github.com/potmat/homebridge-google-nest-sdm/issues/235) — HKSV recording re-encodes video unnecessarily; `-codec:v copy` works and the `-profile:v` requirement is self-imposed — **open**
 - [homebridge-google-nest-sdm PR #237](https://github.com/potmat/homebridge-google-nest-sdm/pull/237) — the silent-recordings fix from this repo (issue #234) — **open**
 - [homebridge-google-nest-sdm PR #238](https://github.com/potmat/homebridge-google-nest-sdm/pull/238) — copy the camera H.264 for HKSV recording on the WebRTC path, dropping the libx264 transcode (issue #235); RTSP cameras keep transcoding — **open**
+- [homebridge-google-nest-sdm #230](https://github.com/potmat/homebridge-google-nest-sdm/issues/230) by [@littlepope81](https://github.com/littlepope81) — "Serve real snapshot tiles and advertise HKSV motion triggers" — **open**; this repo is a working end-to-end implementation of exactly that, which is why [#236](https://github.com/potmat/homebridge-google-nest-sdm/issues/236) from here was closed as a duplicate of it
+
+**go2rtc bugs found while building this (reported upstream):**
+
+- [go2rtc #2389](https://github.com/AlexxIT/go2rtc/issues/2389) — a WebRTC producer creates **two** video receivers for one codec, and consumers can attach to the one that is never fed. `getMediaCodec` resolves the codec from the transmitted payload type, but `media.Codecs` is narrowed only *after* `GetTrack`, which matches receivers by `*Codec` **pointer** identity. Audio is unaffected (single Opus payload type), so ffmpeg keeps reading audio, its socket timeout never fires, and `frag_keyframe` never cuts a fragment — the reader sits alive and silent. **This is the root cause of "the prebuffer ring never fills"**; a cold dial always mis-binds, a warm attach never does — **open**; fixed in this fork at `nestfix-1.9.14-4`, which took a camera from 300 stall-kills in 18 hours to zero
+- [go2rtc #2387](https://github.com/AlexxIT/go2rtc/issues/2387) — `Producer.reconnect()` silently drops receivers it cannot re-match (two bare `continue`s, no log at any level), and the following `conn.Stop()` then severs their consumers permanently. Directly observable: a consumer whose sender reports a `parent` receiver id the producer no longer has — **open**
+- [go2rtc #2388](https://github.com/AlexxIT/go2rtc/issues/2388) — the RTSP consumer's `bytes_send` is incremented inside the `err != nil` branch, so it counts **failed** writes; a perfectly healthy consumer reports zero. The same inverted pattern is in three backchannel consumers — **open**
 
 **Upstream go2rtc work this fork builds on (credit to the authors):**
 
