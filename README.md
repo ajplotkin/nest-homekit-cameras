@@ -888,8 +888,8 @@ A camera that's **switched off** costs a little more than an active one: the for
 
 Every problem here has an expensive solution and a cheap one, and the expensive one is
 usually the obvious one. The whole point of this setup is that it takes the cheap route each
-time — so it runs on a 2 GB Pi 4 that is also running Home Assistant, a Matter bridge, a DVR
-and a VPN.
+time — so it runs comfortably on a 2 GB Pi 4 with room to spare for whatever else that Pi
+is doing.
 
 Measured on that Pi, steady state, four cameras (two live, two switched off):
 
@@ -923,8 +923,9 @@ Where the savings come from, in rough order of size:
 - **Audio is the only thing still transcoded**, because HomeKit requires AAC-ELD and Nest sends
   Opus. That is cheap and unavoidable.
 
-The one thing that *did* need more resources was unrelated to cameras: Home Assistant, at
-~489 MB, is 40% of the memory on the box. The camera pipeline is ~121 MB of it.
+For context on the memory figure: ~121 MB covers go2rtc, the per-camera ring readers and the
+snapshot cache together. Adding cameras costs roughly a ring reader each — tens of MB, not
+hundreds — because nothing in the path buffers video beyond the few seconds of pre-roll.
 
 ### Related Issues and PRs
 
