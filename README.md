@@ -599,6 +599,24 @@ Two design points worth keeping if you modify it:
 Verified: a real doorbell event now opens on an empty porch **5 seconds before** the subject
 appears, where it previously opened on their back as they left.
 
+**It works, and it stays working.** Early on it did not — the ring would fill for hours and
+then stop, and clips went back to opening late or not at all. That turned out not to be the
+prebuffer at all but the go2rtc wrong-receiver bug described below, which starves a reader
+silently. With that fixed (`nestfix-1.9.14-4`), measured over a full day on a Pi 4 with four
+cameras:
+
+| | before the receiver fix | after |
+|---|---|---|
+| reader stall-kills / 18h | **416** (300 on the doorbell) | **0** |
+| longest reader uptime | ~61 seconds | **20.5 hours**, unbroken |
+| video receivers per producer | 2 (one starved) | 1 |
+| real events recorded | intermittent | every one, `reason=0` |
+
+A live doorbell press on the morning after: motion at `10:30:37`, recording requested the same
+second, **9.1 s of pre-trigger history served**, hub accepted the clip. Two more that morning
+on another camera, both clean. So the pre-roll is not a lab result — it is what the hub
+actually receives on a real press.
+
 Config keys (both optional; the feature is **off** unless the first is set):
 
 | Key | Default | Meaning |
