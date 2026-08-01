@@ -66,8 +66,8 @@ The one thing that **cannot** be scripted is Google Device Access (Part 1) — c
 **Option A — `install.sh`** (idempotent; builds the patched go2rtc image, sets up the tmpfs, generates the config, starts go2rtc, installs the warmer service, applies the plugin patches):
 
 ```bash
-git clone https://github.com/ajplotkin/nest-homekit-snapshots.git
-cd nest-homekit-snapshots
+git clone https://github.com/ajplotkin/nest-homekit-cameras.git
+cd nest-homekit-cameras
 
 # see exactly what it will do first (changes nothing):
 ./install.sh --dry-run --hb-config /path/to/homebridge/config.json \
@@ -241,7 +241,7 @@ Grab it and make it executable:
 
 ```bash
 mkdir -p ~/scripts
-curl -fsSL https://raw.githubusercontent.com/ajplotkin/nest-homekit-snapshots/main/scripts/nest-go2rtc-sync.py -o ~/scripts/nest-go2rtc-sync.py
+curl -fsSL https://raw.githubusercontent.com/ajplotkin/nest-homekit-cameras/main/scripts/nest-go2rtc-sync.py -o ~/scripts/nest-go2rtc-sync.py
 chmod +x ~/scripts/nest-go2rtc-sync.py
 ```
 
@@ -358,7 +358,7 @@ Freshness: the **baseline** cycle uses a cache window *shorter* than the poll in
 Grab it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ajplotkin/nest-homekit-snapshots/main/scripts/go2rtc-snapshot-warmer.sh -o ~/scripts/go2rtc-snapshot-warmer.sh
+curl -fsSL https://raw.githubusercontent.com/ajplotkin/nest-homekit-cameras/main/scripts/go2rtc-snapshot-warmer.sh -o ~/scripts/go2rtc-snapshot-warmer.sh
 ```
 
 Install as a systemd service — write this to `/etc/systemd/system/go2rtc-snapshot-warmer.service` (e.g. `sudo nano`), replacing `YOUR_USER`:
@@ -422,8 +422,8 @@ Earlier versions of this repo carried several more patches; those fixes were mer
 Clone this repo (you'll want it for the scripts too) and run the patcher:
 
 ```bash
-git clone https://github.com/ajplotkin/nest-homekit-snapshots.git
-cd nest-homekit-snapshots
+git clone https://github.com/ajplotkin/nest-homekit-cameras.git
+cd nest-homekit-cameras
 HOMEBRIDGE_DIR=/path/to/homebridge ./scripts/apply-snapshot-patch.sh
 ```
 
@@ -883,6 +883,48 @@ A camera that's **switched off** costs a little more than an active one: the for
 | CPU per HKSV recording (copy, now) | remux + audio only |
 | Prebuffer ring, per camera | ~150 KB/s, ~2 MB RAM, a few % of one core |
 | Pre-trigger footage recovered | ~10.7s (clip opens ~5s before the subject appears) |
+
+### None of this needs a bigger box
+
+Every problem here has an expensive solution and a cheap one, and the expensive one is
+usually the obvious one. The whole point of this setup is that it takes the cheap route each
+time — so it runs on a 2 GB Pi 4 that is also running Home Assistant, a Matter bridge, a DVR
+and a VPN.
+
+Measured on that Pi, steady state, four cameras (two live, two switched off):
+
+```
+load average           0.23  0.31  0.32        (4 cores; 93-97% idle)
+go2rtc                 8-18% of ONE core
+ffmpeg ring readers    1-9% of one core each
+entire camera stack    ~121 MB RAM
+snapshot cache         tmpfs (RAM) — zero SD-card writes
+```
+
+Where the savings come from, in rough order of size:
+
+- **Recording copies instead of re-encoding.** The transcode was ~1.8 of 4 cores per clip and
+  ran at only ~1.37× realtime, so two concurrent recordings could fall behind and truncate.
+  Copy has no encoder to fall behind. This is the single biggest win, and it turned out the
+  transcode was never required — see *Recording copies video*.
+- **The prebuffer is a remux, not a recorder.** It never decodes or encodes; it copies
+  keyframe-aligned fragments into RAM and drops them out the back. ~150 KB/s and ~2 MB per
+  camera buys ~9 s of pre-trigger footage. Continuous *recording* of four cameras would cost
+  orders of magnitude more and is what the plugin's own README calls impractical.
+- **Snapshots are served from RAM, not generated on demand.** A warm JPEG per camera lives on
+  tmpfs and is read in ~26 ms. Nothing decodes a frame per tile request, and nothing writes to
+  the SD card — which matters, because a snapshot-per-request design on an SD-backed Pi is a
+  wear problem as much as a CPU one.
+- **One Google session per camera, shared.** go2rtc holds a single SDM/WebRTC session and fans
+  it out to the snapshot warmer, live view and HKSV recording alike. Stock, each of those opens
+  its own dial, so a recording during a live view is a second concurrent session for the same
+  device. Fewer dials, less contention, and it stays inside the per-device limit no matter how
+  many things are watching.
+- **Audio is the only thing still transcoded**, because HomeKit requires AAC-ELD and Nest sends
+  Opus. That is cheap and unavoidable.
+
+The one thing that *did* need more resources was unrelated to cameras: Home Assistant, at
+~489 MB, is 40% of the memory on the box. The camera pipeline is ~121 MB of it.
 
 ### Related Issues and PRs
 
