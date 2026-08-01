@@ -19,7 +19,7 @@ This guide walks through the full setup from scratch: getting API access to your
 - **This README** — the complete, from-scratch guide (start here and read top to bottom).
 - **[`install.sh`](install.sh)** — one-shot installer for everything after your Google credentials. Re-running is safe but **not** a no-op: it recreates the go2rtc container (dropping every warm stream) and rewrites the warmer unit. see [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
 - **[`docker-compose.yml`](docker-compose.yml)** — the go2rtc + warmer half of the stack as Compose services.
-- **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), and `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches).
+- **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches), and `check-drift.sh` (read-only; proves your deployment still matches this repo — see [Checking for drift](#checking-for-drift)).
 - **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), four plugin diffs against stock 1.1.24 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`), and `homebridge-plugin/new-files/PrebufferManager.js` (a new file, copied in rather than patched — it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)).
 
 The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-4)** — build from the stable tag **`nestfix-1.9.14-4`** (development happens on the `fix/nest-ipv6-ice-failure` branch, which may carry in-progress work, so don't build from the branch.). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
@@ -926,6 +926,42 @@ Where the savings come from, in rough order of size:
 For context on the memory figure: ~121 MB covers go2rtc, the per-camera ring readers and the
 snapshot cache together. Adding cameras costs roughly a ring reader each — tens of MB, not
 hundreds — because nothing in the path buffers video beyond the few seconds of pre-roll.
+
+### Checking for drift
+
+A long-lived install stops matching the repo it came from. You fix something on the box to
+restore service and mean to commit it later; you commit a fix here and mean to deploy it later.
+Neither is noticed, because nothing compares the two — drift is normally found by accident,
+while looking at one file for an unrelated reason.
+
+```bash
+./scripts/check-drift.sh --deep --host you@your-pi \
+  --homebridge /path/to/homebridge --scripts /path/to/scripts
+```
+
+It is **strictly read-only** — it never copies, patches or restarts anything. That is deliberate:
+the thing it exists to catch is a stale patch script quietly reverting good code, so a checker
+that could also "fix" would be the same hazard wearing a different hat.
+
+It reports three things:
+
+- **Byte-identical artifacts** — the scripts and `PrebufferManager.js`, which should match exactly.
+- **Reproducibility** (`--deep`) — fetches pristine `EXPECT_VER` from npm, applies this repo's
+  diffs, and compares the result to your live `dist/`. Byte-identical or it isn't reproducible.
+  This is the only check that actually proves your deployment is the one documented here.
+- **Stale whole-file patch blobs** — this repo shipped whole-file copies before 2026-07-19 and
+  moved to unified diffs precisely because pasting a stale whole file silently reverts everything
+  done since. Any surviving `*.patched` tree can still do that, so it is flagged.
+
+**`package.json` is reported but never treated as authoritative.** Patching `dist/` in place
+doesn't make npm rewrite the version field, so a plugin whose code is 1.1.24 can keep reporting
+1.1.23 indefinitely. It still matters — `apply-snapshot-patch.sh` reads that field and will refuse
+to run after an `npm install` — but it says nothing about which code is executing. Only `--deep`
+answers that.
+
+Exit status is 0 when clean and 1 on drift, so it works as a cron canary. When something has
+drifted, establish the **direction** before copying anything: the repo may be ahead (deploy it),
+or the box may be ahead and carrying an undeployed hotfix (commit it).
 
 ### Related Issues and PRs
 
