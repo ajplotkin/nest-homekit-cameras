@@ -102,6 +102,16 @@ const READER_NO_FRAGMENT_MS = 20000;
 // so HomeKit gets a short history-only clip instead of timing out and discarding everything.
 // Must be comfortably under the hub's ~16s patience.
 const LIVE_FLOW_DEADMAN_MS = 8000;
+// A ring poisoned by an upstream timestamp re-base clamps ~50x/second, sustained, because
+// every packet after the re-base is behind its predecessor (measured 2026-08-03: 1218 and
+// 1398 clamps inside single failed recordings). An isolated clamp is a different animal --
+// upstairs emits one every few minutes and every recording it fed still closed reason=0.
+// 20-in-10s sits far above the isolated rate and is reached in well under a second by a
+// real freeze, so the two cannot be confused.
+const DTS_CLAMP_WINDOW_MS = 10000;
+const DTS_CLAMP_THRESHOLD = 20;
+// Report isolated clamps at most this often per camera, so a chatty one cannot flood.
+const CLAMP_LOG_THROTTLE_MS = 60000;
 class CameraBuffer {
     constructor(log, name, url, ffmpegPath, bufferSeconds) {
         this.startedAt = 0;
@@ -149,6 +159,9 @@ class CameraBuffer {
         // recovering, and it should back off like any other dead camera.
         this.lastStallKillAt = 0;
         this.stallKills = 0;
+        // Sliding window of muxer dts-clamp times, to tell a sustained freeze from a hiccup.
+        this.dtsClamps = [];
+        this.lastClampLogAt = 0;
     }
     start() {
         if (this.stopped) {
@@ -290,12 +303,40 @@ class CameraBuffer {
                 return;
             }
             // Backstop for a timestamp re-base that arrives WITHOUT a cseq jump, which the
-            // rule above would never see. One clamped packet already means some servable
-            // window contains a backward step, so restarting is correct rather than merely
-            // cautious. ffmpeg 6 spells it "Non-monotonous"; 7+ says "Non-monotonic".
+            // rule above would never see. ffmpeg 6 spells it "Non-monotonous"; 7+ says
+            // "Non-monotonic".
+            //
+            // Threshold, not hair-trigger. An ISOLATED clamp is survivable and common: the
+            // upstairs camera produces one every few minutes and every recording it fed
+            // still closed reason=0. Restarting on each one cost ~5 ring resets in 13
+            // minutes for no benefit -- measured, after this backstop first shipped
+            // hair-triggered. What actually poisons a ring is a SUSTAINED freeze: on
+            // 2026-08-03 the muxer clamped roughly fifty times a second for 4h53m, because
+            // every packet after the re-base was behind its predecessor. Requiring a burst
+            // separates the two: a real freeze trips this within a second, an isolated
+            // hiccup never does.
             if (/Non-monoton(ous|ic) DTS in output stream/.test(s)) {
-                this.log.warn(`[prebuffer:${this.name}] muxer clamped a backward dts -- the ring's timeline is compromised; restarting reader`);
-                this.killChild();
+                const now = Date.now();
+                this.dtsClamps.push(now);
+                while (this.dtsClamps.length && now - this.dtsClamps[0] > DTS_CLAMP_WINDOW_MS) {
+                    this.dtsClamps.shift();
+                }
+                if (this.dtsClamps.length >= DTS_CLAMP_THRESHOLD) {
+                    this.log.warn(`[prebuffer:${this.name}] ${this.dtsClamps.length} dts clamps in ${DTS_CLAMP_WINDOW_MS / 1000}s -- the ring's timeline is frozen; restarting reader. Last: ${s.split("\n")[0]}`);
+                    this.dtsClamps = [];
+                    this.killChild();
+                    return;
+                }
+                // Below the burst threshold this only REPORTS. Never swallow the raw line:
+                // discarding it is exactly how the 4h53m poisoning stayed invisible, and the
+                // rate is the thing worth watching. Throttled so a chatty camera cannot
+                // flood the log -- upstairs emits isolated clamps every few minutes and every
+                // recording it fed still closed reason=0, so they are survivable and must not
+                // be treated as cause for a restart.
+                if (now - this.lastClampLogAt > CLAMP_LOG_THROTTLE_MS) {
+                    this.lastClampLogAt = now;
+                    this.log.warn(`[prebuffer:${this.name}] isolated dts clamp (${this.dtsClamps.length} in ${DTS_CLAMP_WINDOW_MS / 1000}s, threshold ${DTS_CLAMP_THRESHOLD}): ${s.split("\n")[0]}`);
+                }
                 return;
             }
             // Before this camera has EVER produced a fragment, ffmpeg's complaint is the
