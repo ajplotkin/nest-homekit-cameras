@@ -146,6 +146,15 @@ if gcloud projects describe "$PROJECT_ID" >/dev/null 2>&1; then
 else
   step "creating project '$PROJECT_ID'"
   run gcloud projects create "$PROJECT_ID" --name="$PROJECT_ID"
+  # Verify instead of assuming. Nothing here uses `set -e`, so a failed create would
+  # otherwise sail on and every later step would run against a project that does not
+  # exist -- reporting progress the whole way. Project IDs are unique across ALL of
+  # Google Cloud, so the common failure is a name a stranger already took, and
+  # `projects describe` cannot distinguish "taken by someone else" from "free":
+  # both answer "does not have permission ... (or it may not exist)".
+  if [ "$APPLY" = "1" ] && ! gcloud projects describe "$PROJECT_ID" >/dev/null 2>&1; then
+    fail "could not create project '$PROJECT_ID'. Project IDs are globally unique, so this one may be taken by another Google Cloud user, or your account may be at its project quota. Pick another and re-run with --project-id NEW_NAME."
+  fi
 fi
 run gcloud config set project "$PROJECT_ID"
 
@@ -164,6 +173,15 @@ for api in smartdevicemanagement.googleapis.com pubsub.googleapis.com; do
   else
     step "enabling $api"
     run gcloud services enable "$api" --project="$PROJECT_ID"
+    # Same reasoning as the project check: verify, because everything downstream
+    # (topic, IAM binding, subscription) depends on these and would fail one by one
+    # with less obvious errors. Enabling an API on a brand-new project is the step
+    # most likely to demand a billing account be linked -- which is free to attach
+    # and is not the $5 Device Access fee.
+    if [ "$APPLY" = "1" ] && ! gcloud services list --enabled --project="$PROJECT_ID" 2>/dev/null \
+         | awk -v a="$api" 'NR>1 && $1==a {f=1} END{exit !f}'; then
+      fail "enabled $api but it is still not listed. Usually this means the project needs a billing account linked: https://console.cloud.google.com/billing/linkedaccount?project=$PROJECT_ID (free to attach; separate from the \$5 Device Access fee). Link one and re-run."
+    fi
   fi
 done
 
