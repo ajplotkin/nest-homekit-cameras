@@ -15,10 +15,16 @@
 #   Automated : GCP project, SDM + Pub/Sub API enablement, topic, sdm-publisher IAM
 #               binding, pull subscription, the OAuth token exchange, and writing a
 #               ready-to-paste Homebridge config block.
-#   Manual    : the $5 Device Access registration, the OAuth consent screen, creating
-#               the OAuth client, linking the topic in the Device Access Console, and
-#               approving the authorization URL. All five need a browser and a human;
-#               the script walks you to the exact page and waits.
+#   Manual    : the $5 Device Access registration (which is also where you paste the
+#               Pub/Sub topic), the OAuth consent screen, creating the OAuth client,
+#               and approving the authorization URL. All four need a browser and a
+#               human; the script walks you to the exact page and waits.
+#
+#   ORDER MATTERS: the topic is created BEFORE the Device Access project, because the
+#   Device Access Console demands a Pub/Sub topic while you are creating the project
+#   and validates the format on the spot. PR #209 creates the project first and links
+#   the topic afterwards; following that order leaves you staring at a required field
+#   for a topic that does not exist yet. Hit for real on 2026-08-03.
 #
 # DIFFERENCES FROM PR #209
 #   1. Dry run by DEFAULT. Nothing is created until you pass --apply. Every gcloud
@@ -34,11 +40,16 @@
 #      rather than "create and ignore the error", so a re-run is quiet and honest.
 #
 # TESTING STATUS -- READ THIS
-#   The dry-run path, argument handling, prerequisite detection and the token-parsing
-#   logic are tested. THE LIVE GCP CALLS ARE NOT: they need a real Google account and
-#   a $5 registration, so they have never been executed by the author of this file.
-#   The sequence is the one from #209 and matches this guide's manual Part 1, which
-#   is known to work. Run with --dry-run first and read it.
+#   Tested against live Google Cloud accounts on 2026-08-03:
+#     - detection of an EXISTING project and already-enabled APIs (reused, not recreated)
+#     - detection on a CLEAN account (absent project/APIs/topic -> would create)
+#     - `services enable` for both APIs, `pubsub topics create`, the sdm-publisher IAM
+#       binding, and `pubsub subscriptions create` -- all executed for real and verified
+#     - dry-run, argument handling, exit codes, no-tty refusal, token-response parsing
+#       (including that an access_token is never echoed when refresh_token is absent)
+#   NOT yet executed end to end: `projects create` (the test account already had one)
+#   and the OAuth token exchange, which needs a completed $5 registration.
+#   Run with --dry-run first and read it.
 #
 # Usage:
 #   ./setup-google-device-access.sh [--apply] [--project-id ID] [--out FILE] [--help]
@@ -214,28 +225,7 @@ printf "  OAuth Client Secret: "; read -rs CLIENT_SECRET </dev/tty; echo
 step "OAuth client captured"
 
 # --------------------------------------------------------------- Device Access
-header "Step 5 — Device Access registration (\$5, one time)"
-manual "This cannot be automated: it takes a payment."
-cat <<EOF
-    1. https://console.nest.google.com/device-access
-    2. Accept the terms, pay the one-time \$5 fee
-    3. Create project -> paste the OAuth Client ID from Step 4
-    4. Enable events: YES
-    5. Copy the Device Access PROJECT ID -- a UUID like
-       32c4c2bc-fe0d-461b-b51c-f3885afff2f0
-EOF
-printf "\n  %sNote: this UUID is NOT your GCP project ID ('%s'). Mixing the two up%s\n" "$Y" "$PROJECT_ID" "$N"
-printf "  %sgives a 404 that the plugin reports only as 'initialization failed'.%s\n" "$Y" "$N"
-pause
-printf "  Device Access project ID (UUID): "; read -r SDM_PROJECT_ID </dev/tty
-[ -n "$SDM_PROJECT_ID" ] || fail "Device Access project ID is required"
-step "Device Access project: $SDM_PROJECT_ID"
-
-# -------------------------------------------------------------------- Pub/Sub
-# Projects created after January 2025 must self-host their topic; Google stopped
-# providing hosted ones (release notes 2025-01-23). Events only -- streaming works
-# without any of this.
-header "Step 6 — Pub/Sub topic and subscription"
+header "Step 5 — Pub/Sub topic and subscription"
 if gcloud pubsub topics describe "$TOPIC_NAME" --project="$PROJECT_ID" >/dev/null 2>&1; then
   step "topic '$TOPIC_NAME' already exists"
 else
@@ -258,17 +248,33 @@ else
       --ack-deadline=20 --message-retention-duration=1d
 fi
 
-header "Step 7 — link the topic to Device Access"
-manual "Google will not publish anything until the topic is registered there."
+header "Step 6 — Device Access registration (\$5, one time)"
+manual "This cannot be automated: it takes a payment."
 cat <<EOF
     1. https://console.nest.google.com/device-access
-    2. Open your project -> Pub/Sub topic
-    3. Set it to: projects/$PROJECT_ID/topics/$TOPIC_NAME
-EOF
-pause
+    2. Accept the terms, pay the one-time \$5 fee
+    3. Create project -> paste the OAuth Client ID from Step 4
+    4. Tick "Enable events", and paste this EXACT string into the PubSub topic box:
 
-# --------------------------------------------------------------------- tokens
-header "Step 8 — authorize and exchange for a refresh token"
+           projects/$PROJECT_ID/topics/$TOPIC_NAME
+
+       The console validates the format and rejects anything else, which is why the
+       topic is created in Step 5 -- before you need it, not after.
+    5. Copy the Device Access PROJECT ID -- a UUID like
+       32c4c2bc-fe0d-461b-b51c-f3885afff2f0
+EOF
+printf "\n  %sNote: this UUID is NOT your GCP project ID ('%s'). Mixing the two up%s\n" "$Y" "$PROJECT_ID" "$N"
+printf "  %sgives a 404 that the plugin reports only as 'initialization failed'.%s\n" "$Y" "$N"
+pause
+printf "  Device Access project ID (UUID): "; read -r SDM_PROJECT_ID </dev/tty
+[ -n "$SDM_PROJECT_ID" ] || fail "Device Access project ID is required"
+step "Device Access project: $SDM_PROJECT_ID"
+
+# -------------------------------------------------------------------- Pub/Sub
+# Projects created after January 2025 must self-host their topic; Google stopped
+# providing hosted ones (release notes 2025-01-23). Events only -- streaming works
+# without any of this.
+header "Step 7 — authorize and exchange for a refresh token"
 # BOTH scopes. sdm.service alone authenticates fine and then silently delivers no
 # events, which is a miserable thing to debug.
 SCOPES="https://www.googleapis.com/auth/sdm.service+https://www.googleapis.com/auth/pubsub"
@@ -299,7 +305,7 @@ if [ -z "$REFRESH_TOKEN" ]; then
   ERR="$(printf '%s' "$TOKEN_RESPONSE" | jq -r '[.error, .error_description] | map(select(.)) | join(": ") // empty')"
   warn "no refresh token in the response${ERR:+ — $ERR}"
   warn "The usual cause is re-authorizing a client that already has a grant."
-  warn "Revoke it at https://myaccount.google.com/permissions and run Step 8 again."
+  warn "Revoke it at https://myaccount.google.com/permissions and run Step 7 again."
   fail "could not obtain a refresh token"
 fi
 step "refresh token obtained (${REFRESH_TOKEN:0:12}...)"
