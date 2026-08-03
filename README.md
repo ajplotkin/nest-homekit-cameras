@@ -107,6 +107,37 @@ Google's docs cover this well. Here are the gotchas they don't emphasize:
 
 **Include the `pubsub` scope in your refresh token** if you want motion and doorbell notifications. The authorization URL should include both `https://www.googleapis.com/auth/sdm.service` and `https://www.googleapis.com/auth/pubsub`.
 
+
+**Publish the app, or your cameras break every 7 days.** This is the single most
+important thing on this page and Google does not warn you. While the OAuth consent
+screen's publishing status is **Testing** with user type **External**, Google
+[revokes refresh tokens after 7 days](https://developers.google.com/identity/protocols/oauth2#expiration).
+Everything works, then silently stops a week later. Set publishing status to **In
+production** (Google Auth Platform → Audience → *Publish app*).
+
+You will *not* pass Google verification and do not need to: SDM uses a **restricted**
+scope, so a personal project stays permanently "unverified". The only consequence is
+a **"Google hasn't verified this app"** interstitial when you authorize — click
+**Advanced → Go to *your app name* (unsafe)**. You are the developer, the user, and
+the only person who will ever see it.
+
+**Before publishing, add yourself as a Test User** or authorization fails outright
+with `Error 403: access_denied` — "can only be accessed by developer-approved
+testers". Google Auth Platform → Audience → Test users → add the same @gmail.com
+account that owns the cameras. Publishing removes this requirement, but the two
+settings live on the same page and it costs nothing to set both.
+
+**Create the Pub/Sub topic *before* the Device Access project.** The Device Access
+Console demands a topic the moment you tick "Enable events", validates the format on
+the spot (`projects/{project}/topics/{topic}`), and will not let you past the field.
+Create the topic, grant `sdm-publisher`, then register the Device Access project.
+Doing it the other way round leaves you at a mandatory field for something that does
+not exist yet.
+
+**You cannot re-read a client secret.** Google now shows only the last four
+characters and offers no download after creation. If you lose it, *add a second
+secret* on the OAuth client (this does not invalidate the first) and use that — the
+JSON it offers at creation time is the only copy you will ever get.
 ## Part 2: Homebridge and the Nest Plugin
 
 [Homebridge](https://homebridge.io/) bridges non-HomeKit devices into Apple Home. Install it following the [official guide](https://github.com/homebridge/homebridge/wiki) — Docker is the easiest path on a Pi.
