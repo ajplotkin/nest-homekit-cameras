@@ -155,7 +155,12 @@ class CameraBuffer {
             return;
         }
         const args = [
-            "-hide_banner", "-loglevel", "error",
+            // "warning", not "error": the mp4 muxer's "Non-monotonous DTS ... changing to
+            // prev+1" clamp is a WARNING, and that clamp is the only direct evidence that
+            // this reader's timeline has been poisoned by an upstream re-base. At "error" it
+            // is discarded, which is exactly how a 4h53m poisoning went unnoticed on
+            // 2026-08-03 -- and it would also make the stderr backstop below dead code.
+            "-hide_banner", "-loglevel", "warning",
             "-rtsp_transport", "tcp",
             // Die on a stalled socket instead of blocking forever. 15s is inside the ring's
             // retention, so a stall is normally recovered before history even goes stale.
@@ -252,6 +257,45 @@ class CameraBuffer {
         child.stderr.on("data", d => {
             const s = d.toString().trim();
             if (!s) {
+                return;
+            }
+            // A producer restart behind go2rtc splices a NEW RTP stream -- random sequence
+            // numbers AND random timestamp bases -- into this still-open RTSP session. Over
+            // TCP a cseq jump cannot be loss or reordering, so it can only mean the server
+            // switched sources underneath us. ffmpeg does not re-anchor: whichever track's
+            // new base lands AHEAD stays monotonic and is harmless, but a track landing
+            // BEHIND makes our own mp4 muxer clamp every later dts to prev+1. That clamp is
+            // a warning, so at the -loglevel error this reader used to run at it was thrown
+            // away silently (hence the loglevel change above). The ring then holds real
+            // audio on a FROZEN timeline, and every clip cut from it is rejected by the hub
+            // with reason=5 (UNEXPECTED_FAILURE).
+            //
+            // Measured 2026-08-03: a 04:26:43 splice poisoned front_door's ring for 4h53m.
+            // It was invisible until the first doorbell press at 08:19:57, which failed, as
+            // did HomeKit's retry 9s later -- a real person, missed entirely. All 12
+            // recordings before the splice closed reason=0 with zero timestamp warnings.
+            // Nothing detected or repaired it; it was cured only by luck, when a SECOND
+            // splice at 09:19 happened to stall the socket long enough to trip the 15s
+            // timeout and restart the reader.
+            //
+            // One reader run must equal one coherent timeline. Enforce that the moment the
+            // splice is visible: killChild() lets the exit handler wipe initSegment and
+            // fragments, drop in-flight consumers, and respawn in ~1s. The ring is
+            // unavailable for ~5-10s, during which createStream() returns null and a
+            // recording falls back to a direct go2rtc dial -- which costs the pre-trigger
+            // history for one event, against hours of silently poisoned clips.
+            if (/RTP: PT=\d+: bad cseq/.test(s)) {
+                this.log.warn(`[prebuffer:${this.name}] RTP discontinuity (${s.split("\n")[0]}); restarting reader to re-anchor the timeline`);
+                this.killChild();
+                return;
+            }
+            // Backstop for a timestamp re-base that arrives WITHOUT a cseq jump, which the
+            // rule above would never see. One clamped packet already means some servable
+            // window contains a backward step, so restarting is correct rather than merely
+            // cautious. ffmpeg 6 spells it "Non-monotonous"; 7+ says "Non-monotonic".
+            if (/Non-monoton(ous|ic) DTS in output stream/.test(s)) {
+                this.log.warn(`[prebuffer:${this.name}] muxer clamped a backward dts -- the ring's timeline is compromised; restarting reader`);
+                this.killChild();
                 return;
             }
             // Before this camera has EVER produced a fragment, ffmpeg's complaint is the
