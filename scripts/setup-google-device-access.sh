@@ -84,6 +84,28 @@ run() {
   fi
 }
 
+# This script is inherently interactive: five steps need a human in a browser, and
+# every value it cannot derive is read from /dev/tty (deliberately, so the prompts
+# still work when stdout is piped to a log).
+#
+# Without a controlling terminal those reads FAIL -- and a failed `read` is not
+# fatal, so the script would walk straight through every manual step collecting
+# empty strings and carry on as though the user had answered. Observed exactly that
+# on 2026-08-03: a non-interactive dry run went from "Press Enter when done..." to
+# Step 4 without pausing, and would have reached the token exchange with an empty
+# client ID. Refuse up front rather than half-run. (--help is handled above and
+# still works headless.)
+# Brace group, not a bare redirect: the "Device not configured" error comes from the
+# shell performing the redirection, before the command runs, so `: >/dev/tty 2>/dev/null`
+# still leaks it to the terminal ahead of the clean message below.
+if ! { : >/dev/tty; } 2>/dev/null; then
+  echo "ERROR: no controlling terminal." >&2
+  echo "This script is interactive -- the \$5 registration, the OAuth consent screen," >&2
+  echo "the OAuth client, linking the Pub/Sub topic and approving the authorization" >&2
+  echo "URL all need a browser and a human. Run it from a terminal." >&2
+  exit 1
+fi
+
 # ---------------------------------------------------------------- prerequisites
 header "Step 0 — prerequisites"
 for b in gcloud jq curl; do
