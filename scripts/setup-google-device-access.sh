@@ -268,6 +268,18 @@ printf "  %sgives a 404 that the plugin reports only as 'initialization failed'.
 pause
 printf "  Device Access project ID (UUID): "; read -r SDM_PROJECT_ID </dev/tty
 [ -n "$SDM_PROJECT_ID" ] || fail "Device Access project ID is required"
+# VALIDATE, do not merely warn. Two IDs are in play and they are easy to transpose;
+# warning about that in prose and then accepting anything is worse than useless,
+# because the mistake surfaces later as a broken authorization URL that 404s with no
+# explanation. Observed for real on 2026-08-03: an OAuth client ID pasted here was
+# accepted and silently produced a dead auth URL.
+case "$SDM_PROJECT_ID" in
+  *.apps.googleusercontent.com|*apps.googleusercontent.com)
+    fail "that is your OAuth CLIENT ID, not the Device Access project ID. The one you want is a UUID shown in the Device Access Console (console.nest.google.com/device-access) after the project is created." ;;
+esac
+if ! printf '%s' "$SDM_PROJECT_ID" | grep -qiE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+  fail "'$SDM_PROJECT_ID' is not a UUID. The Device Access project ID looks like 32c4c2bc-fe0d-461b-b51c-f3885afff2f0 and is shown in the Device Access Console. It is NOT the GCP project ID ('$PROJECT_ID') and NOT the OAuth client ID."
+fi
 step "Device Access project: $SDM_PROJECT_ID"
 
 # -------------------------------------------------------------------- Pub/Sub
