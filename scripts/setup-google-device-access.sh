@@ -47,8 +47,10 @@
 #       binding, and `pubsub subscriptions create` -- all executed for real and verified
 #     - dry-run, argument handling, exit codes, no-tty refusal, token-response parsing
 #       (including that an access_token is never echoed when refresh_token is absent)
-#   NOT yet executed end to end: `projects create` (the test account already had one)
-#   and the OAuth token exchange, which needs a completed $5 registration.
+#   Also verified 2026-08-03 on a second, freshly registered account: the authorization
+#   URL (both scopes), the code -> refresh-token exchange, refresh -> access token, and
+#   an SDM devices call that returned real cameras. So every step except one is proven.
+#   NOT yet executed: `projects create` -- both test accounts already had a project.
 #   Run with --dry-run first and read it.
 #
 # Usage:
