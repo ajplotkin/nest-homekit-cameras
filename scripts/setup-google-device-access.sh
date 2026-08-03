@@ -128,8 +128,16 @@ fi
 run gcloud config set project "$PROJECT_ID"
 
 header "Step 2 — enable the APIs"
+# Matched against the DEFAULT table output (first column is the service name)
+# rather than a --format projection. `--format='value(config.name)'` looked right,
+# but gcloud validates format strings only after authenticating, so an unauthenticated
+# check cannot tell a good projection from a typo -- a deliberately bogus field
+# errored identically. An unverifiable projection that silently yields nothing would
+# make this branch claim "enabling" forever and never report "already enabled".
+# awk with an exact field match avoids both the guess and grep's regex dots.
 for api in smartdevicemanagement.googleapis.com pubsub.googleapis.com; do
-  if gcloud services list --enabled --project="$PROJECT_ID" --format='value(config.name)' 2>/dev/null | grep -qx "$api"; then
+  if gcloud services list --enabled --project="$PROJECT_ID" 2>/dev/null \
+       | awk -v a="$api" 'NR>1 && $1==a {found=1} END{exit !found}'; then
     step "$api already enabled"
   else
     step "enabling $api"
