@@ -52,6 +52,10 @@ patches=(
   "Api.js.patch|dist/sdm/Api.js|subscribeToEvents"
   "StreamingDelegate.js.patch|dist/StreamingDelegate.js|go2rtcKey"
   "HksvStreamer.js.patch|dist/HksvStreamer.js|SIGKILL"
+  # Not under dist/: this is the Homebridge Config UI schema at the plugin root.
+  # Without it the hksvPrebuffer* keys work at runtime (config.json is read directly)
+  # but are invisible and uneditable in the UI, so nobody discovers the feature.
+  "config.schema.json.patch|config.schema.json|hksvPrebufferSeconds"
 )
 
 # New files, copied rather than patched. Must land BEFORE the patches that require them,
@@ -104,7 +108,13 @@ if [ "$failed" = 1 ]; then
   exit 1
 fi
 if [ "$applied" = 1 ]; then
-  echo "Done. Restart Homebridge:  docker restart $CONTAINER"
+  echo "Done. Reload the plugin WITHOUT restarting the container:"
+  echo "    docker exec $CONTAINER pkill -x homebridge"
+  echo
+  echo "  Do NOT run 'docker restart $CONTAINER'. The image reinstalls plugins on"
+  echo "  container start, which deletes every patch just applied -- including"
+  echo "  dist/PrebufferManager.js. Killing the homebridge process instead lets s6"
+  echo "  respawn it in place: new code is loaded, the patches survive."
 else
   echo "All patches already present; nothing to do."
 fi

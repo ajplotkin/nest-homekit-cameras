@@ -477,11 +477,15 @@ The script pins the plugin version it was cut against (**1.1.24**) and **refuses
 
 ## Part 5: Verify
 
-Restart Homebridge to load the patched plugin. (If you added the snapshot mount in the previous step, you already recreated the container — that counts.)
+Reload Homebridge to pick up the patched plugin.
 
 ```bash
-docker restart homebridge
+docker exec homebridge pkill -x homebridge
 ```
+
+> **Do not use `docker restart` here.** The Homebridge image reinstalls plugins on container start, which deletes every patch you just applied — `dist/PrebufferManager.js` disappears entirely and the cameras silently revert to stock behaviour, with no error anywhere. Killing the `homebridge` process instead lets s6 respawn it in place: the new code is loaded and the patches survive. Verified the hard way on 2026-08-06.
+>
+> If you *did* just recreate the container for the snapshot mount, that recreation also wiped the patches — re-run `apply-snapshot-patch.sh` afterwards, then reload with the command above.
 
 After about 30 seconds:
 

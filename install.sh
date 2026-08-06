@@ -236,7 +236,7 @@ else
   ok "HKSV prebuffer is enabled in $HB_CONFIG"
 fi
 echo
-say "Done. RESTART HOMEBRIDGE NOW, then open Apple Home — tiles should show real images within a minute."
+say "Done. Reload Homebridge with:  $DOCKER exec $HB_CONTAINER pkill -x homebridge   (NOT docker restart -- that reinstalls plugins and wipes the patches). Then open Apple Home; tiles should show real images within a minute."
 # The plugin patches land in dist/ on disk; the running process is still executing the code it
 # loaded at startup. If phase 5 did not have to recreate the container (snapshot mount already
 # present), nothing has restarted it, and tiles sit on the placeholder while everything reports
