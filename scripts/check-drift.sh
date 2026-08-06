@@ -16,7 +16,13 @@
 #   ./check-drift.sh --host pi --homebridge /home/pi/volumes/homebridge \
 #                    --scripts /home/pi/scripts
 #
+# With --host the install locations are resolved ON THE REMOTE (~/volumes/homebridge,
+# ~/homebridge, /var/lib/homebridge are probed in that order), so --homebridge and
+# --scripts are only needed for a non-standard layout.
+#
 # Exit: 0 = in sync, 1 = drift found, 2 = could not check.
+# A run that compared nothing exits 2, never 0: "in sync" over zero comparisons is
+# the one answer this script must never give.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,11 +44,6 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Defaults differ local vs remote only in the usual install locations.
-HB_DIR="${HB_DIR:-${HOMEBRIDGE_DIR:-$HOME/homebridge}}"
-SCRIPTS_DIR="${SCRIPTS_DIR:-$HOME/scripts}"
-PLUGIN_DIR="$HB_DIR/node_modules/homebridge-google-nest-sdm"
-
 [ -d "$REPO_DIR/scripts" ] || { echo "ERROR: no repo at $REPO_DIR (use --repo)"; exit 2; }
 
 # --- remote/local plumbing ------------------------------------------------
@@ -57,10 +58,39 @@ rfetch() {  # $1=remote path  $2=local dest; silent failure means "not deployed"
   else [ -f "$1" ] && cp "$1" "$2" 2>/dev/null; fi
 }
 
+# --- where the deployment lives -------------------------------------------
+# These MUST be resolved where the deployment is, not here. Defaulting to the
+# local $HOME under --host silently built Mac paths, checked them on the Pi,
+# found nothing, and still exited 0 — a false clean, which is precisely the
+# failure this script exists to catch. Probe instead of assuming: the Pi keeps
+# its Homebridge volume at ~/volumes/homebridge, a plain install uses
+# ~/homebridge, and the Debian package uses /var/lib/homebridge.
+BASE_HOME="$HOME"
+if [ -n "$HOST" ]; then
+  BASE_HOME="$(rexec 'echo $HOME' 2>/dev/null | tr -d '\r')"
+  [ -n "$BASE_HOME" ] || {
+    echo "ERROR: could not resolve \$HOME on $HOST (ssh failed?); pass --homebridge and --scripts"; exit 2; }
+fi
+
+if [ -z "$HB_DIR" ] && [ -z "${HOMEBRIDGE_DIR:-}" ]; then
+  for cand in "$BASE_HOME/volumes/homebridge" "$BASE_HOME/homebridge" /var/lib/homebridge; do
+    if rexec "[ -d '$cand/node_modules/homebridge-google-nest-sdm' ]" 2>/dev/null; then
+      HB_DIR="$cand"; break
+    fi
+  done
+fi
+HB_DIR="${HB_DIR:-${HOMEBRIDGE_DIR:-$BASE_HOME/homebridge}}"
+SCRIPTS_DIR="${SCRIPTS_DIR:-$BASE_HOME/scripts}"
+PLUGIN_DIR="$HB_DIR/node_modules/homebridge-google-nest-sdm"
+
 RED=$'\033[31m'; GRN=$'\033[32m'; YEL=$'\033[33m'; DIM=$'\033[2m'; OFF=$'\033[0m'
 [ -t 1 ] || { RED=""; GRN=""; YEL=""; DIM=""; OFF=""; }
 
-drift=0; missing=0; checked=0
+# `checked` counts comparisons ATTEMPTED; `verified` counts those that actually
+# read both sides. Only the second can support a clean verdict — a run where every
+# fetch failed still increments `checked`, which is how a wrong --homebridge path
+# printed "in sync" over zero real comparisons.
+drift=0; missing=0; checked=0; verified=0
 
 compare() {  # $1=label  $2=repo-relative path  $3=deployed absolute path
   local label="$1" repo="$REPO_DIR/$2" dep="$3" tmp="$WORK/$(echo "$1" | tr '/ ' '__')"
@@ -71,6 +101,7 @@ compare() {  # $1=label  $2=repo-relative path  $3=deployed absolute path
   if ! rfetch "$dep" "$tmp" || [ ! -s "$tmp" ]; then
     printf "  %-34s %snot deployed%s %s(%s)%s\n" "$label" "$YEL" "$OFF" "$DIM" "$dep" "$OFF"; missing=$((missing+1)); return
   fi
+  verified=$((verified + 1))
   if cmp -s "$repo" "$tmp"; then
     printf "  %-34s %sin sync%s\n" "$label" "$GRN" "$OFF"
   else
@@ -175,6 +206,16 @@ fi
 echo
 
 # --- verdict --------------------------------------------------------------
+# Nothing readable is NOT a clean bill of health. Reporting "in sync" after
+# comparing zero artifacts is how a wrong --homebridge path reads as success.
+if [ "$verified" -eq 0 ]; then
+  echo "${RED}Nothing could be checked.${OFF} $missing path(s) unreadable under:"
+  echo "  homebridge: $HB_DIR"
+  echo "  scripts:    $SCRIPTS_DIR"
+  echo "Pass --homebridge / --scripts if the deployment lives elsewhere."
+  exit 2
+fi
+
 if [ "$drift" -eq 0 ] && [ "$missing" -eq 0 ]; then
   echo "${GRN}Everything checked is in sync.${OFF} ($checked artifacts)"
   exit 0
