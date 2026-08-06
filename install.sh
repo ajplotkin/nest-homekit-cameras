@@ -131,7 +131,14 @@ done
 ok "sync + warmer installed"
 
 say "Generate go2rtc.yaml from your Homebridge credentials"
-run "python3 '$SCRIPTS_DIR/nest-go2rtc-sync.py' --hb-config '$HB_CONFIG' --out '$GO2RTC_DIR/go2rtc.yaml' --container '$GO2RTC_CONTAINER'"
+# --no-restart: the container is created a few lines below and reads this file on
+# startup, so there is nothing to restart yet. Without the flag, the sync script's
+# `docker restart` fails on a fresh machine, exits 1, and takes this whole installer
+# down with it under `set -euo pipefail` -- leaving go2rtc unstarted, the warmer
+# service uninstalled and the plugin unpatched, behind a message that reads like a
+# go2rtc problem. (A second run appeared to work only because an unchanged config
+# short-circuits before the restart.)
+run "python3 '$SCRIPTS_DIR/nest-go2rtc-sync.py' --hb-config '$HB_CONFIG' --out '$GO2RTC_DIR/go2rtc.yaml' --container '$GO2RTC_CONTAINER' --no-restart"
 run "chmod 600 '$GO2RTC_DIR/go2rtc.yaml' || true"   # contains the OAuth secret
 ok "wrote $GO2RTC_DIR/go2rtc.yaml (chmod 600)"
 

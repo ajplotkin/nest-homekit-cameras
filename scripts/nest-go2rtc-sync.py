@@ -47,6 +47,12 @@ ap.add_argument("--log-level", default=None,
                 help="go2rtc log level to write (trace/debug/info/warn/error). "
                      "Default: keep the level already in --out, or 'info' for a new file. "
                      "Without this the regenerated config would silently reset a level you set by hand.")
+ap.add_argument("--no-restart", action="store_true",
+                help="Write the config but do not restart the container, and do not fail "
+                     "if it is absent. For first-run installs, where this script legitimately "
+                     "runs BEFORE the container exists and the caller starts it immediately "
+                     "afterwards. Without this the missing-container restart failure exits 1 "
+                     "and aborts an install.sh running under `set -e`.")
 ap.add_argument("--dry-run", action="store_true")
 a = ap.parse_args()
 
@@ -109,14 +115,27 @@ _fd = os.open(_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(_fd, "w") as _f:
     _f.write(out)
 os.replace(_tmp, a.out)
+if a.no_restart:
+    # The caller owns the container's lifecycle this run (first install: it is created
+    # moments from now, and will read this file on startup). Restarting here is not
+    # merely unnecessary, it is impossible -- and its failure would abort the caller.
+    print(f"config changed -> wrote {a.out}; not restarting {a.container} (--no-restart)")
+    sys.exit(0)
+
 print(f"config changed -> wrote {a.out}; restarting {a.container}")
 # Do NOT discard this. A user who needs `sudo docker` would otherwise see
 # "restarting go2rtc" while go2rtc kept serving the OLD config -- new cameras
 # never get warm streams, with no error anywhere.
-_r = subprocess.run(["docker", "restart", a.container], check=False,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-if _r.returncode != 0:
+try:
+    _r = subprocess.run(["docker", "restart", a.container], check=False,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    _rc = _r.returncode
     _e = (_r.stderr or b"").decode("utf-8", "replace").strip()
-    print(f"WARNING: could not restart {a.container} (exit {_r.returncode}): {_e}")
+except FileNotFoundError:
+    # No docker on PATH at all. Without this the script dies on an uncaught
+    # FileNotFoundError traceback, which buries the one line the user needs.
+    _rc, _e = 127, "docker not found on PATH"
+if _rc != 0:
+    print(f"WARNING: could not restart {a.container} (exit {_rc}): {_e}")
     print("         go2rtc is STILL RUNNING THE OLD CONFIG -- restart it yourself.")
     sys.exit(1)
