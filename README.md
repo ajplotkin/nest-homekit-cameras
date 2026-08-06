@@ -6,7 +6,7 @@ This is harder than it should be. Google does not offer Nest cameras through Hom
 
 This guide walks through the full setup from scratch: getting API access to your Nest cameras, bridging them into HomeKit, and then solving the snapshot problem by keeping a warm stream and serving frames from it. By the end you'll have:
 
-- **Real camera images on your HomeKit tiles** — refreshed every 10 seconds, and instantly on motion or doorbell events (so the tile shows *who's there*, not a stale frame)
+- **Real camera images on your HomeKit tiles** — refreshed every 10 seconds, and instantly on motion/person events (so the tile shows *who's there*, not a stale frame)
 - **~2 second live stream startup** — down from ~8 seconds stock (on the plugin's direct dial; the optional RTSP routing in [Part 6](#part-6-route-live-view-and-recording-through-go2rtc) trades a little of that for consistency)
 - **Motion and doorbell event notifications** in Apple Home
 - **HomeKit Secure Video recording** — motion-triggered clips saved to iCloud also work through this setup (confirmed on a Pi 4; no hardware encoder is needed — and as of the copy change below, recording does not re-encode at all). Requires iCloud+ and a Home Hub, like any HKSV camera.
@@ -42,7 +42,7 @@ There are four layers. Each builds on the last:
 
 3. **[go2rtc](https://github.com/AlexxIT/go2rtc)** (patched) — go2rtc (by [@AlexxIT](https://github.com/AlexxIT)) keeps a stream warm per camera, which is what makes real tile images possible. Part 3 covers it, including the one-line patch many home networks need.
 
-4. **Snapshot warmer + plugin patches** — A small script that pulls a JPEG from each warm stream every 10 seconds (and immediately on motion/doorbell events), plus a patch to the Homebridge plugin that serves those images instead of the placeholder. This is the glue that connects go2rtc's capabilities to your HomeKit tiles.
+4. **Snapshot warmer + plugin patches** — A small script that pulls a JPEG from each warm stream every 10 seconds (and immediately on motion/person events), plus a patch to the Homebridge plugin that serves those images instead of the placeholder. This is the glue that connects go2rtc's capabilities to your HomeKit tiles.
 
 ## Start here — find your row
 
@@ -205,7 +205,10 @@ This is the piece that makes real snapshots possible: keep one stream warm per c
 
 ### The IPv6 bug
 
-> The fork also adds Google's public STUN server (`stun:stun.l.google.com:19302`) to the PeerConnection > config, where stock go2rtc passes none. That changes ICE candidate gathering and means the host will > contact a Google STUN endpoint when negotiating a Nest stream. Noted because it is a functional change > beyond the udp4 filter.
+> The fork also adds Google's public STUN server (`stun:stun.l.google.com:19302`) to the PeerConnection
+> config, where stock go2rtc passes none. That changes ICE candidate gathering and means the host will
+> contact a Google STUN endpoint when negotiating a Nest stream. Noted because it is a functional change
+> beyond the udp4 filter.
 
 **Stock go2rtc (v1.9.14 as of this writing) cannot stream Nest cameras on many home networks.** Its `nest:` source uses [pion/webrtc](https://github.com/pion/webrtc) for WebRTC negotiation, and pion gathers ICE candidates on all network types including IPv6. On hosts where IPv6 addresses exist but have no working route — which is extremely common — the ICE agent fails silently and no media flows. You'll see `nest: wrong status: 400 Bad Request` in the logs or streams that start but never produce video.
 
@@ -513,7 +516,11 @@ To make that automatic, run a one-shot unit on a `systemd` **timer** (`OnBootSec
 
 ## Part 6: route live view and recording through go2rtc
 
-> **Not actually optional once you patch.** `apply-snapshot-patch.sh` has no per-patch switch, and the > routing is unconditional — `useGo2rtc` is true for every camera that has a name, which is all of them. > So after patching, a Homebridge whose go2rtc is missing, stopped, or serving different stream names > **loses live view and all HKSV recording**, because ffmpeg dials `rtsp://127.0.0.1:8554/<key>` and fails. > If you only want snapshot tiles, stop after Part 4 and do not run the patch script.
+> **Not actually optional once you patch.** `apply-snapshot-patch.sh` has no per-patch switch, and the
+> routing is unconditional — `useGo2rtc` is true for every camera that has a name, which is all of them.
+> So after patching, a Homebridge whose go2rtc is missing, stopped, or serving different stream names
+> **loses live view and all HKSV recording**, because ffmpeg dials `rtsp://127.0.0.1:8554/<key>` and fails.
+> If you only want snapshot tiles, stop after Part 4 and do not run the patch script.
 
 By default `homebridge-google-nest-sdm` opens its **own** WebRTC connection to Google every time you tap a camera tile — separate from the warm stream go2rtc is already holding. That means 2–3 concurrent Google streams per camera (go2rtc's preload + each HomeKit view + the Google Home app). Nest enforces a concurrent-stream limit, and hitting it is what causes tiles that hang for many seconds or "never load."
 
@@ -1046,4 +1053,4 @@ or the box may be ahead and carrying an undeployed hotfix (commit it).
 
 ## License
 
-go2rtc is [MIT licensed](https://github.com/AlexxIT/go2rtc/blob/master/LICENSE). This fork carries a small set of Nest-focused patches: IPv4-only ICE in `pkg/nest/client.go`; keyframe-request, `sprop-parameter-sets`, and a stall watchdog in `pkg/webrtc/conn.go`; and stream-extension resilience in `pkg/nest/api.go`. It also incorporates the community PRs credited above. Only the `pkg/webrtc/conn.go` additions are gated to the Nest source (`FormatName == "nest/webrtc"`). The rest are **not** Nest-specific and affect any source that exercises them: `pkg/h264/rtp.go` (partition-head sync — every H264 RTP source), `internal/streams/preload.go` (preload retry), `internal/mjpeg/mjpeg.go` and `internal/mp4/mp4.go` (consumer reaping), `internal/ffmpeg/jpeg.go` (stderr surfacing), `pkg/core/writebuffer.go`, and `pkg/homekit/helpers.go`. They are bug fixes rather than Nest behaviour changes — three are upstream PRs (#2368/#2378/#2380) — but if you run other sources through this fork, know that they are in the path.
+go2rtc is [MIT licensed](https://github.com/AlexxIT/go2rtc/blob/master/LICENSE). This fork carries a small set of Nest-focused patches: IPv4-only ICE in `pkg/nest/client.go`; keyframe-request, `sprop-parameter-sets`, and a stall watchdog in `pkg/webrtc/conn.go`; and stream-extension resilience in `pkg/nest/api.go`. It also incorporates the community PRs credited above. Only the `pkg/webrtc/conn.go` additions are gated to the Nest source (`FormatName == "nest/webrtc"`). The rest are **not** Nest-specific and affect any source that exercises them: `pkg/h264/rtp.go` (partition-head sync — every H264 RTP source), `pkg/h264/h264.go` (`GetFmtpLine` bounds guards — likewise every H264 source), `internal/streams/preload.go` (preload retry), `internal/streams/producer.go` (a debug line when a producer ends without an error), `internal/mjpeg/mjpeg.go` and `internal/mp4/mp4.go` (consumer reaping), `internal/ffmpeg/jpeg.go` (stderr surfacing), `pkg/core/writebuffer.go` and its new `pkg/core/writebuffer_test.go`, and `pkg/homekit/helpers.go`. That is the full set — 13 files, the same 13 the patch touches. They are bug fixes rather than Nest behaviour changes — three are upstream PRs (#2368/#2378/#2380) — but if you run other sources through this fork, know that they are in the path.

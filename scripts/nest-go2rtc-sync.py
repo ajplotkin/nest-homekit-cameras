@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Regenerate ~/go2rtc2/go2rtc.yaml from live SDM device discovery, so every Nest camera
+Regenerate ~/go2rtc-nest/go2rtc.yaml from live SDM device discovery, so every Nest camera
 (including ones added/powered on later) gets a warm stream + snapshot automatically.
 
 Credentials are read from Homebridge's own config.json -- single source of truth, no

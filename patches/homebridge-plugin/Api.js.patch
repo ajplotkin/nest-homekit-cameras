@@ -47,7 +47,7 @@
 +                clearTimeout(this.recycleTimer);
 +                // A deliberate 12h recycle is healthy, not a failure: use a short fixed gap and do
 +                // NOT ratchet the backoff or the failure counter. Otherwise an idle camera's recycle
-+                // gap would grow past the 30s event-freshness window and silently drop events that
++                // gap would grow past the 120s event-freshness window and silently drop events that
 +                // Pub/Sub redelivers on re-subscribe.
 +                const recycle = reason === 'periodic recycle';
 +                const delay = recycle ? SmartDeviceManagement.RECYCLE_DELAY_MS : this.reconnectDelay;

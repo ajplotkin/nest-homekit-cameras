@@ -236,5 +236,9 @@ else
   ok "HKSV prebuffer is enabled in $HB_CONFIG"
 fi
 echo
-say "Done. Open Apple Home — tiles should show real images within a minute."
+say "Done. RESTART HOMEBRIDGE NOW, then open Apple Home — tiles should show real images within a minute."
+# The plugin patches land in dist/ on disk; the running process is still executing the code it
+# loaded at startup. If phase 5 did not have to recreate the container (snapshot mount already
+# present), nothing has restarted it, and tiles sit on the placeholder while everything reports
+# success. Saying this at the end is cheaper than the support question it prevents.
 [ "$MOUNTED" = 0 ] && warn "…once you add the snapshot bind mount to Homebridge (see above)."

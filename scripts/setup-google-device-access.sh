@@ -69,7 +69,7 @@ while [ $# -gt 0 ]; do
     --dry-run)    APPLY=0; shift ;;
     --project-id) PROJECT_ID="$2"; shift 2 ;;
     --out)        OUT="$2"; shift 2 ;;
-    -h|--help)    sed -n '2,46p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help)    sed -n '2,57p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *)            echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done

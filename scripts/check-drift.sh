@@ -39,7 +39,7 @@ while [ $# -gt 0 ]; do
     --homebridge)  HB_DIR="$2"; shift 2 ;;
     --scripts)     SCRIPTS_DIR="$2"; shift 2 ;;
     --deep)        DEEP=1; shift ;;
-    -h|--help)     sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help)     sed -n '2,25p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *)             echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
