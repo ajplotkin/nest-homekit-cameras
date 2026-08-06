@@ -189,6 +189,49 @@ if [ "$DEEP" = "1" ]; then
   echo
 fi
 
+# --- 2b. deployed-but-not-loaded ------------------------------------------
+# Everything above compares BYTES ON DISK. Node reads its modules once, at startup,
+# so a dist/ file newer than the running Homebridge process is deployed and NOT
+# executing -- and every check above still says "in sync". That is the failure this
+# whole script exists to make impossible, and it had a live instance on 2026-08-06:
+# dist/sdm/Api.js was installed at 17:26 while the process had been up since Aug 3,
+# seven minutes after a commit that added a "restart Homebridge" warning elsewhere.
+# It was comment-only that time. Next time it will not be.
+echo "Deployed but not loaded (on-disk newer than the running process)"
+# Match the process whose command IS homebridge, not merely anything mentioning it.
+# `pgrep -f homebridge | head -1` picks whatever has the lowest pid, which on this Pi
+# was `tail -f --follow=name /homebridge/homebridge.log` — a log tailer restarted
+# minutes ago. That reported "all loaded" over a bridge that had actually been up for
+# three days, i.e. this check's own false clean, on its first run. `pgrep -x` matches
+# the executable name exactly, which also excludes the two `s6-supervise homebridge`
+# supervisors.
+HB_PID="$(rexec "pgrep -x homebridge 2>/dev/null | head -1" | tr -d '\r')"
+HB_START="$([ -n "$HB_PID" ] && rexec "ps -o lstart= -p $HB_PID 2>/dev/null" | tr -d '\r' | sed 's/^ *//')"
+if [ -z "$HB_START" ]; then
+  printf "  %-34s %scannot determine%s — is Homebridge running?\n" "process age" "$YEL" "$OFF"
+  missing=$((missing+1))
+else
+  HB_EPOCH="$(rexec "date -d '$HB_START' +%s 2>/dev/null" | tr -d '\r')"
+  if [ -z "$HB_EPOCH" ]; then
+    printf "  %-34s %scannot parse start time%s (%s)\n" "process age" "$YEL" "$OFF" "$HB_START"
+    missing=$((missing+1))
+  else
+    NEWER="$(rexec "find '$PLUGIN_DIR/dist' -name '*.js' -newermt '@$HB_EPOCH' 2>/dev/null | sed 's|.*/dist/||' | sort | tr '\n' ' '")"
+    NEWER="$(echo "$NEWER" | tr -d '\r' | sed 's/ *$//')"
+    if [ -n "$NEWER" ]; then
+      printf "  %-34s %sSTALE IN MEMORY%s  %s\n" "running process" "$RED" "$OFF" "$NEWER"
+      printf "      %sThose files are on disk but were installed AFTER Homebridge started\n" "$DIM"
+      printf "      (%s). The running code does not include them.\n" "$HB_START"
+      printf "      Restart Homebridge, or accept that they land on the next restart.%s\n" "$OFF"
+      drift=$((drift + 1))
+    else
+      printf "  %-34s %sall loaded%s %s(process up since %s)%s\n" "running process" "$GRN" "$OFF" "$DIM" "$HB_START" "$OFF"
+    fi
+    verified=$((verified + 1))
+  fi
+fi
+echo
+
 # --- 3. landmines: stale whole-file patch blobs ---------------------------
 # The repo shipped whole-file copies until 2026-07-19 (446b29f) and then moved
 # to unified diffs, precisely because pasting a stale whole file reverts

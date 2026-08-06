@@ -157,6 +157,16 @@ const check = (name, ok, detail) => {
         duration > (liveElapsed / 1000) + 2,
         `${duration}s vs ${(liveElapsed / 1000).toFixed(1)}s live -> ~${(duration - liveElapsed / 1000).toFixed(1)}s recovered`);
 
+    // Upper bound, and it is not redundant. The lower bound alone is satisfied by a ring
+    // that IGNORES the anchor and dumps its entire retention -- which would look like a
+    // pass while silently serving minutes-old footage as if it were the trigger moment.
+    // We asked for ANCHOR_BACK_MS of history over a LIVE_WINDOW_MS recording, so anything
+    // beyond that plus a fragment of slack means `history(sinceEpochMs)` did not filter.
+    const expectedMax = (ANCHOR_BACK_MS + LIVE_WINDOW_MS) / 1000 + 4;
+    check('clip is not LONGER than requested (anchor was honoured)',
+        duration <= expectedMax,
+        `${duration}s vs ${expectedMax}s max (ring retains ${20}s, so an unanchored dump would exceed this)`);
+
     // Consumers must be released, or a dead recording pins the ring open.
     const after = mgr.stats()[KEY];
     check('consumer released on destroy', after.subscribers === 0, `${after.subscribers} subscriber(s) still attached`);
