@@ -328,10 +328,22 @@ step "refresh token obtained (${REFRESH_TOKEN:0:12}...)"
 # credential for your cameras.
 umask 077
 TMP="$(mktemp "${OUT}.XXXXXX")"
+# `platform` MUST be the full plugin name. homebridge-google-nest-sdm registers
+# PLATFORM_NAME = 'homebridge-google-nest-sdm' (src/Settings.ts, and pluginAlias in
+# its config.schema.json), so a shortened "google-nest-sdm" is silently never loaded
+# by Homebridge -- every credential correct, no cameras, no error. install.sh's
+# preflight and nest-go2rtc-sync.py both look for the full name too, so they then
+# fail with "no homebridge-google-nest-sdm platform in the config", which points at
+# the config rather than at this line that wrote it.
+#
+# gcpProjectId is the CLOUD project (distinct from the Device Access project id) and
+# is what the plugin uses to build the Pub/Sub subscription path; vEncoder:"copy"
+# matches the guide's example config, which assumes go2rtc is doing the work.
 jq -n --arg ci "$CLIENT_ID" --arg cs "$CLIENT_SECRET" --arg pid "$SDM_PROJECT_ID" \
+      --arg gcp "$PROJECT_ID" \
       --arg rt "$REFRESH_TOKEN" --arg sub "projects/$PROJECT_ID/subscriptions/$SUBSCRIPTION_NAME" \
-  '{platform:"google-nest-sdm", clientId:$ci, clientSecret:$cs, projectId:$pid,
-    refreshToken:$rt, subscriptionId:$sub}' > "$TMP"
+  '{platform:"homebridge-google-nest-sdm", clientId:$ci, clientSecret:$cs, projectId:$pid,
+    gcpProjectId:$gcp, refreshToken:$rt, subscriptionId:$sub, vEncoder:"copy"}' > "$TMP"
 mv -f "$TMP" "$OUT"
 chmod 600 "$OUT"
 
