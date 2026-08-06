@@ -22,7 +22,7 @@ This guide walks through the full setup from scratch: getting API access to your
 - **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches), `setup-google-device-access.sh` (automates Part 1 — the Google Cloud half of the credentials setup), and `check-drift.sh` (read-only; proves your deployment still matches this repo — see [Checking for drift](#checking-for-drift)).
 - **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), four plugin diffs against stock 1.1.24 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`), and `homebridge-plugin/new-files/PrebufferManager.js` (a new file, copied in rather than patched — it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)).
 
-The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-4)** — build from the stable tag **`nestfix-1.9.14-4`** (development happens on the `fix/nest-ipv6-ice-failure` branch, which may carry in-progress work, so don't build from the branch.). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
+The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-5)** — build from the stable tag **`nestfix-1.9.14-5`** (development happens on the `fix/nest-ipv6-ice-failure` branch, which may carry in-progress work, so don't build from the branch.). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
 
 Two things worth calling out for anyone arriving because their recordings are unreliable:
 **HKSV clips from the stock plugin are silent** (an `-an` overrides the whole audio block —
@@ -227,10 +227,12 @@ The fork also removes an inner retry loop in `rtcConn` that burned ~130 SDM API 
 ```bash
 git clone https://github.com/ajplotkin/go2rtc.git
 cd go2rtc
-git checkout nestfix-1.9.14-4   # stable tag — not the dev branch
+git checkout nestfix-1.9.14-5   # stable tag — not the dev branch
 ```
 
 > **Prefer to patch stock go2rtc yourself?** Instead of cloning the fork, check out upstream go2rtc at the `v1.9.14` tag and apply [`patches/go2rtc-nest.patch`](patches/go2rtc-nest.patch) from this repo (`git clone https://github.com/AlexxIT/go2rtc && cd go2rtc && git checkout v1.9.14 && git apply /path/to/go2rtc-nest.patch`), then run the same build command below. The diff is the exact set of source changes described in this guide, plus the credited community PRs.
+>
+> **The two routes do not produce identical binaries.** The patch is a clean diff against `v1.9.14`, but the fork is branched from upstream `master` at [`c245815`](https://github.com/AlexxIT/go2rtc/commit/c245815) — v1.9.14 plus 70 upstream commits — so the fork tree differs from `v1.9.14` in 107 files while this patch touches 13. Within those 13 the two routes agree exactly; everywhere else the fork carries upstream work that `v1.9.14` does not. Build from the fork if you want what is actually running here; patch `v1.9.14` if you want a minimal, auditable delta from a released version.
 
 ```bash
 # Build natively on a Pi (arm64, ~3 min). On a 2 GB Pi this can exhaust RAM and take
@@ -983,6 +985,15 @@ It reports three things:
 - **Stale whole-file patch blobs** — this repo shipped whole-file copies before 2026-07-19 and
   moved to unified diffs precisely because pasting a stale whole file silently reverts everything
   done since. Any surviving `*.patched` tree can still do that, so it is flagged.
+
+**What it does not check — read this before trusting a green result.** Its scope is the
+Homebridge side: the three scripts, `PrebufferManager.js`, the plugin's `dist/`, and stale
+patch blobs. It says **nothing about go2rtc** — not the running binary, not which fork tag it
+was built from, not `go2rtc.yaml`, and not the warmer/wedge systemd units. That blind spot is
+not hypothetical: the keyframe-watchdog fix (4s → 60s) lived in `patches/go2rtc-nest.patch`
+here for days while the fork tag the guide told people to build from still shipped the old 4s
+version, and a clean drift report could never have revealed it. To check the go2rtc side, compare
+the tag you built from against the one in Part 3 and rebuild if they differ.
 
 **`package.json` is reported but never treated as authoritative.** Patching `dist/` in place
 doesn't make npm rewrite the version field, so a plugin whose code is 1.1.24 can keep reporting
