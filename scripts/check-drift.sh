@@ -373,6 +373,59 @@ echo
 # The repo shipped whole-file copies until 2026-07-19 (446b29f) and then moved
 # to unified diffs, precisely because pasting a stale whole file reverts
 # everything done since. Any surviving *.patched tree can still do that.
+# --- 2c. things the fixes DEPEND on, which nothing else covered ---------------
+# The plugin dist can be byte-perfect and the deployment still broken, because three
+# inputs live outside every check above:
+#   * config.json keys -- vEncoder:copy is what makes live view a remux instead of an
+#     encode, and hksvPrebufferSeconds is what makes the ring serve pre-trigger footage.
+#     Lose either and nothing DIFFERS; the box just quietly gets slower or shorter clips.
+#   * go2rtc stream keys -- the plugin derives them by slugifying the camera's room name
+#     and never checks that go2rtc serves them, so a Google Home rename kills a camera
+#     with no drift anywhere. (Values are never printed: config.json holds OAuth secrets.)
+#   * systemd units -- ~/scripts/systemd-units/ is what the config tarball captures, but
+#     /etc/systemd/system/ is what actually runs.
+echo "Deployment inputs (outside the patch set)"
+HB_CONF="$HB_DIR/config.json"
+for k in '"vEncoder"[[:space:]]*:[[:space:]]*"copy"' '"hksvPrebufferSeconds"'; do
+  label="$(echo "$k" | sed 's/\[\[:space:\]\]\*//g; s/"//g; s/:.*//')"
+  if rexec "grep -qE '$k' '$HB_CONF' 2>/dev/null"; then
+    printf "  %-34s %spresent%s\n" "config.json $label" "$GRN" "$OFF"
+  else
+    printf "  %-34s %sMISSING%s in %s\n" "config.json $label" "$RED" "$OFF" "$HB_CONF"
+    printf "      %sNo file DIFFERS when this is lost -- live view silently starts\n" "$DIM"
+    printf "      re-encoding, or the prebuffer stops serving pre-trigger footage.%s\n" "$OFF"
+    drift=$((drift + 1))
+  fi
+  checked=$((checked + 1))
+done
+
+# Every go2rtc stream should have a producer configured. A key present in go2rtc but with
+# no matching camera (or the reverse after a rename) is the failure this cannot otherwise see.
+# Parsed, not grepped: a regex over the JSON also matches NESTED keys ("producers",
+# "consumers", ...) and reported 14 streams for a 4-camera deployment.
+NSTREAM="$(rexec "curl -s --max-time 8 http://127.0.0.1:${GO2RTC_API_PORT:-1985}/api/streams 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null" | tr -d ' \r')"
+if [ -n "$NSTREAM" ]; then
+  printf "  %-34s %s%s configured%s\n" "go2rtc streams" "$GRN" "$NSTREAM" "$OFF"
+  printf "      %sRename a camera in Google Home and the plugin dials a slug go2rtc does\n" "$DIM"
+  printf "      not serve. Re-run nest-go2rtc-sync.py after ANY rename.%s\n" "$OFF"
+  checked=$((checked + 1))
+else
+  printf "  %-34s %sAPI unreachable%s\n" "go2rtc streams" "$YEL" "$OFF"; missing=$((missing + 1))
+fi
+
+# Units: staged copy (what the tarball restores) vs /etc (what actually runs), plus enabled.
+UNIT_DIFF="$(rexec "for u in \$(ls /home/pi/scripts/systemd-units/*.service 2>/dev/null); do n=\$(basename \$u); if ! sudo diff -q \$u /etc/systemd/system/\$n >/dev/null 2>&1; then echo \$n; fi; done" | tr -d '\r' | tr '\n' ' ' | sed 's/ *$//')"
+if [ -z "$UNIT_DIFF" ]; then
+  printf "  %-34s %sstaged copies match /etc%s\n" "systemd units" "$GRN" "$OFF"
+else
+  printf "  %-34s %sDIFFER%s: %s\n" "systemd units" "$RED" "$OFF" "$UNIT_DIFF"
+  printf "      %s~/scripts/systemd-units/ is what the backup tarball restores; /etc is\n" "$DIM"
+  printf "      what runs. A restore would put back the wrong unit.%s\n" "$OFF"
+  drift=$((drift + 1))
+fi
+checked=$((checked + 1))
+echo
+
 echo "Stale whole-file patch blobs"
 BLOBS="$(rexec "ls -1 $HB_DIR/patches/*.patched 2>/dev/null | wc -l" | tr -d ' \r')"
 if [ "${BLOBS:-0}" -gt 0 ]; then
