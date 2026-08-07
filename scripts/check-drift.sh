@@ -220,6 +220,68 @@ else
   else
     printf "  %-34s %spatched%s %s(image %s)%s\n" "binary" "$GRN" "$OFF" "$DIM" "$G_IMAGE" "$OFF"
   fi
+
+  # The markers above prove "not stock". They CANNOT prove "current": the changes in
+  # nestfix-1.9.14-7/-8/-9 (writebuffer close semantics, preload cancel) introduced no new
+  # string literals at all, so no grep can distinguish them from -6. A v13 image passed the
+  # marker check while missing every one of those fixes.
+  #
+  # The image tag is the only signal that carries generation, so compare it against the tag
+  # the guide tells people to build. Advisory, not drift: rebuilding go2rtc is a deliberate
+  # act and the image name is a convention, not a guarantee.
+  WANT_TAG="$(grep -m1 '^FORK_BRANCH=' "$REPO_DIR/install.sh" 2>/dev/null | sed 's/.*:-//; s/}.*//')"
+  if [ -n "$WANT_TAG" ]; then
+    case "$G_IMAGE" in
+      *"${WANT_TAG##*-}"*)
+        printf "  %-34s %slooks current%s %s(image mentions %s)%s\n" "generation" "$GRN" "$OFF" "$DIM" "${WANT_TAG}" "$OFF" ;;
+      *)
+        printf "  %-34s %sIMAGE PREDATES %s%s\n" "generation" "$YEL" "$WANT_TAG" "$OFF"
+        printf "      %sThe running image (%s) does not reference the tag the guide builds\n" "$DIM" "$G_IMAGE"
+        printf "      from. String markers cannot detect -7/-8/-9 (no new literals), so this\n"
+        printf "      name check is the only generation signal. Rebuild + redeploy if the\n"
+        printf "      fixes in those tags are wanted.%s\n" "$OFF" ;;
+    esac
+  fi
+  verified=$((verified + 1))
+fi
+echo
+
+# --- 2a2. recovery kit freshness -------------------------------------------
+# The kit staged on the box is what actually runs after a wipe, and it silently went
+# stale within 38 minutes of being staged on 2026-08-07: it held the old sentinel-based
+# apply script and a StreamingDelegate patch missing a hunk. A stale kit is worse than
+# none — it restores an older generation and reports success.
+echo "Recovery kit (${DIM}${BASE_HOME}/nest-recovery${OFF})"
+KIT="$BASE_HOME/nest-recovery"
+if ! rexec "[ -d '$KIT' ]" 2>/dev/null; then
+  printf "  %-34s %snot staged%s — a wipe would need files copied over first\n" "kit" "$YEL" "$OFF"
+  missing=$((missing+1))
+else
+  kit_bad=""
+  for pair in "scripts/apply-snapshot-patch.sh|scripts/apply-snapshot-patch.sh" \
+              "patches/homebridge-plugin/StreamingDelegate.js.patch|patches/homebridge-plugin/StreamingDelegate.js.patch" \
+              "patches/homebridge-plugin/Camera.js.patch|patches/homebridge-plugin/Camera.js.patch" \
+              "patches/homebridge-plugin/Api.js.patch|patches/homebridge-plugin/Api.js.patch" \
+              "patches/homebridge-plugin/HksvStreamer.js.patch|patches/homebridge-plugin/HksvStreamer.js.patch" \
+              "patches/homebridge-plugin/config.schema.json.patch|patches/homebridge-plugin/config.schema.json.patch" \
+              "patches/homebridge-plugin/new-files/PrebufferManager.js|patches/homebridge-plugin/new-files/PrebufferManager.js"; do
+    kf="${pair%%|*}"; rf="${pair##*|}"
+    tmp="$WORK/kit_$(echo "$kf" | tr '/.' '__')"
+    if rfetch "$KIT/$kf" "$tmp" && [ -s "$tmp" ]; then
+      cmp -s "$REPO_DIR/$rf" "$tmp" || kit_bad="$kit_bad $kf"
+    else
+      kit_bad="$kit_bad $kf(missing)"
+    fi
+  done
+  if [ -n "$kit_bad" ]; then
+    printf "  %-34s %sSTALE%s —%s\n" "kit" "$RED" "$OFF" "$kit_bad"
+    printf "      %sAfter a wipe this restores an OLDER generation and reports success.\n" "$DIM"
+    printf "      Re-stage: scp the repo's scripts/apply-snapshot-patch.sh and\n"
+    printf "      patches/homebridge-plugin/ to %s/%s\n" "$KIT" "$OFF"
+    drift=$((drift + 1))
+  else
+    printf "  %-34s %smatches the repo%s\n" "kit" "$GRN" "$OFF"
+  fi
   verified=$((verified + 1))
 fi
 echo
