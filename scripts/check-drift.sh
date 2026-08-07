@@ -189,6 +189,41 @@ if [ "$DEEP" = "1" ]; then
   echo
 fi
 
+# --- 2a. go2rtc: is the running binary the patched one? --------------------
+# This was the script's largest blind spot, and it hid a real defect: the keyframe
+# watchdog fix lived in patches/go2rtc-nest.patch for days while the fork tag the guide
+# told people to build from still shipped the old 4s version, and a fully green drift
+# report could never have revealed it.
+#
+# Byte-comparing the binary would need a rebuild, which this script must not do. Instead
+# check for marker strings the patch introduces -- present in a patched build, absent from
+# stock go2rtc. Cheap, read-only, and enough to catch "you are running a stock or older
+# image" which is the failure that actually happens.
+echo "go2rtc (running container vs this repo's patch)"
+GO2RTC_CONTAINER="${GO2RTC_CONTAINER:-go2rtc}"
+G_IMAGE="$(rexec "docker inspect --format '{{.Config.Image}}' $GO2RTC_CONTAINER 2>/dev/null" | tr -d '\r')"
+if [ -z "$G_IMAGE" ]; then
+  printf "  %-34s %snot running%s (container '%s')\n" "container" "$YEL" "$OFF" "$GO2RTC_CONTAINER"
+  missing=$((missing+1))
+else
+  # Every marker below is added by patches/go2rtc-nest.patch.
+  G_MISSING=""
+  for marker in "producer ended without error" "closing stalled stream (no keyframe)" "nest: stall watchdog armed"; do
+    n_hits="$(rexec "docker exec $GO2RTC_CONTAINER grep -c '$marker' /usr/local/bin/go2rtc 2>/dev/null || echo 0" | tr -d '\r' | head -1)"
+    [ "${n_hits:-0}" = "0" ] && G_MISSING="$G_MISSING '$marker'"
+  done
+  if [ -n "$G_MISSING" ]; then
+    printf "  %-34s %sUNPATCHED OR STALE%s  image=%s\n" "binary" "$RED" "$OFF" "$G_IMAGE"
+    printf "      %smissing marker(s):%s%s\n" "$DIM" "$G_MISSING" "$OFF"
+    printf "      %sRebuild from the fork tag in README Part 3 and redeploy.%s\n" "$DIM" "$OFF"
+    drift=$((drift + 1))
+  else
+    printf "  %-34s %spatched%s %s(image %s)%s\n" "binary" "$GRN" "$OFF" "$DIM" "$G_IMAGE" "$OFF"
+  fi
+  verified=$((verified + 1))
+fi
+echo
+
 # --- 2b. deployed-but-not-loaded ------------------------------------------
 # Everything above compares BYTES ON DISK. Node reads its modules once, at startup,
 # so a dist/ file newer than the running Homebridge process is deployed and NOT
