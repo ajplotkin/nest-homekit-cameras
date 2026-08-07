@@ -384,6 +384,52 @@ echo
 #     with no drift anywhere. (Values are never printed: config.json holds OAuth secrets.)
 #   * systemd units -- ~/scripts/systemd-units/ is what the config tarball captures, but
 #     /etc/systemd/system/ is what actually runs.
+# --- 2b. repo go2rtc patch  <->  fork tag ------------------------------------
+# The generation check above proves the RUNNING BINARY matches the fork tag. It says
+# nothing about whether this repo's go2rtc-nest.patch still matches that tag -- and those
+# are what a stranger following the README actually builds from. They have drifted before:
+# a watchdog fix lived on the Pi and in the patch but was never pushed to the fork, so the
+# tag and the patch described different code while everything else reported green.
+#
+# Compares only the files the patch touches. The tag's diff against v1.9.14 covers ~109
+# files, but the rest is upstream dev churn (website, README, xiaomi/tutk/kasa) that this
+# patch deliberately does not carry.
+if [ "$DEEP" = "1" ] && command -v gh >/dev/null 2>&1; then
+  echo "Repo go2rtc patch vs fork tag"
+  G2P="$REPO_DIR/patches/go2rtc-nest.patch"
+  WANT_TAG="$(grep -m1 '^FORK_BRANCH=' "$REPO_DIR/install.sh" 2>/dev/null | sed 's/.*:-//; s/}.*//')"
+  if [ -f "$G2P" ] && [ -n "$WANT_TAG" ]; then
+    TAGDIFF="$WORK/tagdiff.patch"
+    if gh api "repos/ajplotkin/go2rtc/compare/v1.9.14...$WANT_TAG" \
+         -H "Accept: application/vnd.github.v3.diff" > "$TAGDIFF" 2>/dev/null && [ -s "$TAGDIFF" ]; then
+      # Per file: normalise to the hunk BODIES only. Index lines and hunk headers carry
+      # blob SHAs and line offsets that legitimately differ between a rebased tag and a
+      # flat patch, so comparing raw text would cry wolf on every rebase.
+      MISMATCH=""; NCHECK=0
+      for pf in $(grep '^+++ b/' "$G2P" | sed 's|^+++ b/||' | sort -u); do
+        NCHECK=$((NCHECK + 1))
+        a="$(awk -v F="$pf" '/^\+\+\+ b\//{on=($3=="b/"F)} on && /^[-+ ]/ && !/^(\+\+\+|---)/' "$G2P" | md5)"
+        b="$(awk -v F="$pf" '/^\+\+\+ b\//{on=($3=="b/"F)} on && /^[-+ ]/ && !/^(\+\+\+|---)/' "$TAGDIFF" | md5)"
+        [ "$a" = "$b" ] || MISMATCH="$MISMATCH $pf"
+      done
+      if [ -z "$MISMATCH" ]; then
+        printf "  %-34s %sall %s files match %s%s\n" "go2rtc-nest.patch" "$GRN" "$NCHECK" "$WANT_TAG" "$OFF"
+      else
+        printf "  %-34s %sDIFFERS from %s%s\n" "go2rtc-nest.patch" "$RED" "$WANT_TAG" "$OFF"
+        for m in $MISMATCH; do printf "      %s%s%s\n" "$DIM" "$m" "$OFF"; done
+        printf "      %sThe patch in this repo and the tag the guide builds describe different\n" "$DIM"
+        printf "      code. Anyone following the README gets something you are not running.%s\n" "$OFF"
+        drift=$((drift + 1))
+      fi
+      checked=$((checked + 1))
+    else
+      printf "  %-34s %scould not fetch tag diff%s (offline?)\n" "go2rtc-nest.patch" "$YEL" "$OFF"
+    fi
+  fi
+  verified=$((verified + 1))
+  echo
+fi
+
 echo "Deployment inputs (outside the patch set)"
 HB_CONF="$HB_DIR/config.json"
 for k in '"vEncoder"[[:space:]]*:[[:space:]]*"copy"' '"hksvPrebufferSeconds"'; do
