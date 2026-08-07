@@ -31,7 +31,7 @@
          api.on("shutdown" /* SHUTDOWN */, () => {
              for (const session in this.ongoingSessions) {
                  this.stopStream(session);
-@@ -54,7 +71,23 @@
+@@ -54,7 +71,26 @@
              recording: {
                  delegate: this,
                  options: {
@@ -52,11 +52,14 @@
 +                    // appears to TRIM the clip to the advertised prebufferLength and discard
 +                    // anything earlier. Advertising the configured pre-roll (ms) tells it to
 +                    // keep what we hand it. Capped at 15000ms as a sanity bound.
-+                    prebufferLength: (Number(this.config.hksvPrebufferSeconds) || 0) > 0 ? Math.min(Number(this.config.hksvPrebufferSeconds) * 1000, 15000) : 0,
++                    // Clamped to the ring's retention too: the two are independent config keys,
++                    // so nothing stops a 15s pre-roll on a 5s ring -- and since the hub KEEPS what
++                    // we advertise, that promises 15s and silently delivers 5.
++                    prebufferLength: (Number(this.config.hksvPrebufferSeconds) || 0) > 0 ? Math.min(Number(this.config.hksvPrebufferSeconds) * 1000, (Number(this.config.hksvPrebufferRetainSeconds) || 15) * 1000, 15000) : 0,
                      mediaContainerConfiguration: {
                          type: 0 /* FRAGMENTED_MP4 */,
                          fragmentLength: 4000,
-@@ -193,16 +226,36 @@
+@@ -193,16 +229,36 @@
          const bitrate = request.video.max_bit_rate * 4;
          const vEncoder = this.config.vEncoder || 'libx264 -preset ultrafast -tune zerolatency';
          this.log.debug(`Video stream requested: ${request.video.width} x ${request.video.height}, ${request.video.fps} fps, ${request.video.max_bit_rate} kbps`, this.camera.getDisplayName());
@@ -100,7 +103,7 @@
          }
          ffmpegArgs += // Video
              ' -an -sn -dn' +
-@@ -264,12 +317,26 @@
+@@ -264,12 +320,26 @@
                  }, request.video.rtcp_interval * 2 * 1000);
              });
              activeSession.socket.bind(sessionInfo.videoReturnPort, sessionInfo.localAddress);
@@ -128,7 +131,7 @@
          this.ongoingSessions[request.sessionID] = activeSession;
          delete this.pendingSessions[request.sessionID];
      }
-@@ -314,7 +381,8 @@
+@@ -314,7 +384,8 @@
                  this.log.error('Error occurred terminating two-way FFmpeg process: ' + err, this.camera.getDisplayName());
              }
              try {
@@ -138,7 +141,7 @@
              }
              catch (err) {
                  this.log.error('Error terminating SDM stream: ' + err, this.camera.getDisplayName());
-@@ -325,6 +393,14 @@
+@@ -325,6 +396,14 @@
      }
      closeRecordingStream(streamId, reason) {
          var _a, _b;
@@ -153,7 +156,7 @@
          // Only tear down if this close targets the session we're actually running. A HomeKit hub can
          // send a late close for an already-replaced (orphaned) session; without this guard that stale
          // close would destroy the *current* recording.
-@@ -341,6 +417,8 @@
+@@ -341,6 +420,8 @@
          this.handlingRecordingStreamingRequest = false;
      }
      acknowledgeStream(streamId) {
@@ -162,7 +165,7 @@
          this.closeRecordingStream(streamId, undefined);
      }
      /**
-@@ -353,7 +431,7 @@
+@@ -353,7 +434,7 @@
       *   when the HomeKit Controller requests it (see the documentation of `CameraRecordingDelegate`).
       */
      async *handleRecordingStreamRequest(streamId) {
@@ -171,7 +174,7 @@
          this.log.debug('Recording request received.');
          if (!this.cameraRecordingConfiguration)
              throw new Error('No recording configuration for this camera.');
-@@ -368,23 +446,45 @@
+@@ -368,23 +449,45 @@
          this.handlingRecordingStreamingRequest = true;
          if (this.cameraRecordingConfiguration.videoCodec.type !== 0 /* H264 */)
              throw new Error('Unsupported recording codec type.');
@@ -219,7 +222,7 @@
          ];
          let samplerate;
          switch (this.cameraRecordingConfiguration.audioCodec.samplerate) {
-@@ -410,6 +510,11 @@
+@@ -410,6 +513,11 @@
                  throw new Error("Unsupported audio sample rate: " + this.cameraRecordingConfiguration.audioCodec.samplerate);
          }
          const audioArgs = ((_b = (_a = this.controller) === null || _a === void 0 ? void 0 : _a.recordingManagement) === null || _b === void 0 ? void 0 : _b.recordingManagementService.getCharacteristic(this.platform.Characteristic.RecordingAudioActive))
@@ -231,7 +234,7 @@
              ? [
                  "-acodec", "libfdk_aac",
                  ...(this.cameraRecordingConfiguration.audioCodec.type === 0 /* AAC_LC */ ?
-@@ -419,10 +524,108 @@
+@@ -419,10 +527,108 @@
                  "-b:a", `${this.cameraRecordingConfiguration.audioCodec.bitrate}k`,
                  "-ac", `${this.cameraRecordingConfiguration.audioCodec.audioChannels}`,
              ]
@@ -344,7 +347,7 @@
          // Tear down any prior recording session before overwriting it. A HomeKit hub
          // can start a new recording (e.g. after a brief reconnect) before the previous
          // session's close event fires. Without this, the previous HksvStreamer — and
-@@ -437,12 +640,15 @@
+@@ -437,12 +643,15 @@
              hksvStreamer: hksvStreamer,
              nestStreamer: nestStreamer
          };
@@ -364,7 +367,7 @@
              for await (const box of this.recordingSessionInfo.hksvStreamer.generator()) {
                  pending.push(box.header, box.data);
                  const motionDetected = (_c = this.accessory.getService(this.hap.Service.MotionSensor)) === null || _c === void 0 ? void 0 : _c.getCharacteristic(this.platform.Characteristic.MotionDetected).value;
-@@ -450,6 +656,16 @@
+@@ -450,6 +659,16 @@
                  if (box.type === "moov" || box.type === "mdat") {
                      const fragment = Buffer.concat(pending);
                      pending.splice(0, pending.length);
@@ -381,7 +384,7 @@
                      const isLast = STOP_AFTER_MOTION_STOP && !motionDetected;
                      yield {
                          data: fragment,
-@@ -463,12 +679,57 @@
+@@ -463,12 +682,57 @@
              }
          }
          catch (error) {

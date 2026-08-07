@@ -205,6 +205,10 @@ class CameraBuffer {
         this.exitHandled = false;
         this.pending = Buffer.alloc(0);
         this.pendingMoof = undefined;
+        // Per-run: the next child writes a fresh init segment, so the first geometry it
+        // reports is the new baseline. Carrying the old value across a restart would fire
+        // the detector on the very geometry the new init segment correctly describes.
+        this.lastGeometry = undefined;
         // Non-null: stdio is spawned as ["ignore", "pipe", "pipe"] just above.
         child.stdout.on("data", chunk => this.consume(chunk));
         // Stall watchdog. Covers three shapes: a reader that produced and then went silent
@@ -304,6 +308,34 @@ class CameraBuffer {
                 this.killChild();
                 return;
             }
+            // A camera that renegotiates resolution MID-SESSION poisons the ring the same
+            // way a timestamp re-base does, and structurally: an fMP4 track declares its
+            // dimensions once, in the init segment, and cannot re-declare them. After the
+            // first switch the track no longer matches its samples -- video freezes while
+            // audio plays on, for every clip cut from that ring.
+            //
+            // Reported by @littlepope81 (potmat/homebridge-google-nest-sdm#238) on newer
+            // Nest hardware alternating 640x368 and 1920x1088 within one session. It
+            // reproduces under `-c copy` AND under transcode-without-scale, so the geometry
+            // change reaches the muxer either way. No camera here has ever done it.
+            //
+            // Best-effort: under `-c copy` ffmpeg does not decode, so whether the change
+            // surfaces on stderr depends on the build and on the parser noticing the new
+            // SPS. When it surfaces we re-anchor; when it does not we are no worse off.
+            // Not thresholded like the DTS-clamp rule -- one genuine geometry change
+            // already invalidates the init segment, so there is no benign burst to ride out.
+            const geometry = /Reinit context to (\d+x\d+)/.exec(s);
+            if (geometry) {
+                const seen = geometry[1];
+                if (this.lastGeometry && this.lastGeometry !== seen) {
+                    this.log.warn(`[prebuffer:${this.name}] video geometry changed mid-session (${this.lastGeometry} -> ${seen}); the init segment can no longer describe this track, so restarting the reader to re-anchor`);
+                    this.lastGeometry = seen;
+                    this.killChild();
+                    return;
+                }
+                this.lastGeometry = seen;
+                return;
+            }
             // Backstop for a timestamp re-base that arrives WITHOUT a cseq jump, which the
             // rule above would never see. ffmpeg 6 spells it "Non-monotonous"; 7+ says
             // "Non-monotonic".
@@ -398,6 +430,13 @@ class CameraBuffer {
             // cannot mask. start() also resets these, but only after the backoff delay.
             this.pending = Buffer.alloc(0);
             this.pendingMoof = undefined;
+            // The clamp window is per-run too, and forgetting that is harmful rather than
+            // untidy. A run that dies holding e.g. 15 clamps inside the last 10s hands them
+            // to its replacement, which respawns after a >=1s backoff -- still inside the
+            // window. A few ordinary clamps from the NEW run then cross the threshold on a
+            // mixed count, and the burst detector kills a healthy reader and destroys the
+            // in-flight consumer it was feeding, truncating a live recording.
+            this.dtsClamps = [];
             this.resetConsumers("prebuffer reader restarted; timeline discontinuity");
             // Reset backoff if it had been healthy: a stream that ran for minutes
             // and then dropped deserves a prompt retry, not the delay earned by one
@@ -705,12 +744,23 @@ class PrebufferManager {
         // waiting on input that never comes -- we would have handed over perfectly good
         // pre-trigger footage and then hung, and the hub discards the clip entirely on timeout.
         let deadman;
+        // Set once EOF has been pushed. stream.push(chunk) after push(null) throws
+        // ERR_STREAM_PUSH_AFTER_EOF, which destroys the stream WITH an error instead of
+        // ending it cleanly -- turning the slightly-short clip the deadman exists to save
+        // into an errored one. Reachable whenever the recorder is applying backpressure
+        // (flowing === false, fragments still queued) at the moment the reader stalls.
+        let ended = false;
         const armDeadman = () => {
             if (deadman) {
                 clearTimeout(deadman);
             }
             deadman = setTimeout(() => {
                 this.log.warn(`[prebuffer:${cameraKey}] no live fragment for ${LIVE_FLOW_DEADMAN_MS / 1000}s; closing the stream so the clip finalizes with the history we already sent`);
+                ended = true;
+                // Unsubscribe here rather than waiting for 'close'; otherwise late live
+                // fragments keep re-arming this timer and piling into a queue nobody reads.
+                buf.subscribers.delete(onFragment);
+                queue.length = 0;
                 try {
                     stream.push(null);
                 }
@@ -721,6 +771,9 @@ class PrebufferManager {
             }
         };
         const onFragment = (f) => {
+            if (ended) {
+                return;
+            }
             armDeadman();
             // Backstop: if the consumer never drains (ffmpeg died before its stdin
             // was piped, or was killed while the reader was down so no write ever
@@ -739,6 +792,9 @@ class PrebufferManager {
             }
         };
         const pump = () => {
+            if (ended) {
+                return;
+            }
             while (queue.length) {
                 const chunk = queue.shift();
                 if (!stream.push(chunk)) {
