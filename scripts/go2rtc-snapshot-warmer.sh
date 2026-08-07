@@ -1,5 +1,5 @@
 #!/bin/bash
-# go2rtc snapshot warmer — v2 (2026-07-26)
+# go2rtc snapshot warmer — v3 (2026-07-26; liveness delta added)
 # Writes a fresh JPEG per warm go2rtc stream to /run/nest-snaps/ (tmpfs).
 # Baseline: every INTERVAL seconds, with a cache just under INTERVAL so each cycle
 #   actually re-transcodes (tile content stays ~INTERVAL fresh, not stuck for 30s).

@@ -5,9 +5,12 @@
 # unrelated reason and notice it is older than the repo. Everything else stays
 # invisible. This makes it a command instead.
 #
-# STRICTLY READ-ONLY. It never writes, copies, patches or restarts anything,
-# on purpose: a "checker" that can also fix is how a stale whole-file patch
-# script silently reverted three weeks of hardening here on 2026-08-01.
+# STRICTLY READ-ONLY WITH RESPECT TO THE DEPLOYMENT. It never writes, patches or
+# restarts anything on the target box, on purpose: a "checker" that can also fix is how a
+# stale whole-file patch script silently reverted three weeks of hardening here on
+# 2026-08-01. (It does copy deployed files OUT, into a local temp dir, and under --deep it
+# npm-fetches the stock package and patches that local copy. Nothing it writes is ever on
+# the deployment side.)
 #
 # Usage:
 #   ./check-drift.sh                                  # everything on this machine
@@ -168,15 +171,22 @@ if [ "$DEEP" = "1" ]; then
       done
       cp "$REPO_DIR/patches/homebridge-plugin/new-files/PrebufferManager.js" "$B/package/dist/" 2>/dev/null
       if [ "$pfail" -eq 0 ]; then
-        for f in sdm/Api.js sdm/Camera.js HksvStreamer.js StreamingDelegate.js PrebufferManager.js; do
+        # config.schema.json is patched above but was never COMPARED, so a wipe-recovery that
+        # missed it stayed fully green. It drives the Homebridge UI's config form, so a stale
+        # one hides hksvPrebuffer* from anyone editing through the UI.
+        # NOTE: this list is hand-maintained. A new patched file must be added here or it is
+        # silently uncovered -- the failure this very entry is fixing.
+        for f in sdm/Api.js sdm/Camera.js HksvStreamer.js StreamingDelegate.js PrebufferManager.js ../config.schema.json; do
           mkdir -p "$B/live/$(dirname "$f")"
+          label="${f#../}"
           if ! rfetch "$PLUGIN_DIR/dist/$f" "$B/live/$f" || [ ! -s "$B/live/$f" ]; then
-            printf "  %-34s %snot deployed%s\n" "$f" "$YEL" "$OFF"; missing=$((missing+1)); continue
+            printf "  %-34s %snot deployed%s\n" "$label" "$YEL" "$OFF"; missing=$((missing+1)); continue
           fi
           if cmp -s "$B/package/dist/$f" "$B/live/$f"; then
-            printf "  %-34s %sreproduced exactly%s\n" "$f" "$GRN" "$OFF"
+            printf "  %-34s %sreproduced exactly%s\n" "$label" "$GRN" "$OFF"
+            checked=$((checked + 1))
           else
-            printf "  %-34s %sDIFFERS%s  %s lines\n" "$f" "$RED" "$OFF" \
+            printf "  %-34s %sDIFFERS%s  %s lines\n" "$label" "$RED" "$OFF" \
               "$(diff "$B/package/dist/$f" "$B/live/$f" | grep -c '^[<>]')"
             drift=$((drift + 1))
           fi
@@ -226,22 +236,52 @@ else
   # string literals at all, so no grep can distinguish them from -6. A v13 image passed the
   # marker check while missing every one of those fixes.
   #
-  # The image tag is the only signal that carries generation, so compare it against the tag
-  # the guide tells people to build. Advisory, not drift: rebuilding go2rtc is a deliberate
-  # act and the image name is a convention, not a guarantee.
+  # GENERATION. The binary self-reports the git revision it was built from
+  # (GET /api -> .revision), and the fork tag resolves to a commit SHA. Comparing those two
+  # is an actual proof of which code is running -- unlike the image NAME, which is a
+  # convention anyone can typo, and unlike the marker strings above, which cannot separate
+  # -7/-8/-9 from -6 because those tags added no new string literals at all.
+  #
+  # This was advisory-only until 2026-08-07 and printed IMAGE PREDATES without incrementing
+  # drift -- so a go2rtc built from a stale tag still exited 0 under "Everything checked is
+  # in sync." That is the exact failure class this script was written for, passing silently.
+  # A revision mismatch is now real drift.
   WANT_TAG="$(grep -m1 '^FORK_BRANCH=' "$REPO_DIR/install.sh" 2>/dev/null | sed 's/.*:-//; s/}.*//')"
   if [ -n "$WANT_TAG" ]; then
-    case "$G_IMAGE" in
-      *"${WANT_TAG##*-}"*)
-        printf "  %-34s %slooks current%s %s(image mentions %s)%s\n" "generation" "$GRN" "$OFF" "$DIM" "${WANT_TAG}" "$OFF" ;;
-      *)
-        printf "  %-34s %sIMAGE PREDATES %s%s\n" "generation" "$YEL" "$WANT_TAG" "$OFF"
-        printf "      %sThe running image (%s) does not reference the tag the guide builds\n" "$DIM" "$G_IMAGE"
-        printf "      from. String markers cannot detect -7/-8/-9 (no new literals), so this\n"
-        printf "      name check is the only generation signal. Rebuild + redeploy if the\n"
-        printf "      fixes in those tags are wanted.%s\n" "$OFF" ;;
-    esac
+    G_REV="$(rexec "curl -s --max-time 8 http://127.0.0.1:${GO2RTC_API_PORT:-1985}/api 2>/dev/null" \
+             | tr -d '\r' | sed -n 's/.*"revision"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    # Peeled ref (^{}) first: an annotated tag's own object is NOT the commit, and comparing
+    # against the tag object would mismatch every time for annotated tags.
+    WANT_SHA="$(git ls-remote "${FORK_URL:-https://github.com/ajplotkin/go2rtc}" \
+                  "refs/tags/${WANT_TAG}^{}" 2>/dev/null | cut -f1)"
+    [ -z "$WANT_SHA" ] && WANT_SHA="$(git ls-remote "${FORK_URL:-https://github.com/ajplotkin/go2rtc}" \
+                  "refs/tags/${WANT_TAG}" 2>/dev/null | cut -f1)"
+
+    if [ -n "$G_REV" ] && [ -n "$WANT_SHA" ]; then
+      # go2rtc reports an abbreviated revision, so compare on its length.
+      if [ "${WANT_SHA:0:${#G_REV}}" = "$G_REV" ]; then
+        printf "  %-34s %sok%s %s(rev %s == %s)%s\n" "generation" "$GRN" "$OFF" "$DIM" "$G_REV" "$WANT_TAG" "$OFF"
+      else
+        printf "  %-34s %sWRONG BUILD%s\n" "generation" "$RED" "$OFF"
+        printf "      %sRunning revision %s, but %s is %s.\n" "$DIM" "$G_REV" "$WANT_TAG" "${WANT_SHA:0:${#G_REV}}"
+        printf "      The running binary was NOT built from the tag this repo ships. Rebuild\n"
+        printf "      and redeploy -- see 'Building the go2rtc fork' in the README.%s\n" "$OFF"
+        drift=$((drift + 1))
+      fi
+    else
+      # Degrade to the old name check rather than failing: no network (git ls-remote) or the
+      # API unreachable are both ordinary, and neither is evidence of drift.
+      case "$G_IMAGE" in
+        *"${WANT_TAG##*-}"*)
+          printf "  %-34s %sname looks current%s %s(rev check unavailable)%s\n" "generation" "$YEL" "$OFF" "$DIM" "$OFF" ;;
+        *)
+          printf "  %-34s %sIMAGE PREDATES %s%s %s(rev check unavailable)%s\n" "generation" "$YEL" "$WANT_TAG" "$OFF" "$DIM" "$OFF" ;;
+      esac
+      printf "      %sCould not prove the build: %s.%s\n" "$DIM" \
+        "$([ -z "$G_REV" ] && echo "go2rtc API unreachable" || echo "could not resolve $WANT_TAG (offline?)")" "$OFF"
+    fi
   fi
+  checked=$((checked + 1))
   verified=$((verified + 1))
 fi
 echo
@@ -357,7 +397,7 @@ if [ "$verified" -eq 0 ]; then
 fi
 
 if [ "$drift" -eq 0 ] && [ "$missing" -eq 0 ]; then
-  echo "${GRN}Everything checked is in sync.${OFF} ($checked artifacts)"
+  echo "${GRN}Everything checked is in sync.${OFF} ($checked artifacts, $verified checks)"
   exit 0
 fi
 [ "$missing" -gt 0 ] && echo "${YEL}$missing not deployed / unreadable${OFF} — expected if you run a subset."

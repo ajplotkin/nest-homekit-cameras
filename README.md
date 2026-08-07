@@ -17,7 +17,7 @@ This guide walks through the full setup from scratch: getting API access to your
 ### What's in this repo
 
 - **This README** — the complete, from-scratch guide (start here and read top to bottom).
-- **[`install.sh`](install.sh)** — one-shot installer for everything after your Google credentials. Re-running is safe but **not** a no-op: it recreates the go2rtc container (dropping every warm stream) and rewrites the warmer unit. see [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
+- **[`install.sh`](install.sh)** — one-shot installer for everything after your Google credentials. Re-running is safe but **not** a no-op: it recreates the go2rtc container (dropping every warm stream) and rewrites the warmer unit. If your go2rtc config does **not** live at the default `~/go2rtc-nest`, pass `--go2rtc-dir` — otherwise a re-run builds a fresh config at the default path and your existing one goes unused. see [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
 - **[`docker-compose.yml`](docker-compose.yml)** — the go2rtc + warmer half of the stack as Compose services.
 - **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches), `setup-google-device-access.sh` (automates Part 1 — the Google Cloud half of the credentials setup), `test-prebuffer-e2e.js` (end-to-end proof the prebuffer ring actually recovers pre-trigger footage — see [Testing the prebuffer](#testing-the-prebuffer)), and `check-drift.sh` (read-only; proves your deployment still matches this repo — see [Checking for drift](#checking-for-drift)).
 - **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), five plugin diffs against stock 1.1.24 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`), and `homebridge-plugin/new-files/PrebufferManager.js` (a new file, copied in rather than patched — it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)).
@@ -371,7 +371,7 @@ The solution is a warmer script that pre-fetches a JPEG every 10 seconds and wri
 
 ### SD card wear
 
-**If your system runs on an SD card** (most Raspberry Pis), put the snapshots in tmpfs (RAM). Writing ~100KB JPEGs every 10 seconds per camera is ~1.5 GB/day of flash writes for data that's pure cache — the warmer rebuilds it in seconds after a reboot. tmpfs costs about 200KB of RAM.
+**If your system runs on an SD card** (most Raspberry Pis), put the snapshots in tmpfs (RAM). Writing ~150KB JPEGs every 10 seconds is ~1.3 GB/day of flash writes **per warm camera** (~2.6 GB/day for the two here) for data that's pure cache — the warmer rebuilds it in seconds after a reboot. tmpfs costs about 150KB of RAM per camera (312KB measured for two).
 
 ```bash
 echo "d /run/nest-snaps 0755 $(id -u) $(id -g) -" | sudo tee /etc/tmpfiles.d/nest-snaps.conf
@@ -420,7 +420,7 @@ sudo systemctl enable --now go2rtc-snapshot-warmer.service
 Confirm it's actually working before moving on — within ~20 seconds you should see a JPEG per warm camera, and they should keep changing:
 
 ```bash
-ls -la /run/nest-snaps/           # one <key>.jpg per warm camera, 60-100 KB
+ls -la /run/nest-snaps/           # one <key>.jpg per warm camera, ~150 KB at 1600x1200
 journalctl -t go2rtc-warmer -n 20 # quiet is good; failures are logged here
 ```
 
@@ -510,9 +510,9 @@ journalctl -t go2rtc-warmer --since -30min   # fetch failures / grey-frame rejec
 ls -la --time-style=+%H:%M:%S /run/nest-snaps/   # ages must stay well under 90s
 ```
 
-A snapshot around 5–6 KB (versus a normal 60–100 KB) is a **grey frame** — ffmpeg decoding H264 without a usable keyframe. The warmer rejects those and keeps the previous good image.
+A snapshot around 5–6 KB (versus a normal ~150 KB at 1600x1200, measured 2026-08-07; smaller at lower resolutions) is a **grey frame** — ffmpeg decoding H264 without a usable keyframe. The warmer rejects those and keeps the previous good image.
 
-**Everything shows "No Response" after a power failure.** Homebridge came up before the network had settled and advertised itself into an mDNS environment that wasn't ready. Restarting *avahi* does not help — Homebridge runs its **own** mDNS responder, so avahi never sees it and restarting avahi changes nothing. Restart **Homebridge** instead.
+**Everything shows "No Response" after a power failure.** Homebridge came up before the network had settled and advertised itself into an mDNS environment that wasn't ready. Restarting *avahi* does not help — Homebridge runs its **own** mDNS responder by default (`ciao`), so avahi never sees it and restarting avahi changes nothing. (If you have switched Homebridge to the Avahi advertiser, this does not apply — restart avahi first in that case.) Restart **Homebridge** instead.
 
 To make that automatic, run a one-shot unit on a `systemd` **timer** (`OnBootSec=120`) that restarts the container, rather than ordering it `After=network-online.target` — that target is unreliable on Raspberry Pi OS and has been observed reached while DHCP was still settling, and silently skipped entirely. If your accessories depend on another service (Home Assistant, for example), poll it for a 200 before restarting so the bridge re-advertises with its accessories already loaded.
 
@@ -606,10 +606,10 @@ Recording only starts once HomeKit asks for it, which is downstream of Google's 
 delivery. Measured on this deployment:
 
 ```
-Google event timestamp -> Pub/Sub delivery :  ~2.0s typical (median 7.5s across a day)
+Google event timestamp -> Pub/Sub delivery :  median 7.5s  (mode ~2s, p75 47.8s)
 delivery -> ffmpeg connected + keyframe    :  ~1.0s
                                               ------
-event timestamp -> first recorded frame    :  ~3.6s
+event timestamp -> first recorded frame    :  ~8.5s at the median (~3.0s at the mode)
 ```
 
 Worse, Google's timestamp is itself late. For one doorbell event Google's *own* clip began
@@ -632,7 +632,7 @@ one core per camera, and about 2 MB of RAM. When a recording starts, the recorde
 Two design points worth keeping if you modify it:
 
 - **Anchor to the event timestamp, not to "now".** Connection time varies with Pub/Sub
-  latency (median 7.5s, p75 47.8s here), so anchoring to the moment ffmpeg connects makes the
+  latency (median 7.5s, p75 47.8s here — see the table above), so anchoring to the moment ffmpeg connects makes the
   recovered window vary by seconds run to run. `Camera.js` latches the Google timestamp when
   a STARTED motion/person event fires; the recorder anchors to that.
 - **Advertise the pre-roll you actually want kept.** This was originally documented the
@@ -942,7 +942,8 @@ is doing.
 Measured on that Pi, steady state, four cameras (two live, two switched off):
 
 ```
-load average           0.23  0.31  0.32        (4 cores; 93-97% idle)
+load average           0.6 - 1.2                (4 cores, WHOLE box incl. non-camera
+                                               containers; sampled 2026-08-07)
 go2rtc                 8-18% of ONE core
 ffmpeg ring readers    1-9% of one core each
 entire camera stack    ~121 MB RAM
@@ -1018,12 +1019,18 @@ It is **strictly read-only** — it never copies, patches or restarts anything. 
 the thing it exists to catch is a stale patch script quietly reverting good code, so a checker
 that could also "fix" would be the same hazard wearing a different hat.
 
-It reports three things:
+It reports, in order:
 
 - **Byte-identical artifacts** — the scripts and `PrebufferManager.js`, which should match exactly.
 - **Reproducibility** (`--deep`) — fetches pristine `EXPECT_VER` from npm, applies this repo's
   diffs, and compares the result to your live `dist/`. Byte-identical or it isn't reproducible.
   This is the only check that actually proves your deployment is the one documented here.
+- **go2rtc** — patch markers in the running binary, plus a **generation** check that compares the
+  binary's self-reported git revision (`GET /api` -> `.revision`) against the fork tag `install.sh`
+  builds. A mismatch is drift, not advice.
+- **Recovery kit freshness** — whether `~/nest-recovery/` on the box still matches the repo, since
+  that kit is what actually runs after a container start wipes the patches.
+- **Process age** — whether Homebridge has actually been reloaded since the last `dist/` write.
 - **Stale whole-file patch blobs** — this repo shipped whole-file copies before 2026-07-19 and
   moved to unified diffs precisely because pasting a stale whole file silently reverts everything
   done since. Any surviving `*.patched` tree can still do that, so it is flagged.
@@ -1082,7 +1089,7 @@ or the box may be ahead and carrying an undeployed hotfix (commit it).
 
 - [homebridge-google-nest-sdm #231](https://github.com/potmat/homebridge-google-nest-sdm/issues/231) — `MAX_EVENT_AGE_SECONDS = 30` discards real events, because Pub/Sub first deliveries are routinely 46-57s late — **open**; this repo raises the gate to 120s in `Camera.js.patch`
 - [homebridge-google-nest-sdm #232](https://github.com/potmat/homebridge-google-nest-sdm/issues/232) — HKSV clips truncated by x264 lookahead/B-frames, which a live source can never recover from — **open**; now moot on the go2rtc path, which no longer encodes at all
-- [homebridge-google-nest-sdm #233](https://github.com/potmat/homebridge-google-nest-sdm/issues/233) — `prebufferLength: 4000` advertised to HomeKit with no prebuffer implemented behind it — **open**; answered by `PrebufferManager.js` here
+- [homebridge-google-nest-sdm #233](https://github.com/potmat/homebridge-google-nest-sdm/issues/233) — `prebufferLength: 4000` advertised to HomeKit with no prebuffer implemented behind it — **open**; answered by `PrebufferManager.js` here, submitted upstream as [PR #240](https://github.com/potmat/homebridge-google-nest-sdm/pull/240) (*Add an opt-in HKSV pre-trigger buffer*, open)
 - [homebridge-google-nest-sdm #234](https://github.com/potmat/homebridge-google-nest-sdm/issues/234) — every HKSV clip recorded **silent**: an unconditional `-an` at the head of `videoArgs` overrode the whole AAC-ELD block, because `HksvStreamer` appends videoArgs *after* audioArgs — **open**; fixed here in `StreamingDelegate.js.patch`
 
 - [homebridge-google-nest-sdm #235](https://github.com/potmat/homebridge-google-nest-sdm/issues/235) — HKSV recording re-encodes video unnecessarily; `-codec:v copy` works and the `-profile:v` requirement is self-imposed — **open**

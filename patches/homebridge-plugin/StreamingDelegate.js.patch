@@ -50,7 +50,7 @@
 +            // (vEncoder: copy), not an encode. Against 541MB available and 4 cores, even 11
 +            // sessions would be ~132MB and ~16% of one core. So the stock 11 was harmless in
 +            // practice; there is no clutter either (the Homebridge UI has filtered
-+            // CameraRTPStreamManagement out of the accessories view since v4.10.0, and Apple
++            // CameraRTPStreamManagement out of the accessories view since v4.9.0 (2020-01-29), and Apple
 +            // Home renders one tile per accessory).
 +            //
 +            // 8 is chosen to sit comfortably above the household's device count so nobody is
@@ -67,16 +67,15 @@
              delegate: this,
              streamingOptions: {
                  supportedCryptoSuites: [0 /* AES_CM_128_HMAC_SHA1_80 */],
-@@ -54,7 +99,26 @@
+@@ -54,7 +99,25 @@
              recording: {
                  delegate: this,
                  options: {
 -                    prebufferLength: 4000,
-+                    // The code below states plainly that no prebuffer is implemented (see
-+                    // handleRecordingStreamRequest). Advertising 4000ms told HomeKit each clip
-+                    // would start 4s BEFORE the trigger; measured reality is ~5s AFTER it.
-+                    // Report what we actually deliver until a real prebuffer exists.
-+                    // Upstream: potmat/homebridge-google-nest-sdm#233
++                    // Upstream: potmat/homebridge-google-nest-sdm#233 (and PR #240, which
++                    // carries the implementation). Stock advertised a flat 4000ms with NO
++                    // prebuffer behind it, telling HomeKit each clip started 4s BEFORE the
++                    // trigger when reality was ~5s AFTER.
 +                    // Truthful only because a prebuffer now exists. With
 +                    // hksvPrebufferSeconds set we genuinely deliver several seconds of
 +                    // pre-trigger media (measured: ~11.8s of history on a real clip), so
@@ -95,7 +94,7 @@
                      mediaContainerConfiguration: {
                          type: 0 /* FRAGMENTED_MP4 */,
                          fragmentLength: 4000,
-@@ -193,16 +257,36 @@
+@@ -193,16 +256,36 @@
          const bitrate = request.video.max_bit_rate * 4;
          const vEncoder = this.config.vEncoder || 'libx264 -preset ultrafast -tune zerolatency';
          this.log.debug(`Video stream requested: ${request.video.width} x ${request.video.height}, ${request.video.fps} fps, ${request.video.max_bit_rate} kbps`, this.camera.getDisplayName());
@@ -139,7 +138,7 @@
          }
          ffmpegArgs += // Video
              ' -an -sn -dn' +
-@@ -264,12 +348,26 @@
+@@ -264,12 +347,26 @@
                  }, request.video.rtcp_interval * 2 * 1000);
              });
              activeSession.socket.bind(sessionInfo.videoReturnPort, sessionInfo.localAddress);
@@ -167,7 +166,7 @@
          this.ongoingSessions[request.sessionID] = activeSession;
          delete this.pendingSessions[request.sessionID];
      }
-@@ -314,7 +412,8 @@
+@@ -314,7 +411,8 @@
                  this.log.error('Error occurred terminating two-way FFmpeg process: ' + err, this.camera.getDisplayName());
              }
              try {
@@ -177,7 +176,7 @@
              }
              catch (err) {
                  this.log.error('Error terminating SDM stream: ' + err, this.camera.getDisplayName());
-@@ -325,6 +424,14 @@
+@@ -325,6 +423,14 @@
      }
      closeRecordingStream(streamId, reason) {
          var _a, _b;
@@ -192,7 +191,7 @@
          // Only tear down if this close targets the session we're actually running. A HomeKit hub can
          // send a late close for an already-replaced (orphaned) session; without this guard that stale
          // close would destroy the *current* recording.
-@@ -341,6 +448,8 @@
+@@ -341,6 +447,8 @@
          this.handlingRecordingStreamingRequest = false;
      }
      acknowledgeStream(streamId) {
@@ -201,7 +200,7 @@
          this.closeRecordingStream(streamId, undefined);
      }
      /**
-@@ -353,7 +462,7 @@
+@@ -353,7 +461,7 @@
       *   when the HomeKit Controller requests it (see the documentation of `CameraRecordingDelegate`).
       */
      async *handleRecordingStreamRequest(streamId) {
@@ -210,7 +209,7 @@
          this.log.debug('Recording request received.');
          if (!this.cameraRecordingConfiguration)
              throw new Error('No recording configuration for this camera.');
-@@ -368,23 +477,45 @@
+@@ -368,23 +476,45 @@
          this.handlingRecordingStreamingRequest = true;
          if (this.cameraRecordingConfiguration.videoCodec.type !== 0 /* H264 */)
              throw new Error('Unsupported recording codec type.');
@@ -258,7 +257,7 @@
          ];
          let samplerate;
          switch (this.cameraRecordingConfiguration.audioCodec.samplerate) {
-@@ -410,6 +541,11 @@
+@@ -410,6 +540,11 @@
                  throw new Error("Unsupported audio sample rate: " + this.cameraRecordingConfiguration.audioCodec.samplerate);
          }
          const audioArgs = ((_b = (_a = this.controller) === null || _a === void 0 ? void 0 : _a.recordingManagement) === null || _b === void 0 ? void 0 : _b.recordingManagementService.getCharacteristic(this.platform.Characteristic.RecordingAudioActive))
@@ -270,7 +269,7 @@
              ? [
                  "-acodec", "libfdk_aac",
                  ...(this.cameraRecordingConfiguration.audioCodec.type === 0 /* AAC_LC */ ?
-@@ -419,10 +555,134 @@
+@@ -419,10 +554,153 @@
                  "-b:a", `${this.cameraRecordingConfiguration.audioCodec.bitrate}k`,
                  "-ac", `${this.cameraRecordingConfiguration.audioCodec.audioChannels}`,
              ]
@@ -291,7 +290,17 @@
 +        // not that go2rtc can't serve it (go2rtc dials Nest on-demand when ffmpeg connects). Falling
 +        // back to a direct Google WebRTC dial opened a SECOND concurrent Nest session that collides
 +        // with go2rtc's own (exhausts Google's per-device stream limit) -> failed/empty HKSV recording.
-+        // (Only an unnamed camera falls through to the direct dial.)
++        // That collision belonged to the OLD snapshot-freshness gate. Under the current NAME-based
++        // gate it cannot occur: displayName is the SDM room name, nest-go2rtc-sync.py derives go2rtc
++        // stream keys from the same source, so a camera with no room has no go2rtc stream either --
++        // the direct dial is then that device's ONLY session. The fallback is therefore correct to
++        // exist; it serves room-less cameras.
++        // KNOWN FOOT-GUN, separate from the above: this checks only that the slug is NON-EMPTY, never
++        // that go2rtc actually serves it. Rename a room in Google Home and the plugin dials
++        // rtsp://127.0.0.1:8554/<new_slug> forever while go2rtc.yaml still holds the old key -- no
++        // fallback fires (the slug is still truthy) and nothing re-runs nest-go2rtc-sync.py, so that
++        // camera stays dead in HomeKit until someone does. Fail-fast is deliberate (a conflicting
++        // Google dial would be worse), but re-run the sync script after ANY rename.
 +        const useGo2rtcRec = !!go2rtcKeyRec;
 +        if (useGo2rtcRec) {
 +            this.log.debug("HKSV recording: using local go2rtc RTSP (warm stream)", this.camera.getDisplayName());
@@ -382,10 +391,19 @@
 +        // from an assumption about which protocol the cameras negotiated.
 +        //
 +        //  * WebRtcNestStreamer runs a FIR/PLI keyframe-request loop that holds the IDR interval
-+        //    near 2s, comfortably inside the negotiated fragmentLength (4000ms). The stock WebRTC
++        //    near 2s in STEADY STATE -- but see the drought caveat below. The stock WebRTC
 +        //    input was verified under copy frame-for-frame: 594 of 595 frames (one lost to UDP in
 +        //    the harness), first frame type:I, 20 moof over ~25s, no DTS/RTP warnings, and the one
 +        //    decode error was present in the SOURCE capture too rather than introduced by copy.
++        //    DROUGHT CAVEAT, and it is the real cost of copy: under `-codec:v copy` there is no
++        //    -force_key_frames, so ffmpeg can only cut a fragment where the camera put an IDR.
++        //    The transcode could MANUFACTURE one from still-decodable P-frames; copy cannot. In
++        //    a post-motion keyframe drought (12-24s per the fork's traces) the muxer therefore
++        //    emits nothing, and the hub's ~16s patience expires -> truncated or discarded clip.
++        //    Accepted deliberately: droughts are rare, the ring path degrades gracefully via
++        //    LIVE_FLOW_DEADMAN_MS (closes the pipe so ffmpeg finalises a SHORT clip instead of
++        //    the hub discarding everything), and the transcode's own failure mode (dropping
++        //    below realtime under load, #232) truncated clips far more often in practice.
 +        //  * RtspNestStreamer has NO such loop and Nest's RTSP IDR cadence is unmeasured. If it
 +        //    exceeded fragmentLength, copied fragments would breach the one bound that
 +        //    -force_key_frames was guaranteeing. So RTSP -- and only RTSP -- keeps the encoder.
@@ -409,7 +427,7 @@
          // Tear down any prior recording session before overwriting it. A HomeKit hub
          // can start a new recording (e.g. after a brief reconnect) before the previous
          // session's close event fires. Without this, the previous HksvStreamer — and
-@@ -437,12 +697,15 @@
+@@ -437,12 +715,15 @@
              hksvStreamer: hksvStreamer,
              nestStreamer: nestStreamer
          };
@@ -429,7 +447,7 @@
              for await (const box of this.recordingSessionInfo.hksvStreamer.generator()) {
                  pending.push(box.header, box.data);
                  const motionDetected = (_c = this.accessory.getService(this.hap.Service.MotionSensor)) === null || _c === void 0 ? void 0 : _c.getCharacteristic(this.platform.Characteristic.MotionDetected).value;
-@@ -450,6 +713,16 @@
+@@ -450,6 +731,20 @@
                  if (box.type === "moov" || box.type === "mdat") {
                      const fragment = Buffer.concat(pending);
                      pending.splice(0, pending.length);
@@ -439,14 +457,18 @@
 +                    // post-motion drought makes a normal 1.67s fragment arrive seconds late
 +                    // (a false positive). Measuring this properly means diffing tfdt
 +                    // (traf/tfdt baseMediaDecodeTime) between consecutive moofs against the
-+                    // moov timescale. Not implemented: observed cadence is 1.67-2s even at
-+                    // night frame rates, which indicates Nest's IDR interval is time-based
-+                    // rather than frame-count-based, so exceeding the negotiated 4000ms
-+                    // should not arise.
++                    // moov timescale. Not implemented -- but do NOT read that as "it cannot
++                    // happen". Steady-state cadence is 1.67-2s, yet this repo's own go2rtc fork
++                    // recorded, from production traces: healthy Nest video "jitters keyframes
++                    // into the 3-4s range routinely", and after motion a camera "stops sending
++                    // keyframes (sometimes all RTP) for ~12-24s" while it uploads its own event
++                    // clip -- ignoring FIR throughout. HKSV recordings run post-motion BY
++                    // DEFINITION, so that is exactly the window they occupy. Exceeding 4000ms
++                    // does arise; it is just not measured here.
                      const isLast = STOP_AFTER_MOTION_STOP && !motionDetected;
                      yield {
                          data: fragment,
-@@ -463,12 +736,57 @@
+@@ -463,12 +758,57 @@
              }
          }
          catch (error) {
