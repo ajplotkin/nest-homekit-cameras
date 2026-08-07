@@ -20,7 +20,7 @@ This guide walks through the full setup from scratch: getting API access to your
 - **[`install.sh`](install.sh)** — one-shot installer for everything after your Google credentials. Re-running is safe but **not** a no-op: it recreates the go2rtc container (dropping every warm stream) and rewrites the warmer unit. see [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
 - **[`docker-compose.yml`](docker-compose.yml)** — the go2rtc + warmer half of the stack as Compose services.
 - **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches), `setup-google-device-access.sh` (automates Part 1 — the Google Cloud half of the credentials setup), and `check-drift.sh` (read-only; proves your deployment still matches this repo — see [Checking for drift](#checking-for-drift)).
-- **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), four plugin diffs against stock 1.1.24 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`), and `homebridge-plugin/new-files/PrebufferManager.js` (a new file, copied in rather than patched — it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)).
+- **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), five plugin diffs against stock 1.1.24 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`), and `homebridge-plugin/new-files/PrebufferManager.js` (a new file, copied in rather than patched — it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)).
 
 The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-6)** — build from the stable tag **`nestfix-1.9.14-6`** (development happens on the `fix/nest-ipv6-ice-failure` branch, which may carry in-progress work, so don't build from the branch.). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
 
@@ -473,7 +473,7 @@ The script pins the plugin version it was cut against (**1.1.24**) and **refuses
 
 > **These patches live in `node_modules` and are wiped by any `npm install` of the plugin.** Re-run `apply-snapshot-patch.sh` after any plugin install or upgrade — always in that order: `npm install` first, patch script second. (That is also how you *uninstall* them: reinstall the plugin and don't re-run the patcher.)
 >
-> **This applies all four patches plus one new file, including the Part 6 live-view routing** — the script has no per-patch switch. If you don't want Part 6, read it first and be aware Homebridge needs `--network host`.
+> **This applies all five patches plus one new file, including the Part 6 live-view routing** — the script has no per-patch switch. If you don't want Part 6, read it first and be aware Homebridge needs `--network host`.
 
 ## Part 5: Verify
 
@@ -737,7 +737,7 @@ docker logs homebridge 2>&1 | grep "Using local go2rtc RTSP"
 
 If it appears, live view is coming from the warm stream. If instead you see the plugin opening a Google dial, `go2rtcKey` didn't match a stream name — compare the accessory name against the stream names in `curl -s http://127.0.0.1:1985/api/streams`.
 
-To undo Part 6: reinstall the plugin (`npm install homebridge-google-nest-sdm@1.1.24`) and don't re-run the patch script. That reverts all four patches and removes `PrebufferManager.js`, so re-apply them if you still want the snapshot fix — there is no per-patch switch.
+To undo Part 6: reinstall the plugin (`npm install homebridge-google-nest-sdm@1.1.24`) and don't re-run the patch script. That reverts all five patches and removes `PrebufferManager.js`, so re-apply them if you still want the snapshot fix — there is no per-patch switch.
 
 ### When go2rtc receives but forwards nothing — check this FIRST
 

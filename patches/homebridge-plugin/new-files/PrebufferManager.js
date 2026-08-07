@@ -23,7 +23,7 @@ const stream_1 = require("stream");
  *
  * Separately, HomeKit *asks* for footage before the trigger (`prebufferLength`);
  * that requirement is additive to the lateness above. To honestly serve a 4s
- * advertised prebuffer we need 4 + ~3.3 = ~7.3s of history, hence the 12s default.
+ * advertised prebuffer we need 4 + ~3.3 = ~7.3s of history, hence the 15s default (see DEFAULT_BUFFER_SECONDS, which explains why 12 was rejected).
  *
  * THE APPROACH
  * ------------
@@ -79,7 +79,9 @@ const MAX_BOX_BYTES = 16 * 1024 * 1024;
 // in HksvStreamer): without this the queue grows at ~150KB/s indefinitely.
 const MAX_QUEUED_FRAGMENTS = 240;
 // A ring whose newest fragment is older than this is not usable for pre-trigger history.
-// Generous relative to the ~1.67s IDR cadence, but well inside the hub's ~16s patience.
+// Generous relative to the ~1.67s IDR cadence. Note this is NOT bounded by the hub's ~16s
+// patience -- 20s exceeds it -- but the check is instantaneous, so a stale ring is reported
+// unavailable immediately and the caller falls back rather than waiting.
 const STALE_RING_MS = 20000;
 // If a reader that HAS produced goes this long without a fragment, it has stalled silently.
 // Nest drops to very low frame rates when idle, so this must be well clear of that; 60s is

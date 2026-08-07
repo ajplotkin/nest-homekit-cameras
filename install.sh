@@ -206,7 +206,13 @@ API="http://127.0.0.1:1985"
 warm=$(curl -s -m 8 "$API/api/streams" 2>/dev/null | python3 -c 'import sys,json;d=json.load(sys.stdin);print(sum(1 for s in d.values() for p in (s.get("producers") or []) for r in (p.get("receivers") or []) if (r.get("bytes") or 0)>0))' 2>/dev/null || echo 0)
 ok "go2rtc reports $warm warm receiver(s)"
 sleep 12
-n=$(ls "$SNAPS_DIR"/*.jpg 2>/dev/null | wc -l | tr -d ' ')
+# `ls` exits 2 when nothing matches, and under `set -euo pipefail` that propagated
+# through the assignment and killed the installer right here -- before the warn below
+# written for this exact case, and before the closing "do NOT docker restart" message,
+# which is the most important line the script prints. The `warm=` line above already
+# guards this way; this one did not. Zero snapshots is normal on a cold start or with
+# every camera switched off.
+n=$(find "$SNAPS_DIR" -maxdepth 1 -name '*.jpg' 2>/dev/null | wc -l | tr -d ' ') || n=0
 [ "$n" -gt 0 ] && ok "$n snapshot file(s) on disk in $SNAPS_DIR" || warn "no snapshot files yet — check 'journalctl -u go2rtc-snapshot-warmer' and that cameras are on"
 echo
 # The prebuffer ships with the patches but is OFF unless hksvPrebufferSeconds is set. Say so
