@@ -86,8 +86,24 @@ for entry in "${patches[@]}"; do
   tgt="$PLUGIN/$target"
   [ -f "$patchfile" ] || { echo "  ERROR: missing patch file $patchfile"; failed=1; continue; }
   [ -f "$tgt" ]       || { echo "  ERROR: target not found: $target"; failed=1; continue; }
+  # Was this file patched with THIS generation of the diff? A sentinel string cannot
+  # answer that -- it stays present after an OLDER generation was applied, so a re-cut
+  # patch gets silently skipped and the file keeps stale hunks. That happened on
+  # 2026-08-07: the cameraStreamCount hunk never reached the Pi because `go2rtcKey` was
+  # already there from an earlier run, and the script cheerfully said "already patched".
+  # A reverse dry-run compares CONTENT, so it succeeds only if the target already
+  # contains exactly this patch.
+  if patch -p1 -d "$PLUGIN" --dry-run --reverse --force <"$patchfile" >/dev/null 2>&1; then
+    echo "  ok: $target already patched (this exact diff)"
+    continue
+  fi
+  # Sentinel present but content differs => an older generation is applied. Forward-apply
+  # would fail confusingly, so name the actual problem and how to recover.
   if grep -qF "$sentinel" "$tgt"; then
-    echo "  ok: $target already patched"
+    echo "  ERROR: $target carries an OLDER generation of $pf"
+    echo "         (sentinel '$sentinel' present, but content differs from this diff)."
+    echo "         Restore it from stock $EXPECT_VER, then re-run this script."
+    failed=1
     continue
   fi
   if patch -p1 -d "$PLUGIN" --dry-run <"$patchfile" >/dev/null 2>&1; then
