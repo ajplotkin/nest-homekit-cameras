@@ -110,7 +110,7 @@ index d0a6d97..83ce635 100644
  	// Apple Safari won't show frame without length
  	header := w.Header()
 diff --git a/internal/streams/preload.go b/internal/streams/preload.go
-index 447b5ac..f08439f 100644
+index 447b5ac..3f76f0b 100644
 --- a/internal/streams/preload.go
 +++ b/internal/streams/preload.go
 @@ -5,12 +5,13 @@ import (
@@ -160,7 +160,7 @@ index 447b5ac..f08439f 100644
  func AddPreload(name, rawQuery string) error {
  	if rawQuery == "" {
  		rawQuery = "video&audio"
-@@ -42,23 +68,107 @@ func AddPreload(name, rawQuery string) error {
+@@ -42,23 +68,119 @@ func AddPreload(name, rawQuery string) error {
  	cons := probe.Create("preload", query)
  
  	if err = stream.AddConsumer(cons); err != nil {
@@ -230,10 +230,22 @@ index 447b5ac..f08439f 100644
 +			continue // still unavailable; try again next cycle
 +		}
 +
-+		// Dial succeeded — register under lock, but a concurrent AddPreload/retry may have won
-+		// while we were dialing; if so, drop our extra consumer instead of leaking it.
++		// Dial succeeded. Two reasons not to register, both checked under the lock:
++		//
++		//  1. We were CANCELLED while dialing. The select above only covers cancellation
++		//     that arrives while waiting; a dial takes seconds (much longer behind a 429
++		//     backoff), and DelPreload during that window deletes preloads[name] — so the
++		//     `preloads[name] == nil` test alone reads as "free to register" and puts back
++		//     exactly the preload the operator just deleted. That resurrection is the bug
++		//     this whole cancel mechanism exists to prevent, so testing only the nil was
++		//     not enough.
++		//  2. A concurrent AddPreload or a newer retry won while we were dialing.
++		//
++		// preloadRetries[name] == stop is the single test for "still ours, still wanted":
++		// a canceller deletes the entry, and a replacement overwrites it, so anything other
++		// than our own channel means do not register.
 +		preloadsMu.Lock()
-+		if preloads[name] == nil {
++		if preloadRetries[name] == stop && preloads[name] == nil {
 +			preloads[name] = &Preload{stream: stream, Cons: cons, Query: rawQuery}
 +			preloadsMu.Unlock()
 +		} else {
@@ -268,6 +280,73 @@ index 447b5ac..f08439f 100644
  	return fmt.Errorf("streams: preload not found: %s", name)
  }
  
+diff --git a/internal/streams/preload_cancel_test.go b/internal/streams/preload_cancel_test.go
+new file mode 100644
+index 0000000..6ee7e65
+--- /dev/null
++++ b/internal/streams/preload_cancel_test.go
+@@ -0,0 +1,61 @@
++package streams
++
++import (
++	"testing"
++)
++
++// DelPreload must cancel a pending retry, and a retry that was cancelled MID-DIAL must
++// not register afterwards. The mid-dial case is the one that matters: the select in
++// retryPreload only covers cancellation while waiting, so a naive `preloads[name] == nil`
++// check at registration time reads as "free to register" and puts back the preload the
++// operator just deleted.
++//
++// This exercises the decision directly rather than spinning a real 2-minute retry.
++func TestPreloadRetryCancelledMidDialDoesNotRegister(t *testing.T) {
++	preloadsMu.Lock()
++	preloads = map[string]*Preload{}
++	preloadRetries = map[string]chan struct{}{}
++	stop := make(chan struct{})
++	preloadRetries["cam"] = stop
++	preloadsMu.Unlock()
++
++	// Operator deletes the preload while our goroutine is mid-dial.
++	preloadsMu.Lock()
++	cancelled := cancelRetryLocked("cam")
++	preloadsMu.Unlock()
++	if !cancelled {
++		t.Fatal("cancelRetryLocked should have reported cancelling a pending retry")
++	}
++
++	// The dial now succeeds. This is the exact registration guard from retryPreload.
++	preloadsMu.Lock()
++	mayRegister := preloadRetries["cam"] == stop && preloads["cam"] == nil
++	preloadsMu.Unlock()
++
++	if mayRegister {
++		t.Fatal("a retry cancelled mid-dial would re-register the deleted preload")
++	}
++
++	// And with no cancellation, it must still be allowed to register.
++	preloadsMu.Lock()
++	stop2 := make(chan struct{})
++	preloadRetries["cam2"] = stop2
++	ok := preloadRetries["cam2"] == stop2 && preloads["cam2"] == nil
++	preloadsMu.Unlock()
++	if !ok {
++		t.Fatal("an uncancelled retry must still be able to register")
++	}
++}
++
++// Cancelling twice must not panic on a double close.
++func TestCancelRetryTwiceDoesNotDoubleClose(t *testing.T) {
++	preloadsMu.Lock()
++	preloadRetries = map[string]chan struct{}{}
++	preloadRetries["cam"] = make(chan struct{})
++	first := cancelRetryLocked("cam")
++	second := cancelRetryLocked("cam")
++	preloadsMu.Unlock()
++	if !first || second {
++		t.Fatalf("expected first=true second=false, got first=%v second=%v", first, second)
++	}
++}
 diff --git a/internal/streams/producer.go b/internal/streams/producer.go
 index 09e2dcc..861cfe1 100644
 --- a/internal/streams/producer.go
