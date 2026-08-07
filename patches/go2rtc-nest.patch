@@ -110,7 +110,7 @@ index d0a6d97..83ce635 100644
  	// Apple Safari won't show frame without length
  	header := w.Header()
 diff --git a/internal/streams/preload.go b/internal/streams/preload.go
-index 447b5ac..dd1906f 100644
+index 447b5ac..e7a71aa 100644
 --- a/internal/streams/preload.go
 +++ b/internal/streams/preload.go
 @@ -5,12 +5,13 @@ import (
@@ -165,7 +165,21 @@ index 447b5ac..dd1906f 100644
  func AddPreload(name, rawQuery string) error {
  	if rawQuery == "" {
  		rawQuery = "video&audio"
-@@ -42,23 +73,119 @@ func AddPreload(name, rawQuery string) error {
+@@ -33,6 +64,13 @@ func AddPreload(name, rawQuery string) error {
+ 
+ 	if p := preloads[name]; p != nil {
+ 		p.stream.RemoveConsumer(p.Cons)
++		// Delete the entry too, not just its consumer. If the fresh dial below fails we
++		// return early, and leaving the old entry behind means: the API reports a healthy
++		// preload whose consumer is gone, AND the retry goroutine we just spawned exits on
++		// its first wake because `preloads[name] != nil` -- so the background reattach this
++		// whole mechanism exists for never happens. Reachable via PUT /api/preload on an
++		// existing name while the camera is off.
++		delete(preloads, name)
+ 	}
+ 
+ 	stream := Get(name)
+@@ -42,23 +80,119 @@ func AddPreload(name, rawQuery string) error {
  	cons := probe.Create("preload", query)
  
  	if err = stream.AddConsumer(cons); err != nil {
