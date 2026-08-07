@@ -270,7 +270,7 @@
              ? [
                  "-acodec", "libfdk_aac",
                  ...(this.cameraRecordingConfiguration.audioCodec.type === 0 /* AAC_LC */ ?
-@@ -419,10 +555,108 @@
+@@ -419,10 +555,131 @@
                  "-b:a", `${this.cameraRecordingConfiguration.audioCodec.bitrate}k`,
                  "-ac", `${this.cameraRecordingConfiguration.audioCodec.audioChannels}`,
              ]
@@ -374,16 +374,39 @@
 +        // The advertisement is deliberately left alone: changing it would alter the
 +        // supported-config hash and force every camera to renegotiate. Copy needs no such
 +        // change, so this carries no renegotiation risk.
++        // The real gate is WEBRTC-vs-RTSP, not go2rtc. Gating on useGo2rtcRec alone left the
++        // direct-dial fallback transcoding a stream that is safe to copy -- and on this
++        // deployment every camera is WEB_RTC, so the fallback IS the verified-safe case.
++        //
++        //  * WebRtcNestStreamer runs a FIR/PLI keyframe-request loop that holds the IDR interval
++        //    near 2s, comfortably inside the negotiated fragmentLength (4000ms). The stock WebRTC
++        //    input was verified under copy frame-for-frame: 594 of 595 frames (one lost to UDP in
++        //    the harness), first frame type:I, 20 moof over ~25s, no DTS/RTP warnings, and the one
++        //    decode error was present in the SOURCE capture too rather than introduced by copy.
++        //  * RtspNestStreamer has NO such loop and Nest's RTSP IDR cadence is unmeasured. If it
++        //    exceeded fragmentLength, copied fragments would breach the one bound that
++        //    -force_key_frames was guaranteeing. So RTSP -- and only RTSP -- keeps the encoder.
++        //
++        // Known limit, same as upstream: cameras that renegotiate resolution MID-SESSION (newer
++        // Nest hardware, 640x368 <-> 1920x1088) freeze under copy, because an fMP4 track declares
++        // its dimensions once in the init segment and cannot re-declare them. Transcode WITHOUT a
++        // scale filter freezes too, so this is not a regression introduced here -- the real fix is
++        // pinning -vf scale= to the negotiated resolution, which is a separate change. All four
++        // cameras on this deployment hold a single resolution.
 +        let recVideoArgs = videoArgs;
-+        if (useGo2rtcRec) {
++        const copyOk = useGo2rtcRec || nestStreamer instanceof NestStreamer_1.WebRtcNestStreamer;
++        if (copyOk) {
 +            recVideoArgs = ["-sn", "-dn", "-codec:v", "copy"];
-+            this.log.debug('HKSV recording: copying video (no transcode)', this.camera.getDisplayName());
++            this.log.debug(`HKSV recording: copying video (no transcode), source=${useGo2rtcRec ? 'go2rtc' : 'webrtc-direct'}`, this.camera.getDisplayName());
++        }
++        else {
++            this.log.debug('HKSV recording: transcoding (RTSP source, IDR cadence unmeasured)', this.camera.getDisplayName());
 +        }
 +        const hksvStreamer = new HksvStreamer_1.default(this.log, nestStream, audioArgs, recVideoArgs, this.platform.debugMode);
          // Tear down any prior recording session before overwriting it. A HomeKit hub
          // can start a new recording (e.g. after a brief reconnect) before the previous
          // session's close event fires. Without this, the previous HksvStreamer — and
-@@ -437,12 +671,15 @@
+@@ -437,12 +694,15 @@
              hksvStreamer: hksvStreamer,
              nestStreamer: nestStreamer
          };
@@ -403,7 +426,7 @@
              for await (const box of this.recordingSessionInfo.hksvStreamer.generator()) {
                  pending.push(box.header, box.data);
                  const motionDetected = (_c = this.accessory.getService(this.hap.Service.MotionSensor)) === null || _c === void 0 ? void 0 : _c.getCharacteristic(this.platform.Characteristic.MotionDetected).value;
-@@ -450,6 +687,16 @@
+@@ -450,6 +710,16 @@
                  if (box.type === "moov" || box.type === "mdat") {
                      const fragment = Buffer.concat(pending);
                      pending.splice(0, pending.length);
@@ -420,7 +443,7 @@
                      const isLast = STOP_AFTER_MOTION_STOP && !motionDetected;
                      yield {
                          data: fragment,
-@@ -463,12 +710,57 @@
+@@ -463,12 +733,57 @@
              }
          }
          catch (error) {
