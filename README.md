@@ -1038,10 +1038,30 @@ version, and a clean drift report could never have revealed it. To check the go2
 the tag you built from against the one in Part 3 and rebuild if they differ.
 
 **`package.json` is reported but never treated as authoritative.** Patching `dist/` in place
-doesn't make npm rewrite the version field, so a plugin whose code is 1.1.24 can keep reporting
-1.1.23 indefinitely. It still matters — `apply-snapshot-patch.sh` reads that field and will refuse
-to run after an `npm install` — but it says nothing about which code is executing. Only `--deep`
-answers that.
+doesn't make npm rewrite the version field, so a plugin whose code matches one release can keep
+reporting another indefinitely. It still matters — `apply-snapshot-patch.sh` compares that field
+against its `EXPECT_VER` and refuses to run when they differ — but it says nothing about which
+code is executing. Only `--deep` answers that.
+
+> **Pin the plugin to the version the patches were cut from.** If your Homebridge
+> `package.json` pins a fork or tarball whose version field differs from `EXPECT_VER`, the
+> recovery script refuses on the one machine you need it on, and every wipe becomes manual
+> surgery. This deployment pinned a tarball reporting `1.1.23` whose `dist/` was byte-identical
+> to npm `1.1.24`; repointing the pin to `1.1.24` changed no running code and restored
+> one-command recovery.
+
+> **Keep the recovery kit ON the box.** "Re-run `apply-snapshot-patch.sh`" is only useful if the
+> script and `patches/` are actually there — a wipe is exactly when you don't want to be copying
+> files over first. Stage them once:
+>
+> ```bash
+> ssh you@your-pi 'mkdir -p ~/nest-recovery'
+> scp -r scripts/apply-snapshot-patch.sh you@your-pi:~/nest-recovery/scripts/
+> scp -r patches/homebridge-plugin you@your-pi:~/nest-recovery/patches/
+> ```
+>
+> Then recovery is `sudo HOMEBRIDGE_DIR=/path/to/homebridge ./apply-snapshot-patch.sh` followed
+> by the `pkill` reload.
 
 Exit status is 0 when clean and 1 on drift, so it works as a cron canary. When something has
 drifted, establish the **direction** before copying anything: the repo may be ahead (deploy it),
