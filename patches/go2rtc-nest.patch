@@ -110,7 +110,7 @@ index d0a6d97..83ce635 100644
  	// Apple Safari won't show frame without length
  	header := w.Header()
 diff --git a/internal/streams/preload.go b/internal/streams/preload.go
-index 447b5ac..0465b0e 100644
+index 447b5ac..f08439f 100644
 --- a/internal/streams/preload.go
 +++ b/internal/streams/preload.go
 @@ -5,12 +5,13 @@ import (
@@ -128,27 +128,88 @@ index 447b5ac..0465b0e 100644
  	Cons   *probe.Probe `json:"consumer"`
  	Query  string       `json:"query"`
  }
-@@ -42,6 +43,10 @@ func AddPreload(name, rawQuery string) error {
+@@ -18,6 +19,31 @@ type Preload struct {
+ var preloads = map[string]*Preload{}
+ var preloadsMu sync.Mutex
+ 
++// In-flight retry goroutines, name -> cancel channel. Guarded by preloadsMu.
++//
++// Without this the retry loop was fire-and-forget: it exited only once a preload
++// existed for the name or the stream vanished from config. Two consequences, both
++// observed as possible by inspection rather than in production here, where preloads
++// come only from boot config:
++//   - DelPreload on a preload that had never successfully attached returned "not
++//     found" and left the goroutine running, so when the camera came back it
++//     re-registered the preload the operator had just deleted.
++//   - Every failing AddPreload spawned another goroutine, each dialing SDM on its own
++//     2-minute cadence against the same quota, until one happened to succeed.
++var preloadRetries = map[string]chan struct{}{}
++
++// cancelRetryLocked stops any in-flight retry for name. preloadsMu must be held.
++// The canceller closes the channel and removes the entry; the goroutine only ever
++// reads from it, so there is exactly one closer and no double-close.
++func cancelRetryLocked(name string) bool {
++	if stop, ok := preloadRetries[name]; ok {
++		close(stop)
++		delete(preloadRetries, name)
++		return true
++	}
++	return false
++}
++
+ func AddPreload(name, rawQuery string) error {
+ 	if rawQuery == "" {
+ 		rawQuery = "video&audio"
+@@ -42,23 +68,107 @@ func AddPreload(name, rawQuery string) error {
  	cons := probe.Create("preload", query)
  
  	if err = stream.AddConsumer(cons); err != nil {
 +		// The source may be temporarily unavailable (e.g. a Nest camera powered off at
 +		// boot returns 400). Retry in the background so the preload attaches when the
 +		// source comes back, instead of staying cold until a restart.
-+		go retryPreload(name, rawQuery, query)
++		//
++		// Single-flight: only one retry goroutine per name, or repeated AddPreload calls
++		// each add another dialer against the same SDM quota.
++		if _, busy := preloadRetries[name]; !busy {
++			stop := make(chan struct{})
++			preloadRetries[name] = stop
++			go retryPreload(name, rawQuery, query, stop)
++		}
  		return err
  	}
  
-@@ -49,6 +54,46 @@ func AddPreload(name, rawQuery string) error {
++	// Attached directly, so any retry for this name is now redundant. It would exit on
++	// its own next wake, but cancelling frees it (and its timer) immediately.
++	cancelRetryLocked(name)
++
+ 	preloads[name] = &Preload{stream: stream, Cons: cons, Query: rawQuery}
  	return nil
  }
  
-+func retryPreload(name, rawQuery string, query url.Values) {
++func retryPreload(name, rawQuery string, query url.Values, stop chan struct{}) {
++	// Deregister on every exit path so a later AddPreload can start a fresh retry --
++	// but only if the map still points at OUR channel, since a canceller may already
++	// have removed us and a newer goroutine taken the slot.
++	defer func() {
++		preloadsMu.Lock()
++		if preloadRetries[name] == stop {
++			delete(preloadRetries, name)
++		}
++		preloadsMu.Unlock()
++	}()
++
 +	for {
 +		// Gentler than 1 min: each attempt is one GenerateWebRtcStream (SDM executeCommand,
 +		// counts against the 100 QPH/camera and shared 10 QPM/project quotas). 2 min keeps a
 +		// recovered camera warming reasonably fast without hammering quota while it stays off.
-+		time.Sleep(2 * time.Minute)
++		//
++		// Waited on alongside stop so DelPreload takes effect immediately rather than up to
++		// two minutes later, and so a cancelled retry cannot dial once more on its way out.
++		select {
++		case <-stop:
++			return
++		case <-time.After(2 * time.Minute):
++		}
 +
 +		// Decide whether we still need to retry, then release the lock BEFORE the network dial
 +		// so a 429 backoff inside AddConsumer can't hold preloadsMu (blocking config reload /
@@ -186,6 +247,27 @@ index 447b5ac..0465b0e 100644
  func DelPreload(name string) error {
  	preloadsMu.Lock()
  	defer preloadsMu.Unlock()
+ 
++	// Cancel an in-flight retry as well as removing any attached preload. A preload that
++	// has never successfully attached exists ONLY as a retry goroutine, so without this
++	// DelPreload reported "not found" and left it running -- and it would re-register the
++	// preload the operator had just deleted as soon as the source came back.
++	cancelled := cancelRetryLocked(name)
++
+ 	if p := preloads[name]; p != nil {
+ 		p.stream.RemoveConsumer(p.Cons)
+ 		delete(preloads, name)
+ 		return nil
+ 	}
+ 
++	// Cancelling a pending retry is a real deletion, not a miss.
++	if cancelled {
++		return nil
++	}
++
+ 	return fmt.Errorf("streams: preload not found: %s", name)
+ }
+ 
 diff --git a/internal/streams/producer.go b/internal/streams/producer.go
 index 09e2dcc..861cfe1 100644
 --- a/internal/streams/producer.go
@@ -209,7 +291,7 @@ index 09e2dcc..861cfe1 100644
  
  	p.reconnect(workerID, 0)
 diff --git a/pkg/core/writebuffer.go b/pkg/core/writebuffer.go
-index 50ad013..b489c7b 100644
+index 50ad013..27d800a 100644
 --- a/pkg/core/writebuffer.go
 +++ b/pkg/core/writebuffer.go
 @@ -13,10 +13,11 @@ import (
@@ -228,7 +310,7 @@ index 50ad013..b489c7b 100644
  }
  
  func NewWriteBuffer(wr io.Writer) *WriteBuffer {
-@@ -47,10 +48,16 @@ func (w *WriteBuffer) WriteTo(wr io.Writer) (n int64, err error) {
+@@ -47,10 +48,38 @@ func (w *WriteBuffer) WriteTo(wr io.Writer) (n int64, err error) {
  }
  
  func (w *WriteBuffer) Close() error {
@@ -239,14 +321,36 @@ index 50ad013..b489c7b 100644
 +	w.mu.Unlock()
 +
 +	if closer, ok := writer.(io.Closer); ok {
++		// Mark closed on this path too. Returning early left err nil, so a later Write
++		// had nothing to reject on -- same hazard as below.
++		w.mu.Lock()
++		w.closed = true
++		if w.err == nil {
++			w.err = io.ErrClosedPipe
++		}
++		w.mu.Unlock()
  		return closer.Close()
  	}
  	w.mu.Lock()
 +	w.closed = true
++	// Set err, not merely closed. Write() gates on `w.err != nil` and nothing else, so
++	// before this a write arriving after Close() went straight through to
++	// w.Writer.Write() -- and on the HTTP path that Writer is net/http's bufio.Writer,
++	// which is RECYCLED into the server's pool once the handler returns. Writing into a
++	// pooled buffer now owned by an unrelated request is the cause behind the
++	// long-running panic reports upstream (#338, #1220, #1261, #1757); this mirrors
++	// upstream PR #2339 (Color-Kat).
++	//
++	// Worth stating plainly: a panic here takes down the go2rtc process, i.e. every
++	// camera at once. On this deployment that is a whole-stack outage, not one dropped
++	// consumer.
++	if w.err == nil {
++		w.err = io.ErrClosedPipe
++	}
  	w.done()
  	w.mu.Unlock()
  	return nil
-@@ -76,7 +83,8 @@ const (
+@@ -76,7 +105,8 @@ const (
  )
  
  func (w *WriteBuffer) add() {
@@ -258,10 +362,10 @@ index 50ad013..b489c7b 100644
  	}
 diff --git a/pkg/core/writebuffer_test.go b/pkg/core/writebuffer_test.go
 new file mode 100644
-index 0000000..c35dae2
+index 0000000..0d25151
 --- /dev/null
 +++ b/pkg/core/writebuffer_test.go
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,80 @@
 +package core
 +
 +import (
@@ -295,6 +399,34 @@ index 0000000..c35dae2
 +	case <-time.After(time.Second):
 +		t.Fatal("WriteTo did not unblock after Close - the consumer would leak")
 +	}
++}
++
++// countingWriter records whether it was ever written to. Deliberately NOT an
++// io.Closer, so Close() takes the same path the HTTP consumer path takes.
++type countingWriter struct{ writes int }
++
++func (c *countingWriter) Write(p []byte) (int, error) {
++	c.writes++
++	return len(p), nil
++}
++
++// A Write arriving after Close must be rejected and must NOT reach the underlying
++// writer. On the HTTP path that writer is net/http's bufio.Writer, which is recycled
++// into the server pool once the handler returns — writing into it then corrupts an
++// unrelated request's buffer, which is the panic behind upstream #338/#1220/#1261/#1757.
++//
++// Close previously set only `closed`, while Write gates solely on `err`, so this was
++// reachable. Reverting the err-on-close lines in Close() makes this test fail; the two
++// tests above pass either way, which is why this one exists.
++func TestWriteBufferWriteAfterCloseDoesNotReachWriter(t *testing.T) {
++	cw := &countingWriter{}
++	wb := NewWriteBuffer(cw)
++
++	require.NoError(t, wb.Close())
++
++	_, err := wb.Write([]byte("late"))
++	require.Error(t, err, "Write after Close must return an error")
++	require.Zero(t, cw.writes, "Write after Close reached the underlying writer")
 +}
 +
 +// Close before WriteTo registers its wait must not block WriteTo forever.
@@ -742,7 +874,7 @@ index 6a57091..416b6cf 100644
  }
  
 diff --git a/pkg/webrtc/conn.go b/pkg/webrtc/conn.go
-index 924fd55..6e2f679 100644
+index 924fd55..47385cb 100644
 --- a/pkg/webrtc/conn.go
 +++ b/pkg/webrtc/conn.go
 @@ -1,17 +1,26 @@
@@ -868,7 +1000,7 @@ index 924fd55..6e2f679 100644
  					if err := pc.WriteRTCP(pkts); err != nil {
  						return
  					}
-@@ -98,6 +175,95 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -98,6 +175,86 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}()
  		}
  
@@ -896,27 +1028,18 @@ index 924fd55..6e2f679 100644
 +		// producer.go re-dial a fresh session (a REPLACEMENT: the old pc is closed here first):
 +		//   - no real video RTP at all for 8s (full stall), or
 +		//   - real video flows but no keyframe for 60s (a session gone permanently dry).
++		// A fresh session is the ONLY thing that ends a drought: Nest withholds video ~12-24s after a
++		// motion event and IGNORES FIR (verified 2026-07-22 17:12 UTC: idr_age climbed past 11s while
++		// FIR was sent 5x), but a re-dialed session opens with an IDR and recovers in ~2-4s.
 +		//
-+		// The keyframe deadline was 4s and that was WRONG. Measured over 48h (2026-08-03/04): 23 of
-+		// 26 closes were this trigger, and 13 of those killed a session whose video had arrived less
-+		// than 2s earlier (median 1.28s; several at 40-120ms). Healthy Nest video jitters keyframes
-+		// into the 3-4s range routinely, so a 4s deadline sits inside the tail of NORMAL behaviour and
-+		// was killing sessions about to recover — ~10x/day, each forcing a re-dial whose fresh RTP
-+		// splices into every still-open consumer session. That splice silently freezes a long-lived
-+		// consumer's audio timeline, which cost a real doorbell recording on 2026-08-03.
-+		//
-+		// It no longer serves its original purpose either. It predates the prebuffer and existed to
-+		// stop a recording connecting to a keyframe-dry stream and emitting an init-only clip. A
-+		// recording is now fed buffered history immediately, never waits on a live keyframe, and its
-+		// own deadman finalizes a history-only clip if live never arrives.
-+		//
-+		// Kept, not deleted: it is the ONLY mechanism that can replace a session while video RTP
-+		// still flows. producer.go reconnects only on connection error, an expired-but-trickling
-+		// session never errors, preload pins the producer alive, and the prebuffer's stall timers
-+		// only restart its own ffmpeg against the same dry producer. That state is real —
-+		// 2026-08-01T18:58:05Z, idr_age 42.8s with video_age 1ms. 60s bounds it without firing on
-+		// jitter. connID distinguishes cameras in the logs — Nest assigns SSRC 7777 to every camera,
-+		// so SSRC can't tell them apart.
++		// The keyframe deadline was 4s and that was WRONG. Measured over 48h (2026-08-03/04): it fired
++		// 23 times, and 13 of those killed a session whose video had arrived under 2s earlier (median
++		// 1.28s, several at 40-120ms). Healthy Nest video jitters keyframes into the 3-4s range
++		// routinely, so a 4s deadline sits inside the tail of NORMAL behaviour — and every kill forces
++		// a re-dial, which splices fresh RTP into any still-open consumer session. It was manufacturing
++		// the hazard it was meant to guard against, and it censored every drought measurement at 4s.
++		// At 60s it fires only on a session that is never coming back. connID distinguishes cameras in
++		// the logs — Nest assigns SSRC 7777 to every camera, so SSRC can't tell them apart.
 +		if isNestVideo {
 +			now := time.Now().UnixNano()
 +			lastVideoNS.Store(now)
@@ -964,7 +1087,7 @@ index 924fd55..6e2f679 100644
  		for {
  			b := make([]byte, ReceiveMTU)
  			n, _, err := remote.Read(b)
-@@ -113,9 +279,55 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -113,9 +270,55 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}
  
  			if len(packet.Payload) == 0 {
@@ -1020,7 +1143,7 @@ index 924fd55..6e2f679 100644
  			track.WriteRTP(packet)
  		}
  	})
-@@ -137,6 +349,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -137,6 +340,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			for _, sender := range c.Senders {
  				sender.Start()
  			}
@@ -1040,7 +1163,7 @@ index 924fd55..6e2f679 100644
  		case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
  			// disconnect event comes earlier, than failed
  			// but it comes only for success connections
-@@ -147,6 +372,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -147,6 +363,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  	return c
  }
  

@@ -19,10 +19,10 @@ This guide walks through the full setup from scratch: getting API access to your
 - **This README** — the complete, from-scratch guide (start here and read top to bottom).
 - **[`install.sh`](install.sh)** — one-shot installer for everything after your Google credentials. Re-running is safe but **not** a no-op: it recreates the go2rtc container (dropping every warm stream) and rewrites the warmer unit. see [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
 - **[`docker-compose.yml`](docker-compose.yml)** — the go2rtc + warmer half of the stack as Compose services.
-- **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches), `setup-google-device-access.sh` (automates Part 1 — the Google Cloud half of the credentials setup), and `check-drift.sh` (read-only; proves your deployment still matches this repo — see [Checking for drift](#checking-for-drift)).
+- **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches), `setup-google-device-access.sh` (automates Part 1 — the Google Cloud half of the credentials setup), `test-prebuffer-e2e.js` (end-to-end proof the prebuffer ring actually recovers pre-trigger footage — see [Testing the prebuffer](#testing-the-prebuffer)), and `check-drift.sh` (read-only; proves your deployment still matches this repo — see [Checking for drift](#checking-for-drift)).
 - **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), five plugin diffs against stock 1.1.24 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`), and `homebridge-plugin/new-files/PrebufferManager.js` (a new file, copied in rather than patched — it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)).
 
-The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-6)** — build from the stable tag **`nestfix-1.9.14-6`** (development happens on the `fix/nest-ipv6-ice-failure` branch, which may carry in-progress work, so don't build from the branch.). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
+The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-7)** — build from the stable tag **`nestfix-1.9.14-7`** (development happens on the `fix/nest-ipv6-ice-failure` branch, which may carry in-progress work, so don't build from the branch.). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
 
 Two things worth calling out for anyone arriving because their recordings are unreliable:
 **HKSV clips from the stock plugin are silent** (an `-an` overrides the whole audio block —
@@ -230,12 +230,12 @@ The fork also removes an inner retry loop in `rtcConn` that burned ~130 SDM API 
 ```bash
 git clone https://github.com/ajplotkin/go2rtc.git
 cd go2rtc
-git checkout nestfix-1.9.14-6   # stable tag — not the dev branch
+git checkout nestfix-1.9.14-7   # stable tag — not the dev branch
 ```
 
 > **Prefer to patch stock go2rtc yourself?** Instead of cloning the fork, check out upstream go2rtc at the `v1.9.14` tag and apply [`patches/go2rtc-nest.patch`](patches/go2rtc-nest.patch) from this repo (`git clone https://github.com/AlexxIT/go2rtc && cd go2rtc && git checkout v1.9.14 && git apply /path/to/go2rtc-nest.patch`), then run the same build command below. The diff is the exact set of source changes described in this guide, plus the credited community PRs.
 >
-> **The two routes do not produce identical binaries.** The patch is a clean diff against `v1.9.14`, but the fork is branched from upstream `master` at [`c245815`](https://github.com/AlexxIT/go2rtc/commit/c245815) — v1.9.14 plus 70 upstream commits — so the fork tree differs from `v1.9.14` in 107 files while this patch touches 13. Within those 13 the two routes agree exactly; everywhere else the fork carries upstream work that `v1.9.14` does not. Build from the fork if you want what is actually running here; patch `v1.9.14` if you want a minimal, auditable delta from a released version.
+> **The two routes do not produce identical binaries.** The patch is a clean diff against `v1.9.14`, but the fork is branched from upstream `master` at [`c245815`](https://github.com/AlexxIT/go2rtc/commit/c245815) — v1.9.14 plus 70 upstream commits — so the fork tree differs from `v1.9.14` in 108 files while this patch touches 13. Within those 13 the two routes agree byte-for-byte (re-verified when the patch is re-cut from the tag); everywhere else the fork carries upstream work that `v1.9.14` does not. Build from the fork if you want what is actually running here; patch `v1.9.14` if you want a minimal, auditable delta from a released version.
 
 ```bash
 # Build natively on a Pi (arm64, ~3 min). On a 2 GB Pi this can exhaust RAM and take
@@ -635,10 +635,14 @@ Two design points worth keeping if you modify it:
   latency (median 7.5s, p75 47.8s here), so anchoring to the moment ffmpeg connects makes the
   recovered window vary by seconds run to run. `Camera.js` latches the Google timestamp when
   a STARTED motion/person event fires; the recorder anchors to that.
-- **Size the window from the hub's *selected* `prebufferLength`, not from what you
-  advertise.** The advertised value is only a maximum — the hub picks its own (Apple hubs
-  select ~4000 ms) and anything beyond the selection is delivered and then discarded. Serving
-  15 s when the hub keeps 4 s is pure waste.
+- **Advertise the pre-roll you actually want kept.** This was originally documented the
+  other way round, and that was wrong. HomeKit does not merely bound its request by the
+  advertised `prebufferLength` — it TRIMS the stored clip to it. A measured event
+  (2026-07-29 16:06) served ~11 s of history and the kept clip began at exactly
+  trigger-minus-4 s, with everything earlier discarded. Advertising a token 4000 ms
+  therefore throws away most of what the ring recovers, and since the recording request
+  arrives seconds AFTER the event timestamp, a 4 s ceiling means the median clip still
+  starts after the subject has gone. Advertise `min(hksvPrebufferSeconds, retention)`.
 
 Verified: a real doorbell event now opens on an empty porch **5 seconds before** the subject
 appears, where it previously opened on their back as they left.
@@ -665,7 +669,7 @@ Config keys (both optional; the feature is **off** unless the first is set):
 
 | Key | Default | Meaning |
 |---|---|---|
-| `hksvPrebufferSeconds` | unset (off) | Upper bound on pre-trigger footage to serve, in seconds. `6` is ample given hubs select 4 s. |
+| `hksvPrebufferSeconds` | unset (off) | Pre-trigger footage to serve AND advertise, in seconds. The hub trims the stored clip to the advertised value, so this bounds what is actually kept. Must not exceed the retention below. |
 | `hksvPrebufferRetainSeconds` | `15` | How much history to hold in RAM per camera. Must comfortably exceed `hksvPrebufferSeconds` plus Pub/Sub delivery latency. |
 
 ```json
@@ -970,6 +974,33 @@ Where the savings come from, in rough order of size:
 For context on the memory figure: ~121 MB covers go2rtc, the per-camera ring readers and the
 snapshot cache together. Adding cameras costs roughly a ring reader each — tens of MB, not
 hundreds — because nothing in the path buffers video beyond the few seconds of pre-roll.
+
+### Testing the prebuffer
+
+The ring is easy to break in ways that look fine: it can serve nothing, serve a stale
+init segment, or ignore the anchor and hand over minutes-old footage as though it were
+the trigger moment. None of that shows up as an error anywhere.
+
+```bash
+node scripts/test-prebuffer-e2e.js \
+  /path/to/homebridge-google-nest-sdm/dist /tmp/clip.mp4 \
+  rtsp://127.0.0.1:8554 front_door
+```
+
+It fills the ring against your real restreamer, asks for history anchored in the past,
+records a short live window, and then measures the finished clip. The assertions are
+written so a broken ring fails rather than passes quietly:
+
+- the clip must be **longer** than the live window — a ring serving nothing produces a
+  clip exactly as long as the window
+- the clip must **not** be longer than the history requested plus a fragment of slack —
+  a ring that ignored the anchor and dumped its whole retention would otherwise pass
+- the consumer must be released on destroy, since a leaked subscription keeps the ring
+  queueing for a recording that has already ended
+
+A healthy run recovers roughly `hksvPrebufferSeconds` of extra footage. It caught the
+advertised-`prebufferLength` ceiling in practice: the same run recovered ~9 s before that
+was fixed and ~11 s after.
 
 ### Checking for drift
 
