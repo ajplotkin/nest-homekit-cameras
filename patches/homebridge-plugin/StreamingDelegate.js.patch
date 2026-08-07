@@ -8,7 +8,7 @@
  const HksvStreamer_1 = __importDefault(require("./HksvStreamer"));
  const pick_port_1 = __importDefault(require("pick-port"));
  class StreamingDelegate {
-@@ -23,13 +24,58 @@
+@@ -23,13 +24,57 @@
          this.config = platform.platformConfig;
          this.camera = camera;
          this.accessory = accessory;
@@ -35,40 +35,39 @@
          });
          this.options = {
 -            cameraStreamCount: camera.getResolutions().length,
-+            // Concurrent HomeKit live-view sessions, NOT the resolutions list. Stock passed
-+            // getResolutions().length = 11, which is a category error: the two options are
-+            // unrelated and getResolutions() is separately (and correctly) used for
-+            // streamingOptions.video.resolutions.
++            // Concurrent HomeKit live-view sessions. Stock passed getResolutions().length,
++            // which is a category error: the two options are unrelated, and tying the count to
++            // the resolution list means editing that list silently changes the count. That --
++            // not the number itself -- was the actual defect.
 +            //
-+            // One RTPStreamManagement service = one SRTP session, and that is structural to
-+            // HAP rather than a hap-nodejs quirk: the handshake is carried in per-service
-+            // characteristic state that the client WRITES then READS BACK, and characteristic
-+            // reads carry no session id, so two concurrent handshakes on one service would
-+            // collide. A client arriving when all services are busy is REFUSED at
-+            // SetupEndpoints with STATUS=BUSY (a failed tile), not queued.
++            // One RTPStreamManagement service = one SRTP session, structural to HAP: the
++            // handshake lives in per-service characteristic state the client writes then reads
++            // back, and reads carry no session id, so two handshakes on one service collide. A
++            // client arriving when all are busy is REFUSED at SetupEndpoints with STATUS=BUSY.
 +            //
-+            // Why 4. Live view here is stream-COPY out of local go2rtc (vEncoder: copy), so
-+            // each extra session is a remux at a few percent of a core, not an encode -- the
-+            // usual reason to keep this number small does not apply. go2rtc multiplexes all
-+            // of them off ONE Nest session, so nothing here touches Google's concurrent-stream
-+            // limit. 4 covers a doorbell ring with several phones/iPads/Macs opening the same
-+            // camera at once; the 5th is refused, which is a spinner and not a broken system.
++            // MEASURED cost per concurrent viewer on this deployment (2026-08-07): 12MB RSS and
++            // ~1.4% of one core, because live view is stream-COPY out of local go2rtc
++            // (vEncoder: copy), not an encode. Against 541MB available and 4 cores, even 11
++            // sessions would be ~132MB and ~16% of one core. So the stock 11 was harmless in
++            // practice; there is no clutter either (the Homebridge UI has filtered
++            // CameraRTPStreamManagement out of the accessories view since v4.10.0, and Apple
++            // Home renders one tile per accessory).
 +            //
-+            // NOT 11: advertising concurrency the Pi cannot serve is the real hazard on a 2GB
-+            // box. NOT 1: hap-nodejs documents Secure Video cameras as exposing 1 stream, but
-+            // in-home HomeKit clients stream DIRECTLY from the bridge (verified: an iPhone
-+            // receiving srtp://... while the hub carried only HKSV over HDS), so 1 really does
-+            // mean one viewer household-wide.
++            // 8 is chosen to sit comfortably above the household's device count so nobody is
++            // ever refused, while still being a deliberate number rather than a side effect.
++            // Deliberately not tuned lower: shrinking this later prunes HomeKit's cached
++            // services on restore, so churn has a cost that idle services do not.
 +            //
-+            // HKSV recording consumes NONE of these -- it rides the HomeKit Data Stream via
-+            // recording.delegate and never touches RTPStreamManagement.
++            // go2rtc multiplexes every session off ONE Nest producer, so none of this touches
++            // Google's concurrent-stream limit. HKSV recording consumes NONE of these -- it
++            // rides the HomeKit Data Stream via recording.delegate.
 +            //
-+            // Diagnosis adopted from potmat/homebridge-google-nest-sdm#227 (littlepope81).
-+            cameraStreamCount: 4,
++            // Diagnosis (not the value) from potmat/homebridge-google-nest-sdm#227.
++            cameraStreamCount: 8,
              delegate: this,
              streamingOptions: {
                  supportedCryptoSuites: [0 /* AES_CM_128_HMAC_SHA1_80 */],
-@@ -54,7 +100,26 @@
+@@ -54,7 +99,26 @@
              recording: {
                  delegate: this,
                  options: {
@@ -96,7 +95,7 @@
                      mediaContainerConfiguration: {
                          type: 0 /* FRAGMENTED_MP4 */,
                          fragmentLength: 4000,
-@@ -193,16 +258,36 @@
+@@ -193,16 +257,36 @@
          const bitrate = request.video.max_bit_rate * 4;
          const vEncoder = this.config.vEncoder || 'libx264 -preset ultrafast -tune zerolatency';
          this.log.debug(`Video stream requested: ${request.video.width} x ${request.video.height}, ${request.video.fps} fps, ${request.video.max_bit_rate} kbps`, this.camera.getDisplayName());
@@ -140,7 +139,7 @@
          }
          ffmpegArgs += // Video
              ' -an -sn -dn' +
-@@ -264,12 +349,26 @@
+@@ -264,12 +348,26 @@
                  }, request.video.rtcp_interval * 2 * 1000);
              });
              activeSession.socket.bind(sessionInfo.videoReturnPort, sessionInfo.localAddress);
@@ -168,7 +167,7 @@
          this.ongoingSessions[request.sessionID] = activeSession;
          delete this.pendingSessions[request.sessionID];
      }
-@@ -314,7 +413,8 @@
+@@ -314,7 +412,8 @@
                  this.log.error('Error occurred terminating two-way FFmpeg process: ' + err, this.camera.getDisplayName());
              }
              try {
@@ -178,7 +177,7 @@
              }
              catch (err) {
                  this.log.error('Error terminating SDM stream: ' + err, this.camera.getDisplayName());
-@@ -325,6 +425,14 @@
+@@ -325,6 +424,14 @@
      }
      closeRecordingStream(streamId, reason) {
          var _a, _b;
@@ -193,7 +192,7 @@
          // Only tear down if this close targets the session we're actually running. A HomeKit hub can
          // send a late close for an already-replaced (orphaned) session; without this guard that stale
          // close would destroy the *current* recording.
-@@ -341,6 +449,8 @@
+@@ -341,6 +448,8 @@
          this.handlingRecordingStreamingRequest = false;
      }
      acknowledgeStream(streamId) {
@@ -202,7 +201,7 @@
          this.closeRecordingStream(streamId, undefined);
      }
      /**
-@@ -353,7 +463,7 @@
+@@ -353,7 +462,7 @@
       *   when the HomeKit Controller requests it (see the documentation of `CameraRecordingDelegate`).
       */
      async *handleRecordingStreamRequest(streamId) {
@@ -211,7 +210,7 @@
          this.log.debug('Recording request received.');
          if (!this.cameraRecordingConfiguration)
              throw new Error('No recording configuration for this camera.');
-@@ -368,23 +478,45 @@
+@@ -368,23 +477,45 @@
          this.handlingRecordingStreamingRequest = true;
          if (this.cameraRecordingConfiguration.videoCodec.type !== 0 /* H264 */)
              throw new Error('Unsupported recording codec type.');
@@ -259,7 +258,7 @@
          ];
          let samplerate;
          switch (this.cameraRecordingConfiguration.audioCodec.samplerate) {
-@@ -410,6 +542,11 @@
+@@ -410,6 +541,11 @@
                  throw new Error("Unsupported audio sample rate: " + this.cameraRecordingConfiguration.audioCodec.samplerate);
          }
          const audioArgs = ((_b = (_a = this.controller) === null || _a === void 0 ? void 0 : _a.recordingManagement) === null || _b === void 0 ? void 0 : _b.recordingManagementService.getCharacteristic(this.platform.Characteristic.RecordingAudioActive))
@@ -271,7 +270,7 @@
              ? [
                  "-acodec", "libfdk_aac",
                  ...(this.cameraRecordingConfiguration.audioCodec.type === 0 /* AAC_LC */ ?
-@@ -419,10 +556,108 @@
+@@ -419,10 +555,108 @@
                  "-b:a", `${this.cameraRecordingConfiguration.audioCodec.bitrate}k`,
                  "-ac", `${this.cameraRecordingConfiguration.audioCodec.audioChannels}`,
              ]
@@ -384,7 +383,7 @@
          // Tear down any prior recording session before overwriting it. A HomeKit hub
          // can start a new recording (e.g. after a brief reconnect) before the previous
          // session's close event fires. Without this, the previous HksvStreamer — and
-@@ -437,12 +672,15 @@
+@@ -437,12 +671,15 @@
              hksvStreamer: hksvStreamer,
              nestStreamer: nestStreamer
          };
@@ -404,7 +403,7 @@
              for await (const box of this.recordingSessionInfo.hksvStreamer.generator()) {
                  pending.push(box.header, box.data);
                  const motionDetected = (_c = this.accessory.getService(this.hap.Service.MotionSensor)) === null || _c === void 0 ? void 0 : _c.getCharacteristic(this.platform.Characteristic.MotionDetected).value;
-@@ -450,6 +688,16 @@
+@@ -450,6 +687,16 @@
                  if (box.type === "moov" || box.type === "mdat") {
                      const fragment = Buffer.concat(pending);
                      pending.splice(0, pending.length);
@@ -421,7 +420,7 @@
                      const isLast = STOP_AFTER_MOTION_STOP && !motionDetected;
                      yield {
                          data: fragment,
-@@ -463,12 +711,57 @@
+@@ -463,12 +710,57 @@
              }
          }
          catch (error) {
