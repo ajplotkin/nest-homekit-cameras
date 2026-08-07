@@ -270,7 +270,7 @@
              ? [
                  "-acodec", "libfdk_aac",
                  ...(this.cameraRecordingConfiguration.audioCodec.type === 0 /* AAC_LC */ ?
-@@ -419,10 +555,131 @@
+@@ -419,10 +555,134 @@
                  "-b:a", `${this.cameraRecordingConfiguration.audioCodec.bitrate}k`,
                  "-ac", `${this.cameraRecordingConfiguration.audioCodec.audioChannels}`,
              ]
@@ -375,8 +375,11 @@
 +        // supported-config hash and force every camera to renegotiate. Copy needs no such
 +        // change, so this carries no renegotiation risk.
 +        // The real gate is WEBRTC-vs-RTSP, not go2rtc. Gating on useGo2rtcRec alone left the
-+        // direct-dial fallback transcoding a stream that is safe to copy -- and on this
-+        // deployment every camera is WEB_RTC, so the fallback IS the verified-safe case.
++        // direct-dial fallback transcoding a stream that is safe to copy. Note this fixes a
++        // path that EXISTS rather than one exercised here: all four cameras have go2rtc streams,
++        // so useGo2rtcRec is always true and the log shows zero fallback dials. The gate is
++        // right either way precisely because it decides from the STREAMER CLASS rather than
++        // from an assumption about which protocol the cameras negotiated.
 +        //
 +        //  * WebRtcNestStreamer runs a FIR/PLI keyframe-request loop that holds the IDR interval
 +        //    near 2s, comfortably inside the negotiated fragmentLength (4000ms). The stock WebRTC
@@ -406,7 +409,7 @@
          // Tear down any prior recording session before overwriting it. A HomeKit hub
          // can start a new recording (e.g. after a brief reconnect) before the previous
          // session's close event fires. Without this, the previous HksvStreamer — and
-@@ -437,12 +694,15 @@
+@@ -437,12 +697,15 @@
              hksvStreamer: hksvStreamer,
              nestStreamer: nestStreamer
          };
@@ -426,7 +429,7 @@
              for await (const box of this.recordingSessionInfo.hksvStreamer.generator()) {
                  pending.push(box.header, box.data);
                  const motionDetected = (_c = this.accessory.getService(this.hap.Service.MotionSensor)) === null || _c === void 0 ? void 0 : _c.getCharacteristic(this.platform.Characteristic.MotionDetected).value;
-@@ -450,6 +710,16 @@
+@@ -450,6 +713,16 @@
                  if (box.type === "moov" || box.type === "mdat") {
                      const fragment = Buffer.concat(pending);
                      pending.splice(0, pending.length);
@@ -443,7 +446,7 @@
                      const isLast = STOP_AFTER_MOTION_STOP && !motionDetected;
                      yield {
                          data: fragment,
-@@ -463,12 +733,57 @@
+@@ -463,12 +736,57 @@
              }
          }
          catch (error) {
