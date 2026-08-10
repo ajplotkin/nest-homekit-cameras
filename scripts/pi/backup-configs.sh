@@ -60,6 +60,25 @@ else
   echo "WARN: go2rtc container not found; image not backed up"
 fi
 
+# ROOT-LEVEL FILES AND /etc ARE NOT IN THE TAR ABOVE.
+# The tar takes a list of DIRECTORIES under $SRC, so anything sitting at the root of
+# /home/adamandaj -- compose.yaml above all -- was silently excluded. Discovered on
+# 2026-08-09 while rebuilding after the SD card physically ejected: compose.yaml carried
+# TZ, HOMEBRIDGE_CONFIG_UI_PORT and the /run/nest-snaps bind mount, and without that mount
+# every HomeKit camera tile goes blank with nothing logged as an error.
+# Same for the /etc files the deployment depends on but does not own.
+EXTRA="$DEST/host-files-$STAMP.tar.gz"
+tar czf "$EXTRA" \
+  -C "$SRC" $(cd "$SRC" && ls -1 *.yaml *.yml *.env 2>/dev/null | tr '\n' ' ') \
+  -C / etc/tmpfiles.d/nest-snaps.conf \
+      etc/logrotate.d/nest-wedge \
+      etc/fstab \
+      etc/systemd/system/go2rtc-snapshot-warmer.service \
+      etc/systemd/system/go2rtc-wedge-detector.service \
+      etc/systemd/system/matterbridge-hass-guard.service \
+  2>/dev/null && echo "OK: host files -> $EXTRA"
+ls -1t "$DEST"/host-files-*.tar.gz 2>/dev/null | tail -n +$((KEEP+1)) | xargs -r rm -f
+
 # rotate
 ls -1t "$DEST"/pi-eh-configs-*.tar.gz 2>/dev/null | tail -n +$((KEEP+1)) | xargs -r rm -f
 ls -1t "$DEST"/docker-state-*.txt   2>/dev/null | tail -n +$((KEEP+1)) | xargs -r rm -f
