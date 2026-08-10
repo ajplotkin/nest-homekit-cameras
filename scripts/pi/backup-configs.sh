@@ -27,7 +27,7 @@ tar czf "$DEST/pi-eh-configs-$STAMP.tar.gz" --warning=no-file-changed \
 # decides whether that reinstall fires, so restoring dist without it is not a restore.
 PLUGIN=/home/adamandaj/volumes/homebridge/node_modules/homebridge-google-nest-sdm
 if [ -d "$PLUGIN/dist" ]; then
-  tar czf "$DEST/homebridge-plugin-dist-$STAMP.tar.gz" -C "$PLUGIN" dist package.json 2>/dev/null \
+  tar czf "$DEST/homebridge-plugin-dist-$STAMP.tar.gz" -C "$PLUGIN" dist package.json config.schema.json 2>/dev/null \
     && echo "OK: plugin dist -> $DEST/homebridge-plugin-dist-$STAMP.tar.gz"
   ls -1t "$DEST"/homebridge-plugin-dist-*.tar.gz 2>/dev/null | tail -n +$((KEEP+1)) | xargs -r rm -f
 fi
@@ -67,6 +67,15 @@ fi
 # TZ, HOMEBRIDGE_CONFIG_UI_PORT and the /run/nest-snaps bind mount, and without that mount
 # every HomeKit camera tile goes blank with nothing logged as an error.
 # Same for the /etc files the deployment depends on but does not own.
+# `systemctl enable` state lives as symlinks under /etc/systemd/system/*.wants/, which the
+# file list below does NOT capture. On 2026-08-10 the rebuild restored every unit FILE but
+# matterbridge-hass-guard came back disabled -- it is the guard that stops matterbridge
+# starting before HA and halting the whole Matter bridge, so losing it is silent until the
+# next reboot takes the devices offline. Record the enabled set as plain text.
+systemctl list-unit-files --state=enabled --no-legend --no-pager 2>/dev/null \
+  > "$DEST/systemd-enabled-$STAMP.txt"
+ls -1t "$DEST"/systemd-enabled-*.txt 2>/dev/null | tail -n +$((KEEP+1)) | xargs -r rm -f
+
 EXTRA="$DEST/host-files-$STAMP.tar.gz"
 tar czf "$EXTRA" \
   -C "$SRC" $(cd "$SRC" && ls -1 *.yaml *.yml *.env 2>/dev/null | tr '\n' ' ') \
