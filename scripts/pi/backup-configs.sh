@@ -76,6 +76,33 @@ systemctl list-unit-files --state=enabled --no-legend --no-pager 2>/dev/null \
   > "$DEST/systemd-enabled-$STAMP.txt"
 ls -1t "$DEST"/systemd-enabled-*.txt 2>/dev/null | tail -n +$((KEEP+1)) | xargs -r rm -f
 
+# Home Assistant's custom integrations ride inside the homeassistant/ tarball above, but
+# nothing recorded WHICH VERSIONS were running -- you would have to extract the tarball to
+# find out, and restoring the wrong one is silent until setup fails. On 2026-08-13
+# midea_ac_lan went 0.7.1 -> 2026.8.0 and its pip requirement changed from midea-local to
+# midea-lan; those are different packages, so a restore that quietly reinstated the old
+# tree would come up looking fine and talking to the AC through different code. Record the
+# inventory as plain text, same reasoning as the systemd enabled-state list above.
+{
+  echo "### home-assistant image"
+  docker inspect homeassistant --format '{{.Config.Image}}' 2>/dev/null
+  echo
+  echo "### custom_components (domain | version | requirements)"
+  python3 - <<'PY' 2>/dev/null
+import json, pathlib
+base = pathlib.Path("/home/adamandaj/homeassistant/custom_components")
+for m in sorted(base.glob("*/manifest.json")):
+    try:
+        d = json.loads(m.read_text())
+    except Exception as e:
+        print(f"{m.parent.name} | UNREADABLE | {e}")
+        continue
+    reqs = ",".join(d.get("requirements", [])) or "-"
+    print(f"{d.get('domain', m.parent.name)} | {d.get('version', '?')} | {reqs}")
+PY
+} > "$DEST/ha-components-$STAMP.txt"
+ls -1t "$DEST"/ha-components-*.txt 2>/dev/null | tail -n +$((KEEP+1)) | xargs -r rm -f
+
 EXTRA="$DEST/host-files-$STAMP.tar.gz"
 tar czf "$EXTRA" \
   -C "$SRC" $(cd "$SRC" && ls -1 *.yaml *.yml *.env 2>/dev/null | tr '\n' ' ') \

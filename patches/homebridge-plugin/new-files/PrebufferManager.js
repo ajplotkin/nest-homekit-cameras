@@ -152,6 +152,23 @@ class CameraBuffer {
         // backoff is allowed to grow much further than a camera that was working
         // and then dropped.
         this.everProduced = false;
+        // Consecutive spawns that have produced no fragment. Reset by publish().
+        //
+        // This deliberately does NOT key on everProduced. Keying the throttle on "has
+        // never produced" only covers a camera that was already off when Homebridge
+        // started; a camera that streams and is THEN switched off -- routine if you use
+        // Google Home's Home/Away Assist, which turns cameras off on arrival -- would keep
+        // everProduced true forever and never throttle at all, leaving ~1175
+        // lines/24h. Counting consecutive dry spawns covers both, and resetting on publish
+        // means a later outage is loud again from the start instead of inheriting a spent
+        // budget.
+        //
+        // Counted per SPAWN, not per stderr chunk. ffmpeg writes each line as its own
+        // chunk, so a chunk-based budget spent itself in ~1.5 real attempts and made the
+        // hourly summary's "after N attempts" read about double the true retry count.
+        this.drySpawns = 0;
+        this.dryNoticeSent = false;
+        this.lastDryWarnAt = 0;
         // Timestamp of the last published fragment. A camera that worked earlier but has
         // been dark for a while (cameras are often switched off overnight) should not keep poking
         // go2rtc -> SDM once a minute all night for nothing.
@@ -186,7 +203,14 @@ class CameraBuffer {
             "-movflags", "frag_keyframe+empty_moov+default_base_moof",
             "pipe:1",
         ];
-        this.log.debug(`[prebuffer:${this.name}] starting reader ${this.url}`);
+        this.drySpawns++;
+        // These two debug lines (here and at reader-exit) fire on EVERY retry, and this
+        // deployment writes debug to homebridge.log -- so suppressing only the warn left
+        // ~576 lines/day for two switched-off cameras and the noise was barely reduced.
+        // Silence them on the same budget as the warning.
+        if (!this.isDryQuiet()) {
+            this.log.debug(`[prebuffer:${this.name}] starting reader ${this.url}`);
+        }
         let child;
         try {
             child = (0, child_process_1.spawn)(this.ffmpegPath, args, { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
@@ -376,8 +400,27 @@ class CameraBuffer {
             // Before this camera has EVER produced a fragment, ffmpeg's complaint is the
             // only thing that explains why the prebuffer is silently inert (e.g. an older
             // ffmpeg refusing Opus-in-MP4 without -strict experimental). Do not bury it.
-            if (!this.everProduced) {
-                this.log.warn(`[prebuffer:${this.name}] ffmpeg (ring never started): ${s}`);
+            // Enter the ladder when the ring is genuinely not starting: either this camera
+            // has never produced, or it has now failed at least two spawns in a row. The
+            // second clause is what covers a camera switched off after it had been
+            // streaming. Requiring TWO consecutive dry spawns (rather than one) keeps a
+            // healthy re-dial that happens to emit stderr before its first fragment on the
+            // quiet debug path, so this does not make working cameras noisier.
+            if (!this.everProduced || this.drySpawns > 1) {
+                if (this.drySpawns <= 3) {
+                    // Every chunk from the first three spawns, so the full stderr is visible.
+                    this.log.warn(`[prebuffer:${this.name}] ffmpeg (ring not started): ${s}`);
+                }
+                else {
+                    // The notice fires on the first SUPPRESSED chunk, not on the last loud
+                    // one. Emitting it at `drySpawns === 3` announced the suppression and
+                    // then let that spawn's remaining stderr chunks print after it.
+                    this.maybeDrySummary(s.split("\n")[0]);
+                }
+                // Otherwise deliberately silent. Demoting to debug is NOT enough: this
+                // deployment writes debug output to homebridge.log, so a demoted line still
+                // prints and the noise is unchanged. The attempt count is carried in the
+                // hourly summary, so nothing is lost by dropping the per-attempt line.
             }
             else {
                 this.log.debug(`[prebuffer:${this.name}] ffmpeg: ${s}`);
@@ -459,9 +502,47 @@ class CameraBuffer {
                 && Date.now() - this.lastProducedAt < 30000) {
                 this.backoffMs = 1000;
             }
-            this.log.debug(`[prebuffer:${this.name}] reader exited (code=${code} signal=${signal}), retry in ${this.backoffMs}ms`);
+            if (!this.isDryQuiet()) {
+                this.log.debug(`[prebuffer:${this.name}] reader exited (code=${code} signal=${signal}), retry in ${this.backoffMs}ms`);
+            }
+            else {
+                // The notice and the hourly summary otherwise live only inside the stderr
+                // handler, so a reader that dies with NO stderr at all -- an external
+                // SIGKILL, or the OOM killer -- would produce a completely silent retry
+                // loop. Drive them from here too.
+                this.maybeDrySummary("");
+            }
             this.scheduleRestart();
         });
+    }
+    /**
+     * True once a camera whose ring is not starting has burned its loud budget.
+     * Gates the warn AND the two per-retry debug lines: on a deployment that writes debug
+     * to the log, silencing only the warn leaves the noise essentially unchanged.
+     */
+    isDryQuiet() {
+        return this.drySpawns > 3;
+    }
+    /**
+     * The suppression notice, then one summary an hour. Split out because it is driven from
+     * BOTH the stderr handler and reader-exit -- see the call site in the exit handler for
+     * why. Returns true if it logged, which the tests assert on.
+     */
+    maybeDrySummary(lastLine) {
+        const nowMs = Date.now();
+        if (!this.dryNoticeSent) {
+            this.dryNoticeSent = true;
+            this.lastDryWarnAt = nowMs;
+            this.log.warn(`[prebuffer:${this.name}] further 'ring not started' output suppressed; hourly summary only. A camera switched off in the Home app is the usual cause.`);
+            return true;
+        }
+        if (nowMs - this.lastDryWarnAt >= 3600000) {
+            this.lastDryWarnAt = nowMs;
+            const tail = lastLine ? ` Last: ${lastLine}` : "";
+            this.log.warn(`[prebuffer:${this.name}] ring still not started after ${this.drySpawns} attempts (retry cadence ${Math.round(this.backoffMs / 1000)}s).${tail}`);
+            return true;
+        }
+        return false;
     }
     /** Destroy every in-flight consumer; their timeline is no longer valid. */
     resetConsumers(reason) {
@@ -593,6 +674,11 @@ class CameraBuffer {
     }
     publish(fragment) {
         this.everProduced = true;
+        // Clear the dry-spawn throttle so a LATER outage gets its own loud budget instead of
+        // inheriting a spent one, and so a working camera can never drift into the quiet state.
+        this.drySpawns = 0;
+        this.dryNoticeSent = false;
+        this.lastDryWarnAt = 0;
         const now = Date.now();
         this.lastProducedAt = now;
         this.stallKills = 0;
