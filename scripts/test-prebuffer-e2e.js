@@ -27,7 +27,7 @@ const path = require('path');
 
 const DIST = process.argv[2];
 const OUT = process.argv[3];
-const RTSP_BASE = process.argv[4];           // e.g. rtsp://192.168.1.50:8554
+const RTSP_BASE = process.argv[4];           // e.g. rtsp://raspberrypi.local:8554
 const KEY = process.argv[5] || 'test';
 const PORT = 8554;
 

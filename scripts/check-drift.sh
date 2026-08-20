@@ -14,7 +14,7 @@
 #
 # Usage:
 #   ./check-drift.sh                                  # everything on this machine
-#   ./check-drift.sh --host pi@192.168.1.50   # everything on a remote Pi
+#   ./check-drift.sh --host pi@raspberrypi.local   # everything on a remote Pi
 #   ./check-drift.sh --deep --host pi        # also prove the patches reproduce dist/
 #   ./check-drift.sh --host pi --homebridge /home/pi/volumes/homebridge \
 #                    --scripts /home/pi/scripts
