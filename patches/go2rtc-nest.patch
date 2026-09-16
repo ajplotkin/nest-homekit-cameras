@@ -1000,7 +1000,7 @@ index 6a57091..416b6cf 100644
  }
  
 diff --git a/pkg/webrtc/conn.go b/pkg/webrtc/conn.go
-index 924fd55..c55cd6c 100644
+index 924fd55..3ff6b43 100644
 --- a/pkg/webrtc/conn.go
 +++ b/pkg/webrtc/conn.go
 @@ -1,17 +1,26 @@
@@ -1081,7 +1081,7 @@ index 924fd55..c55cd6c 100644
  		track, err := c.GetTrack(media, codec)
  		if err != nil {
  			return
-@@ -87,10 +133,57 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -87,10 +133,59 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}
  		}
  
@@ -1099,6 +1099,8 @@ index 924fd55..c55cd6c 100644
 +		// separate avoids the connect watchdog killing a healthy non-H264 stream every 30s.
 +		isNestVideoTrack := c.FormatName == "nest/webrtc" && remote.Kind() == webrtc.RTPCodecTypeVideo
 +		isNestVideo := isNestVideoTrack && codec.Name == core.CodecH264
++		// Declared out here so the read-loop exit paths below can name the session in their logs.
++		var connID int64
 +		if isNestVideoTrack {
 +			nestVideoSeen.Store(true) // disarms the connect watchdog in OnConnectionStateChange
 +		}
@@ -1142,7 +1144,7 @@ index 924fd55..c55cd6c 100644
  					if err := pc.WriteRTCP(pkts); err != nil {
  						return
  					}
-@@ -98,6 +191,87 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -98,10 +193,104 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}()
  		}
  
@@ -1186,7 +1188,7 @@ index 924fd55..c55cd6c 100644
 +			now := int64(time.Since(nestEpoch))
 +			lastVideoNS.Store(now)
 +			lastIDRNS.Store(now)
-+			connID := nestConnSeq.Add(1)
++			connID = nestConnSeq.Add(1)
 +			zlog.Debug().Int64("conn", connID).Msg("nest: stall watchdog armed")
 +			stallDone := make(chan struct{})
 +			defer close(stallDone)
@@ -1230,7 +1232,37 @@ index 924fd55..c55cd6c 100644
  		for {
  			b := make([]byte, ReceiveMTU)
  			n, _, err := remote.Read(b)
-@@ -113,9 +287,55 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+ 			if err != nil {
++				// Patched (Nest): a fatal read ends THIS goroutine, and with it the deferred
++				// close(stallDone) tears down the stall watchdog -- so the one thing that would
++				// have noticed the dead video is gone at exactly the moment it is needed. The
++				// connect watchdog cannot cover it either: nestVideoSeen is a one-way latch set
++				// by the first video packet, so it has already been disarmed. Meanwhile ICE stays
++				// up on Google's consent checks alone, with or without audio, so the transport
++				// lingers and Producer.reconnect() is never reached. Close it here instead.
++				// Upstream returns silently, which is also why this was invisible for so long.
++				if isNestVideoTrack {
++					zlog.Warn().Int64("conn", connID).Err(err).
++						Msg("nest: video track read failed, closing transport")
++					_ = c.Close()
++				}
+ 				return
+ 			}
+ 
+@@ -109,13 +298,68 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+ 
+ 			packet := &rtp.Packet{}
+ 			if err := packet.Unmarshal(b[:n]); err != nil {
++				// Same reasoning as the read error above. Reachable on a single malformed packet:
++				// rtp.Packet.Unmarshal returns errTooSmall when the padding-count byte exceeds the
++				// packet, and that byte sits inside the SRTP-encrypted portion, so nothing upstream
++				// validates it before this point.
++				if isNestVideoTrack {
++					zlog.Warn().Int64("conn", connID).Err(err).
++						Msg("nest: RTP unmarshal failed, closing transport")
++					_ = c.Close()
++				}
+ 				return
  			}
  
  			if len(packet.Payload) == 0 {
@@ -1286,7 +1318,7 @@ index 924fd55..c55cd6c 100644
  			track.WriteRTP(packet)
  		}
  	})
-@@ -137,6 +357,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -137,6 +381,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			for _, sender := range c.Senders {
  				sender.Start()
  			}
@@ -1306,7 +1338,7 @@ index 924fd55..c55cd6c 100644
  		case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
  			// disconnect event comes earlier, than failed
  			// but it comes only for success connections
-@@ -147,6 +380,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -147,6 +404,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  	return c
  }
  
