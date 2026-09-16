@@ -1000,7 +1000,7 @@ index 6a57091..416b6cf 100644
  }
  
 diff --git a/pkg/webrtc/conn.go b/pkg/webrtc/conn.go
-index 924fd55..47385cb 100644
+index 924fd55..700a92b 100644
 --- a/pkg/webrtc/conn.go
 +++ b/pkg/webrtc/conn.go
 @@ -1,17 +1,26 @@
@@ -1081,7 +1081,7 @@ index 924fd55..47385cb 100644
  		track, err := c.GetTrack(media, codec)
  		if err != nil {
  			return
-@@ -87,10 +133,41 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -87,10 +133,49 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}
  		}
  
@@ -1102,6 +1102,14 @@ index 924fd55..47385cb 100644
 +		if isNestVideoTrack {
 +			nestVideoSeen.Store(true) // disarms the connect watchdog in OnConnectionStateChange
 +		}
++		// Monotonic base for the drought timestamps below. These MUST NOT round-trip through
++		// time.Now().UnixNano() / time.Unix(0, ns): that strips the monotonic reading, so every
++		// time.Since() on them measures the WALL clock. A forward NTP step then reads as a media
++		// gap -- observed live as a bogus 17.94s idr_age whose watchdog had armed 19s earlier
++		// with no ticks in between -- and a step larger than the full-stall deadline would tear
++		// down a perfectly healthy stream. Storing elapsed-since-base keeps the atomics (a
++		// time.Time does not fit in an atomic.Int64) while staying on the monotonic clock.
++		nestEpoch := time.Now()
 +		var lastVideoNS, lastIDRNS atomic.Int64
 +
 +		// Patched: also request periodic keyframes for the Nest source (ModeActiveProducer,
@@ -1126,7 +1134,7 @@ index 924fd55..47385cb 100644
  					if err := pc.WriteRTCP(pkts); err != nil {
  						return
  					}
-@@ -98,6 +175,86 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -98,6 +183,87 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}()
  		}
  
@@ -1167,7 +1175,7 @@ index 924fd55..47385cb 100644
 +		// At 60s it fires only on a session that is never coming back. connID distinguishes cameras in
 +		// the logs — Nest assigns SSRC 7777 to every camera, so SSRC can't tell them apart.
 +		if isNestVideo {
-+			now := time.Now().UnixNano()
++			now := int64(time.Since(nestEpoch))
 +			lastVideoNS.Store(now)
 +			lastIDRNS.Store(now)
 +			connID := nestConnSeq.Add(1)
@@ -1180,8 +1188,9 @@ index 924fd55..47385cb 100644
 +				for {
 +					select {
 +					case <-t.C:
-+						videoAge := time.Since(time.Unix(0, lastVideoNS.Load()))
-+						idrAge := time.Since(time.Unix(0, lastIDRNS.Load()))
++						elapsed := time.Since(nestEpoch)
++						videoAge := elapsed - time.Duration(lastVideoNS.Load())
++						idrAge := elapsed - time.Duration(lastIDRNS.Load())
 +						if videoAge > 3*time.Second || idrAge > 3*time.Second {
 +							zlog.Debug().Int64("conn", connID).Dur("video_age", videoAge).Dur("idr_age", idrAge).Msg("nest: no recent video/keyframe")
 +						}
@@ -1213,7 +1222,7 @@ index 924fd55..47385cb 100644
  		for {
  			b := make([]byte, ReceiveMTU)
  			n, _, err := remote.Read(b)
-@@ -113,9 +270,55 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -113,9 +279,55 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}
  
  			if len(packet.Payload) == 0 {
@@ -1224,9 +1233,9 @@ index 924fd55..47385cb 100644
  			}
  
 +			if isNestVideo {
-+				lastVideoNS.Store(time.Now().UnixNano())
++				lastVideoNS.Store(int64(time.Since(nestEpoch)))
 +				if isRTPKeyframe(packet.Payload) {
-+					lastIDRNS.Store(time.Now().UnixNano())
++					lastIDRNS.Store(int64(time.Since(nestEpoch)))
 +				}
 +			}
 +
@@ -1269,7 +1278,7 @@ index 924fd55..47385cb 100644
  			track.WriteRTP(packet)
  		}
  	})
-@@ -137,6 +340,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -137,6 +349,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			for _, sender := range c.Senders {
  				sender.Start()
  			}
@@ -1289,7 +1298,7 @@ index 924fd55..47385cb 100644
  		case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
  			// disconnect event comes earlier, than failed
  			// but it comes only for success connections
-@@ -147,6 +363,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -147,6 +372,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  	return c
  }
  
