@@ -1000,7 +1000,7 @@ index 6a57091..416b6cf 100644
  }
  
 diff --git a/pkg/webrtc/conn.go b/pkg/webrtc/conn.go
-index 924fd55..700a92b 100644
+index 924fd55..7f73235 100644
 --- a/pkg/webrtc/conn.go
 +++ b/pkg/webrtc/conn.go
 @@ -1,17 +1,26 @@
@@ -1081,7 +1081,7 @@ index 924fd55..700a92b 100644
  		track, err := c.GetTrack(media, codec)
  		if err != nil {
  			return
-@@ -87,10 +133,49 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -87,10 +133,53 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}
  		}
  
@@ -1103,12 +1103,16 @@ index 924fd55..700a92b 100644
 +			nestVideoSeen.Store(true) // disarms the connect watchdog in OnConnectionStateChange
 +		}
 +		// Monotonic base for the drought timestamps below. These MUST NOT round-trip through
-+		// time.Now().UnixNano() / time.Unix(0, ns): that strips the monotonic reading, so every
-+		// time.Since() on them measures the WALL clock. A forward NTP step then reads as a media
-+		// gap -- observed live as a bogus 17.94s idr_age whose watchdog had armed 19s earlier
-+		// with no ticks in between -- and a step larger than the full-stall deadline would tear
-+		// down a perfectly healthy stream. Storing elapsed-since-base keeps the atomics (a
-+		// time.Time does not fit in an atomic.Int64) while staying on the monotonic clock.
++		// time.Now().UnixNano(): an int64 cannot carry a monotonic reading and time.Unix(0, ns)
++		// cannot restore one, so every time.Since() on them measures the WALL clock. A forward
++		// NTP step then reads as a media gap -- observed live as a bogus 17.94s idr_age whose
++		// watchdog had armed 19s earlier with no ticks in between, on a Pi with no RTC where
++		// go2rtc dialled before the first time sync -- and a step past the full-stall deadline
++		// would tear down a perfectly healthy stream.
++		//
++		// A time.Time per track keeps the monotonic reading but does not fit in an atomic.Int64,
++		// and atomic.Pointer[time.Time] allocates on every packet. Storing elapsed-since-base
++		// keeps the plain atomics and stays on the monotonic clock.
 +		nestEpoch := time.Now()
 +		var lastVideoNS, lastIDRNS atomic.Int64
 +
@@ -1134,7 +1138,7 @@ index 924fd55..700a92b 100644
  					if err := pc.WriteRTCP(pkts); err != nil {
  						return
  					}
-@@ -98,6 +183,87 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -98,6 +187,87 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}()
  		}
  
@@ -1222,7 +1226,7 @@ index 924fd55..700a92b 100644
  		for {
  			b := make([]byte, ReceiveMTU)
  			n, _, err := remote.Read(b)
-@@ -113,9 +279,55 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -113,9 +283,55 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}
  
  			if len(packet.Payload) == 0 {
@@ -1278,7 +1282,7 @@ index 924fd55..700a92b 100644
  			track.WriteRTP(packet)
  		}
  	})
-@@ -137,6 +349,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -137,6 +353,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			for _, sender := range c.Senders {
  				sender.Start()
  			}
@@ -1298,7 +1302,7 @@ index 924fd55..700a92b 100644
  		case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
  			// disconnect event comes earlier, than failed
  			// but it comes only for success connections
-@@ -147,6 +372,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -147,6 +376,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  	return c
  }
  
