@@ -1112,6 +1112,10 @@ or the box may be ahead and carrying an undeployed hotfix (commit it).
 - [go2rtc #2387](https://github.com/AlexxIT/go2rtc/issues/2387) — `Producer.reconnect()` silently drops receivers it cannot re-match (two bare `continue`s, no log at any level), and the following `conn.Stop()` then severs their consumers permanently. Directly observable: a consumer whose sender reports a `parent` receiver id the producer no longer has — **open**
 - [go2rtc #2388](https://github.com/AlexxIT/go2rtc/issues/2388) — the RTSP consumer's `bytes_send` is incremented inside the `err != nil` branch, so it counts **failed** writes; a perfectly healthy consumer reports zero. The same inverted pattern is in three backchannel consumers — **open**
 
+**Bugs other people found in this fork (credit to them):**
+
+- [@donparlor](https://github.com/donparlor), on [go2rtc #2351](https://github.com/AlexxIT/go2rtc/pull/2351) — audited the Nest stall watchdog read-only against their own tree and found that `stallDone` is created with `defer close(stallDone)` inside the `OnTrack` callback, which is the same scope as the read loop. A fatal `remote.Read()` or `rtp.Packet.Unmarshal()` therefore returns, runs the defer, and tears down the watchdog at exactly the moment it is needed, while ICE stays up on Google's consent checks alone and `Producer.reconnect()` is never reached. They also called for monotonic elapsed-time tracking in place of `UnixNano()` reconstruction. Both fixed here in `nestfix-1.9.14-12` through `-15`
+
 **Upstream go2rtc work this fork builds on (credit to the authors):**
 
 - [go2rtc PR #2368](https://github.com/AlexxIT/go2rtc/pull/2368) — the Nest keyframe-request + `sprop-parameter-sets`-in-SDP patches from this fork, submitted upstream
