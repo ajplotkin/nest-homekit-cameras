@@ -1000,17 +1000,19 @@ index 6a57091..416b6cf 100644
  }
  
 diff --git a/pkg/webrtc/conn.go b/pkg/webrtc/conn.go
-index 924fd55..3ff6b43 100644
+index 924fd55..02b91b1 100644
 --- a/pkg/webrtc/conn.go
 +++ b/pkg/webrtc/conn.go
-@@ -1,17 +1,26 @@
+@@ -1,17 +1,28 @@
  package webrtc
  
  import (
 +	"encoding/base64"
 +	"encoding/binary"
  	"encoding/json"
++	"errors"
  	"fmt"
++	"io"
  	"strings"
 +	"sync/atomic"
  	"time"
@@ -1030,7 +1032,7 @@ index 924fd55..3ff6b43 100644
  type Conn struct {
  	core.Connection
  	core.Listener
-@@ -34,6 +43,13 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -34,6 +45,13 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  		pc: pc,
  	}
  
@@ -1044,7 +1046,7 @@ index 924fd55..3ff6b43 100644
  	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
  		// last candidate will be empty
  		if candidate != nil {
-@@ -74,6 +90,36 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -74,6 +92,36 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			return
  		}
  
@@ -1081,7 +1083,7 @@ index 924fd55..3ff6b43 100644
  		track, err := c.GetTrack(media, codec)
  		if err != nil {
  			return
-@@ -87,10 +133,59 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -87,10 +135,59 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}
  		}
  
@@ -1144,7 +1146,7 @@ index 924fd55..3ff6b43 100644
  					if err := pc.WriteRTCP(pkts); err != nil {
  						return
  					}
-@@ -98,10 +193,104 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -98,10 +195,112 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}()
  		}
  
@@ -1241,15 +1243,23 @@ index 924fd55..3ff6b43 100644
 +				// up on Google's consent checks alone, with or without audio, so the transport
 +				// lingers and Producer.reconnect() is never reached. Close it here instead.
 +				// Upstream returns silently, which is also why this was invisible for so long.
++				// io.EOF is what a read returns once the PeerConnection is already closing
++				// (pion rtpreceiver readRTP on closedChan, and packetio once the buffer is
++				// closed), so it is the NORMAL end of every intentional teardown: a watchdog
++				// kill, Producer.reconnect's Stop, or a stream shutdown. Closing again is
++				// harmless and idempotent, but warning about it would fire on every clean
++				// re-dial and bury the real thing this is here to surface.
 +				if isNestVideoTrack {
-+					zlog.Warn().Int64("conn", connID).Err(err).
-+						Msg("nest: video track read failed, closing transport")
++					if !errors.Is(err, io.EOF) {
++						zlog.Warn().Int64("conn", connID).Err(err).
++							Msg("nest: video track read failed, closing transport")
++					}
 +					_ = c.Close()
 +				}
  				return
  			}
  
-@@ -109,13 +298,68 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -109,13 +308,69 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  
  			packet := &rtp.Packet{}
  			if err := packet.Unmarshal(b[:n]); err != nil {
@@ -1262,6 +1272,7 @@ index 924fd55..3ff6b43 100644
 +						Msg("nest: RTP unmarshal failed, closing transport")
 +					_ = c.Close()
 +				}
++				// No io.EOF guard here: Unmarshal never returns it, so any error is real.
  				return
  			}
  
@@ -1318,7 +1329,7 @@ index 924fd55..3ff6b43 100644
  			track.WriteRTP(packet)
  		}
  	})
-@@ -137,6 +381,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -137,6 +392,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			for _, sender := range c.Senders {
  				sender.Start()
  			}
@@ -1338,7 +1349,7 @@ index 924fd55..3ff6b43 100644
  		case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
  			// disconnect event comes earlier, than failed
  			// but it comes only for success connections
-@@ -147,6 +404,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -147,6 +415,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  	return c
  }
  
