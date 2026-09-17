@@ -36,7 +36,7 @@ FORK_URL="${FORK_URL:-https://github.com/ajplotkin/go2rtc.git}"
 # work (and at times debug logging), which must never land in someone's install.
 # `git clone --branch` accepts a tag, so this needs no other change. Override to
 # test a branch/tag: FORK_BRANCH=nestfix-1.9.14-10 ./install.sh
-# (do NOT use fix/nest-ipv6-ice-failure -- it is superseded and 11 commits behind)
+# (build from the tag; the nestfix tags are a branchless chain and no dev branch exists)
 FORK_BRANCH="${FORK_BRANCH:-nestfix-1.9.14-15}"
 BASE_IMAGE="${BASE_IMAGE:-alexxit/go2rtc:1.9.14}"
 PLUGIN_VER="1.1.24"
