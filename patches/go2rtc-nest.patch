@@ -1000,7 +1000,7 @@ index 6a57091..416b6cf 100644
  }
  
 diff --git a/pkg/webrtc/conn.go b/pkg/webrtc/conn.go
-index 924fd55..02b91b1 100644
+index 924fd55..435bf03 100644
 --- a/pkg/webrtc/conn.go
 +++ b/pkg/webrtc/conn.go
 @@ -1,17 +1,28 @@
@@ -1083,7 +1083,7 @@ index 924fd55..02b91b1 100644
  		track, err := c.GetTrack(media, codec)
  		if err != nil {
  			return
-@@ -87,10 +135,59 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -87,10 +135,60 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}
  		}
  
@@ -1103,6 +1103,7 @@ index 924fd55..02b91b1 100644
 +		isNestVideo := isNestVideoTrack && codec.Name == core.CodecH264
 +		// Declared out here so the read-loop exit paths below can name the session in their logs.
 +		var connID int64
++		var badRTP int
 +		if isNestVideoTrack {
 +			nestVideoSeen.Store(true) // disarms the connect watchdog in OnConnectionStateChange
 +		}
@@ -1146,7 +1147,7 @@ index 924fd55..02b91b1 100644
  					if err := pc.WriteRTCP(pkts); err != nil {
  						return
  					}
-@@ -98,10 +195,112 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -98,10 +196,112 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}()
  		}
  
@@ -1259,20 +1260,30 @@ index 924fd55..02b91b1 100644
  				return
  			}
  
-@@ -109,13 +308,69 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -109,13 +309,79 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  
  			packet := &rtp.Packet{}
  			if err := packet.Unmarshal(b[:n]); err != nil {
-+				// Same reasoning as the read error above. Reachable on a single malformed packet:
-+				// rtp.Packet.Unmarshal returns errTooSmall when the padding-count byte exceeds the
-+				// packet, and that byte sits inside the SRTP-encrypted portion, so nothing upstream
-+				// validates it before this point.
++				// Discard the packet and keep reading, rather than closing as the read-error
++				// path above does. This is reachable on a SINGLE malformed packet:
++				// rtp.Packet.Unmarshal returns errTooSmall when the padding-count byte exceeds
++				// the packet, and that byte sits inside the SRTP-encrypted portion, so nothing
++				// upstream validates it before this point. Tearing down a healthy session over
++				// one bad packet is the same false-positive teardown the 4s keyframe deadline
++				// used to cause. If video really has stopped, lastVideoNS stops advancing and
++				// the stall watchdog closes the transport anyway, so patience costs nothing.
++				//
++				// Upstream returns here, which kills the track silently. Gated to Nest to bound
++				// the blast radius. Credit to donparlor (AlexxIT/go2rtc#2351), who reached this
++				// conclusion independently and shipped it first.
 +				if isNestVideoTrack {
-+					zlog.Warn().Int64("conn", connID).Err(err).
-+						Msg("nest: RTP unmarshal failed, closing transport")
-+					_ = c.Close()
++					badRTP++
++					if badRTP == 1 || badRTP%100 == 0 {
++						zlog.Warn().Int64("conn", connID).Err(err).Int("discarded", badRTP).
++							Msg("nest: discarding malformed RTP packet")
++					}
++					continue
 +				}
-+				// No io.EOF guard here: Unmarshal never returns it, so any error is real.
  				return
  			}
  
@@ -1329,7 +1340,7 @@ index 924fd55..02b91b1 100644
  			track.WriteRTP(packet)
  		}
  	})
-@@ -137,6 +392,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -137,6 +403,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			for _, sender := range c.Senders {
  				sender.Start()
  			}
@@ -1349,7 +1360,7 @@ index 924fd55..02b91b1 100644
  		case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
  			// disconnect event comes earlier, than failed
  			// but it comes only for success connections
-@@ -147,6 +415,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -147,6 +426,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  	return c
  }
  
@@ -1384,3 +1395,34 @@ index 924fd55..02b91b1 100644
  func (c *Conn) MarshalJSON() ([]byte, error) {
  	return json.Marshal(c.Connection)
  }
+diff --git a/pkg/core/waiter.go b/pkg/core/waiter.go
+index c61e3be..68d7e31 100644
+--- a/pkg/core/waiter.go
++++ b/pkg/core/waiter.go
+@@ -44,11 +44,22 @@ func (w *Waiter) Done(err error) {
+ 	// safe run Done only when have tasks
+ 	if w.state > 0 {
+ 		w.state--
+-		w.WaitGroup.Done()
+-	}
+ 
+-	// block waiter for any operations after last done
+-	if w.state == 0 {
++		// Publish the result BEFORE the WaitGroup.Done() that releases waiters.
++		// Wait() reads w.err without holding w.mu, and WaitGroup.Done() unblocks it
++		// immediately, so writing w.err afterwards let a waiter read the previous value
++		// and report success for a connection that ended with an error. Reproduced under
++		// -race: Wait() at the `return w.err` line against Done() at the `w.err = err`
++		// line. Ordering the write first also gives the read a happens-before edge
++		// through the WaitGroup, so no lock is needed on the Wait() side.
++		if w.state == 0 {
++			w.state = -1
++			w.err = err
++		}
++
++		w.WaitGroup.Done()
++	} else if w.state == 0 {
++		// block waiter for any operations after last done
+ 		w.state = -1
+ 		w.err = err
+ 	}
