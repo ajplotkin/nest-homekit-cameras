@@ -1000,7 +1000,7 @@ index 6a57091..416b6cf 100644
  }
  
 diff --git a/pkg/webrtc/conn.go b/pkg/webrtc/conn.go
-index 924fd55..33a34ae 100644
+index 924fd55..a5a84ad 100644
 --- a/pkg/webrtc/conn.go
 +++ b/pkg/webrtc/conn.go
 @@ -1,17 +1,26 @@
@@ -1144,7 +1144,7 @@ index 924fd55..33a34ae 100644
  					if err := pc.WriteRTCP(pkts); err != nil {
  						return
  					}
-@@ -98,10 +193,127 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -98,10 +193,133 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}()
  		}
  
@@ -1253,10 +1253,16 @@ index 924fd55..33a34ae 100644
 +				// packet dequeued after the interceptors close. That sentinel is unexported
 +				// (pion/interceptor twcc errClosed), so it cannot be matched with errors.Is.
 +				//
-+				// Keying on connection state covers all of them without listing error values.
++				// Keying on the SIGNALING state covers all of them without listing error values.
 +				// pion's PeerConnection.close() sets SignalingStateClosed (atomically) BEFORE it
 +				// stops the transceivers and BEFORE it closes the interceptors, so by the time the
-+				// read loop sees any teardown error, SignalingState() already reads Closed. It also
++				// read loop sees any teardown error, SignalingState() already reads Closed.
++				//
++				// Do NOT "simplify" this to pc.ConnectionState() != PeerConnectionStateClosed.
++				// ConnectionState only reaches Closed in close()'s updateConnectionState step,
++				// which runs AFTER the transceivers are stopped. The read error fires first, so a
++				// ConnectionState guard would warn on every teardown. Only SignalingState is set
++				// early enough. It also
 +				// fixes a flaw in -15..-17, which excluded only io.EOF: that both missed the TWCC
 +				// case and would have hidden an io.EOF arriving on a still-open connection, which
 +				// is precisely the zombie worth reporting.
@@ -1272,7 +1278,7 @@ index 924fd55..33a34ae 100644
  				return
  			}
  
-@@ -109,13 +321,69 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -109,13 +327,69 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  
  			packet := &rtp.Packet{}
  			if err := packet.Unmarshal(b[:n]); err != nil {
@@ -1342,7 +1348,7 @@ index 924fd55..33a34ae 100644
  			track.WriteRTP(packet)
  		}
  	})
-@@ -137,6 +405,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -137,6 +411,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			for _, sender := range c.Senders {
  				sender.Start()
  			}
@@ -1362,7 +1368,7 @@ index 924fd55..33a34ae 100644
  		case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
  			// disconnect event comes earlier, than failed
  			// but it comes only for success connections
-@@ -147,6 +428,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -147,6 +434,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  	return c
  }
  
