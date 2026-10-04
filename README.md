@@ -22,7 +22,7 @@ This guide walks through the full setup from scratch: getting API access to your
 - **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches), `setup-google-device-access.sh` (automates Part 1 — the Google Cloud half of the credentials setup), `test-prebuffer-e2e.js` (end-to-end proof the prebuffer ring actually recovers pre-trigger footage — see [Testing the prebuffer](#testing-the-prebuffer)), and `check-drift.sh` (read-only; proves your deployment still matches this repo — see [Checking for drift](#checking-for-drift)).
 - **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), five plugin diffs against stock 1.1.24 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`), and `homebridge-plugin/new-files/PrebufferManager.js` (a new file, copied in rather than patched — it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)).
 
-The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-19)** — build from the stable tag **`nestfix-1.9.14-19`** (the tags are a branchless chain on top of upstream master, so build from the tag — there is no branch to check out.). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
+The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-20)** — build from the stable tag **`nestfix-1.9.14-20`** (the tags are a branchless chain on top of upstream master, so build from the tag — there is no branch to check out.). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
 
 Two things worth calling out for anyone arriving because their recordings are unreliable:
 **HKSV clips from the stock plugin are silent** (an `-an` overrides the whole audio block —
@@ -230,7 +230,7 @@ The fork also removes an inner retry loop in `rtcConn` that burned ~130 SDM API 
 ```bash
 git clone https://github.com/ajplotkin/go2rtc.git
 cd go2rtc
-git checkout nestfix-1.9.14-19   # stable tag — not the dev branch
+git checkout nestfix-1.9.14-20   # stable tag — not the dev branch
 ```
 
 > **Prefer to patch stock go2rtc yourself?** Instead of cloning the fork, check out upstream go2rtc at the `v1.9.14` tag and apply [`patches/go2rtc-nest.patch`](patches/go2rtc-nest.patch) from this repo (`git clone https://github.com/AlexxIT/go2rtc && cd go2rtc && git checkout v1.9.14 && git apply /path/to/go2rtc-nest.patch`), then run the same build command below. The diff is the exact set of source changes described in this guide, plus the credited community PRs.
@@ -1048,7 +1048,7 @@ That check exists because the blind spot was not hypothetical: the keyframe-watc
 (4s → 60s) lived in `patches/go2rtc-nest.patch` here for days while the fork tag the guide told
 people to build from still shipped the old 4s version, and a drift report could not have
 revealed it. It caught the same class of drift again on 2026-09-16, when the patch and the tag
-had moved to `nestfix-1.9.14-19` and this README still pinned `-11`.
+had moved to `nestfix-1.9.14-15` and this README still pinned `-11`.
 
 Still outside its scope: `go2rtc.yaml` stream contents beyond a count, and whether the
 warmer/wedge systemd units are enabled as opposed to merely matching.
@@ -1114,7 +1114,7 @@ or the box may be ahead and carrying an undeployed hotfix (commit it).
 
 **Bugs other people found in this fork (credit to them):**
 
-- [@donparlor](https://github.com/donparlor), on [go2rtc #2351](https://github.com/AlexxIT/go2rtc/pull/2351) — audited the Nest stall watchdog read-only against their own tree and found that `stallDone` is created with `defer close(stallDone)` inside the `OnTrack` callback, which is the same scope as the read loop. A fatal `remote.Read()` or `rtp.Packet.Unmarshal()` therefore returns, runs the defer, and tears down the watchdog at exactly the moment it is needed. Their framing was Opus holding the PeerConnection open; the gap turned out to be wider, since Google's consent checks keep ICE up on their own, but the defer was the find. They also supplied the only live capture of the failure — H264 frozen for ten minutes beside advancing Opus, with no reconnect — and, in parallel with the clock-step diagnosis here, called for monotonic elapsed-time tracking in place of `UnixNano()` reconstruction. Fixed here in `nestfix-1.9.14-12` through `-15`. `-16` additionally takes two things from them: the `core.Waiter` result-publication race they found while race-testing their own patch, reproduced here under `-race`, and their decision to count and discard a malformed RTP packet rather than close the transport over one bad byte
+- [@donparlor](https://github.com/donparlor), on [go2rtc #2351](https://github.com/AlexxIT/go2rtc/pull/2351) — audited the Nest stall watchdog read-only against their own tree and found that `stallDone` is created with `defer close(stallDone)` inside the `OnTrack` callback, which is the same scope as the read loop. A fatal `remote.Read()` or `rtp.Packet.Unmarshal()` therefore returns, runs the defer, and tears down the watchdog at exactly the moment it is needed. Their framing was Opus holding the PeerConnection open; the gap turned out to be wider, since Google's consent checks keep ICE up on their own, but the defer was the find. They also supplied the only live capture of the failure — H264 frozen for ten minutes beside advancing Opus, with no reconnect — and, in parallel with the clock-step diagnosis here, called for monotonic elapsed-time tracking in place of `UnixNano()` reconstruction. Fixed here in `nestfix-1.9.14-12` through `-15`. `-16` additionally takes two things from them: the `core.Waiter` result-publication race they found while race-testing their own patch, reproduced here under `-race`, and their decision to count and discard a malformed RTP packet rather than close the transport over one bad byte. `-18` and `-19` accidentally dropped the discard (the `-18` edit was made on a stale copy of `conn.go`); `-20` restores it, with a test that fails if it goes missing again.
 
 **Upstream go2rtc work this fork builds on (credit to the authors):**
 
