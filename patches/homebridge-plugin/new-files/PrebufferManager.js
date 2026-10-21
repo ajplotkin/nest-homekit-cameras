@@ -305,13 +305,15 @@ class CameraBuffer {
             // A producer restart behind go2rtc splices a NEW RTP stream -- random sequence
             // numbers AND random timestamp bases -- into this still-open RTSP session. Over
             // TCP a cseq jump cannot be loss or reordering, so it can only mean the server
-            // switched sources underneath us. ffmpeg does not re-anchor: whichever track's
-            // new base lands AHEAD stays monotonic and is harmless, but a track landing
-            // BEHIND makes our own mp4 muxer clamp every later dts to prev+1. That clamp is
-            // a warning, so at the -loglevel error this reader used to run at it was thrown
-            // away silently (hence the loglevel change above). The ring then holds real
-            // audio on a FROZEN timeline, and every clip cut from it is rejected by the hub
-            // with reason=5 (UNEXPECTED_FAILURE).
+            // switched sources underneath us. ffmpeg does not re-anchor, and either
+            // direction is harmful. A track whose new base lands BEHIND makes our own mp4
+            // muxer clamp every later dts to prev+1. A track landing AHEAD stays monotonic
+            // on its own, but it is now offset from the other track, so a multi-track clip
+            // is misaligned (kreucher's forward-jump test on go2rtc#2404). The BEHIND clamp
+            // is a warning, so at the -loglevel error this reader used to run at it was
+            // thrown away silently (hence the loglevel change above). The ring then holds
+            // real audio on a FROZEN timeline, and every clip cut from it is rejected by
+            // the hub with reason=5 (UNEXPECTED_FAILURE).
             //
             // Measured 2026-08-03: a 04:26:43 splice poisoned front_door's ring for 4h53m.
             // It was invisible until the first doorbell press at 08:19:57, which failed, as
