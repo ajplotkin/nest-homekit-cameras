@@ -368,7 +368,7 @@ index 09e2dcc..861cfe1 100644
  
  	p.reconnect(workerID, 0)
 diff --git a/pkg/core/writebuffer.go b/pkg/core/writebuffer.go
-index 50ad013..99d072d 100644
+index 50ad013..41482a0 100644
 --- a/pkg/core/writebuffer.go
 +++ b/pkg/core/writebuffer.go
 @@ -13,10 +13,11 @@ import (
@@ -387,7 +387,7 @@ index 50ad013..99d072d 100644
  }
  
  func NewWriteBuffer(wr io.Writer) *WriteBuffer {
-@@ -47,10 +48,48 @@ func (w *WriteBuffer) WriteTo(wr io.Writer) (n int64, err error) {
+@@ -47,10 +48,47 @@ func (w *WriteBuffer) WriteTo(wr io.Writer) (n int64, err error) {
  }
  
  func (w *WriteBuffer) Close() error {
@@ -428,16 +428,15 @@ index 50ad013..99d072d 100644
 +	// long-running panic reports upstream (#338, #1220, #1261, #1757); this mirrors
 +	// upstream PR #2339 (Color-Kat).
 +	//
-+	// Worth stating plainly: a panic here takes down the go2rtc process, i.e. every
-+	// camera at once. On this deployment that is a whole-stack outage, not one dropped
-+	// consumer.
++	// A panic here takes down the go2rtc process, i.e. every camera at once. On this
++	// deployment that is a whole-stack outage, not one dropped consumer.
 +	if w.err == nil {
 +		w.err = io.ErrClosedPipe
 +	}
  	w.done()
  	w.mu.Unlock()
  	return nil
-@@ -76,7 +115,8 @@ const (
+@@ -76,7 +114,8 @@ const (
  )
  
  func (w *WriteBuffer) add() {
@@ -449,10 +448,10 @@ index 50ad013..99d072d 100644
  	}
 diff --git a/pkg/core/writebuffer_test.go b/pkg/core/writebuffer_test.go
 new file mode 100644
-index 0000000..25363ee
+index 0000000..bc9ae3f
 --- /dev/null
 +++ b/pkg/core/writebuffer_test.go
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,143 @@
 +package core
 +
 +import (
@@ -572,6 +571,30 @@ index 0000000..25363ee
 +		t.Fatal("WriteTo blocked after Close-before-WriteTo - the race window leaks the consumer")
 +	}
 +}
++
++// closerCountingWriter is an io.Closer that keeps accepting writes after Close, as a
++// connection whose Close hasn't taken effect yet would, and counts every write.
++type closerCountingWriter struct{ writes int }
++
++func (c *closerCountingWriter) Write(p []byte) (int, error) {
++	c.writes++
++	return len(p), nil
++}
++func (c *closerCountingWriter) Close() error { return nil }
++
++// The io.Closer branch of Close must reject later writes too. Before 2f2e9a7 it
++// returned without setting err, so a Write after Close went straight to the target.
++// TestWriteBufferWriteAfterCloseDoesNotReachWriter covers only the other branch.
++func TestWriteBufferWriteAfterCloseOnCloserDoesNotReachWriter(t *testing.T) {
++	cw := &closerCountingWriter{}
++	wb := NewWriteBuffer(cw) // Close() sees an io.Closer and takes that branch
++
++	require.NoError(t, wb.Close())
++
++	_, err := wb.Write([]byte("late"))
++	require.Error(t, err, "Write after Close must return an error")
++	require.Zero(t, cw.writes, "Write after Close reached the underlying writer")
++}
 diff --git a/pkg/h264/h264.go b/pkg/h264/h264.go
 index 1223953..1e36fe0 100644
 --- a/pkg/h264/h264.go
@@ -601,10 +624,10 @@ index 1223953..1e36fe0 100644
  			s += ";sprop-parameter-sets=" + base64.StdEncoding.EncodeToString(avc[4:size])
  		case NALUTypePPS:
 diff --git a/pkg/h264/rtp.go b/pkg/h264/rtp.go
-index d093254..6f1adb3 100644
+index d093254..a0afa57 100644
 --- a/pkg/h264/rtp.go
 +++ b/pkg/h264/rtp.go
-@@ -21,7 +21,25 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
+@@ -21,10 +21,67 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
  
  	buf := make([]byte, 0, 512*1024) // 512K
  
@@ -619,6 +642,11 @@ index d093254..6f1adb3 100644
 +	// Wait for a partition head before feeding the depayloader anything.
 +	synced := false
 +
++	// Track fragmented NAL state after initial sync as well. pion's
++	// H264Packet appends FU-A payloads without validating the start bit, so
++	// an interrupted fragmented NAL must not contaminate the next one.
++	inFragment := false
++
  	return func(packet *rtp.Packet) {
 +		if !synced {
 +			if !depack.IsPartitionHead(packet.Payload) {
@@ -627,10 +655,47 @@ index d093254..6f1adb3 100644
 +			synced = true
 +		}
 +
++		fuaEnd := false
++
++		if len(packet.Payload) >= 2 && packet.Payload[0]&0x1F == fuaNALUType {
++			fuaStart := packet.Payload[1]&0x80 != 0
++			fuaEnd = packet.Payload[1]&0x40 != 0
++
++			switch {
++			case fuaStart:
++				// A new FU-A start is authoritative. If the previous fragmented
++				// NAL never completed, discard both its pion fragment buffer and
++				// any partially collected access unit before starting fresh.
++				if inFragment {
++					buf = buf[:0]
++				}
++				depack = &codecs.H264Packet{IsAVC: true}
++				inFragment = true
++
++			case !inFragment:
++				// Middle/end fragment without a start. This can happen after
++				// packet loss or when attaching in the middle of a fragmented NAL.
++				return
++			}
++		} else if inFragment {
++			// A non-FU-A packet cannot complete the fragmented NAL we were
++			// assembling. Discard the stale fragment/access-unit state.
++			depack = &codecs.H264Packet{IsAVC: true}
++			inFragment = false
++			buf = buf[:0]
++		}
++
  		//log.Printf("[RTP] codec: %s, nalu: %2d, size: %6d, ts: %10d, pt: %2d, ssrc: %d, seq: %d, %v", codec.Name, packet.Payload[0]&0x1F, len(packet.Payload), packet.Timestamp, packet.PayloadType, packet.SSRC, packet.SequenceNumber, packet.Marker)
  
  		payload, err := depack.Unmarshal(packet.Payload)
-@@ -89,7 +107,7 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
++
++		if fuaEnd {
++			inFragment = false
++		}
+ 		if len(payload) == 0 || err != nil {
+ 			return
+ 		}
+@@ -89,7 +146,7 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
  
  		// should not be that huge SPS
  		if NALUType(payload) == NALUTypeSPS && binary.BigEndian.Uint32(payload) >= PSMaxSize {
@@ -658,10 +723,18 @@ index 625e3ab..13b4d32 100644
  			mediaCodec := &core.Codec{
  				Name:      videoCodecs[codec.CodecType],
 diff --git a/pkg/nest/api.go b/pkg/nest/api.go
-index 4e9e4db..77b2e54 100644
+index 4e9e4db..8f8c601 100644
 --- a/pkg/nest/api.go
 +++ b/pkg/nest/api.go
-@@ -26,7 +26,11 @@ type API struct {
+@@ -4,6 +4,7 @@ import (
+ 	"bytes"
+ 	"encoding/json"
+ 	"errors"
++	"io"
+ 	"net/http"
+ 	"net/url"
+ 	"strings"
+@@ -26,7 +27,11 @@ type API struct {
  	StreamToken          string
  	StreamExtensionToken string
  
@@ -673,60 +746,188 @@ index 4e9e4db..77b2e54 100644
  }
  
  type Auth struct {
-@@ -49,8 +53,12 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
- 	key := clientID + ":" + clientSecret + ":" + refreshToken
- 	now := time.Now()
+@@ -42,17 +47,47 @@ type DeviceInfo struct {
+ var cache = map[string]*API{}
+ var cacheMu sync.Mutex
  
++// Endpoints, variables so tests can point them at a local server.
++var (
++	tokenURL = "https://www.googleapis.com/oauth2/v4/token"
++	sdmURL   = "https://smartdevicemanagement.googleapis.com/v1/enterprises/"
++)
++
++// Backoff before retrying GenerateWebRtcStream after a 409 or 429; doubles each retry.
++var busyRetryDelay = time.Second * 30
++
++// A cached token this close to its expiry is not handed out: it might expire
++// before the caller's request reaches Google. The extend loop refreshes within the same margin.
++const tokenExpiryMargin = 30 * time.Second
++
+ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
+ 	cacheMu.Lock()
+ 	defer cacheMu.Unlock()
+ 
+ 	key := clientID + ":" + clientSecret + ":" + refreshToken
+-	now := time.Now()
+ 
+-	if api := cache[key]; api != nil && now.Before(api.ExpiresAt) {
+-		return api, nil
 +	// The cache only stores the OAuth token. Each caller gets its own API
 +	// instance, because the Stream* fields hold per-stream session state -
 +	// multiple cameras sharing one instance overwrite each other's session
 +	// and only the last one gets extended.
- 	if api := cache[key]; api != nil && now.Before(api.ExpiresAt) {
--		return api, nil
++	if api := cache[key]; api != nil && time.Now().Add(tokenExpiryMargin).Before(api.ExpiresAt) {
 +		return &API{Token: api.Token, ExpiresAt: api.ExpiresAt, key: key}, nil
  	}
  
++	api, err := fetchToken(clientID, clientSecret, refreshToken)
++	if err != nil {
++		return nil, err
++	}
++
++	cache[key] = api
++
++	return &API{Token: api.Token, ExpiresAt: api.ExpiresAt, key: key}, nil
++}
++
++// fetchToken requests a new access token from Google. The caller holds cacheMu.
++func fetchToken(clientID, clientSecret, refreshToken string) (*API, error) {
++	now := time.Now()
++
  	data := url.Values{
-@@ -60,7 +68,7 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
+ 		"grant_type":    []string{"refresh_token"},
+ 		"client_id":     []string{clientID},
+@@ -60,8 +95,8 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
  		"refresh_token": []string{refreshToken},
  	}
  
 -	client := &http.Client{Timeout: time.Second * 5000}
+-	res, err := client.PostForm("https://www.googleapis.com/oauth2/v4/token", data)
 +	client := &http.Client{Timeout: time.Second * 10}
- 	res, err := client.PostForm("https://www.googleapis.com/oauth2/v4/token", data)
++	res, err := client.PostForm(tokenURL, data)
  	if err != nil {
  		return nil, err
-@@ -89,7 +97,7 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
+ 	}
+@@ -82,27 +117,58 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
+ 		return nil, err
+ 	}
  
- 	cache[key] = api
+-	api := &API{
++	if resv.AccessToken == "" {
++		return nil, errors.New("nest: no access token in response")
++	}
++
++	return &API{
+ 		Token:     resv.AccessToken,
+ 		ExpiresAt: now.Add(resv.ExpiresIn * time.Second),
+-	}
++	}, nil
++}
+ 
+-	cache[key] = api
++// do sends a request to the SDM API. A 401 means Google no longer accepts the
++// token, even if its clock expiry is still ahead (Google can revoke a token
++// early), so get another one and send the request once more.
++func (a *API) do(method, uri string, body []byte) (*http.Response, error) {
++	client := &http.Client{Timeout: time.Second * 10}
  
 -	return api, nil
-+	return &API{Token: api.Token, ExpiresAt: api.ExpiresAt, key: key}, nil
- }
+-}
++	for attempt := 0; ; attempt++ {
++		var reader io.Reader
++		if body != nil {
++			reader = bytes.NewReader(body)
++		}
++		req, err := http.NewRequest(method, uri, reader)
++		if err != nil {
++			return nil, err
++		}
  
- func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
-@@ -101,7 +109,7 @@ func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
+-func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
+-	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" + projectID + "/devices"
+-	req, err := http.NewRequest("GET", uri, nil)
+-	if err != nil {
+-		return nil, err
+-	}
++		token := a.Token
++		req.Header.Set("Authorization", "Bearer "+token)
++
++		res, err := client.Do(req)
++		if err != nil {
++			return nil, err
++		}
  
- 	req.Header.Set("Authorization", "Bearer "+a.Token)
+-	req.Header.Set("Authorization", "Bearer "+a.Token)
++		if res.StatusCode != http.StatusUnauthorized || attempt > 0 {
++			return res, nil
++		}
++		// Read to the end (up to 64 KiB; Google's 401 body is a few hundred bytes)
++		// before closing, so the connection goes back to the pool
++		// before the token request needs one. Go before 1.27 drops a connection
++		// whose body is closed unread.
++		_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 64<<10))
++		res.Body.Close()
++
++		if err = a.replaceToken(token); err != nil {
++			return nil, err
++		}
++	}
++}
  
 -	client := &http.Client{Timeout: time.Second * 5000}
-+	client := &http.Client{Timeout: time.Second * 10}
- 	res, err := client.Do(req)
+-	res, err := client.Do(req)
++func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
++	res, err := a.do("GET", sdmURL+projectID+"/devices", nil)
  	if err != nil {
  		return nil, err
-@@ -178,7 +186,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
+ 	}
+@@ -164,34 +230,23 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
+ 		return "", err
+ 	}
  
- 		req.Header.Set("Authorization", "Bearer "+a.Token)
+-	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
+-		projectID + "/devices/" + deviceID + ":executeCommand"
++	uri := sdmURL + projectID + "/devices/" + deviceID + ":executeCommand"
  
+ 	maxRetries := 3
+-	retryDelay := time.Second * 30
++	retryDelay := busyRetryDelay
+ 
+ 	for attempt := 0; attempt < maxRetries; attempt++ {
+-		req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
+-		if err != nil {
+-			return "", err
+-		}
+-
+-		req.Header.Set("Authorization", "Bearer "+a.Token)
+-
 -		client := &http.Client{Timeout: time.Second * 5000}
-+		client := &http.Client{Timeout: time.Second * 10}
- 		res, err := client.Do(req)
+-		res, err := client.Do(req)
++		// a.do already replaced the token and retried on a 401
++		res, err := a.do("POST", uri, b)
  		if err != nil {
  			return "", err
-@@ -228,23 +236,12 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
+ 		}
+ 
+-		// Handle 409 (Conflict), 429 (Too Many Requests), and 401 (Unauthorized)
+-		if res.StatusCode == 409 || res.StatusCode == 429 || res.StatusCode == 401 {
++		// Handle 409 (Conflict) and 429 (Too Many Requests). A new token
++		// would not help with either, so only back off.
++		if res.StatusCode == 409 || res.StatusCode == 429 {
+ 			res.Body.Close()
+ 			if attempt < maxRetries-1 {
+-				// Get new token from Google
+-				if err := a.refreshToken(); err != nil {
+-					return "", err
+-				}
+ 				time.Sleep(retryDelay)
+ 				retryDelay *= 2 // exponential backoff
+ 				continue
+@@ -227,28 +282,27 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
+ 	return "", errors.New("nest: max retries exceeded")
  }
  
- func (a *API) refreshToken() error {
+-func (a *API) refreshToken() error {
 -	// Get the cached API with matching token to get credentials
 -	var refreshKey string
 -	cacheMu.Lock()
@@ -735,46 +936,146 @@ index 4e9e4db..77b2e54 100644
 -			refreshKey = key
 -			break
 -		}
--	}
--	cacheMu.Unlock()
--
--	if refreshKey == "" {
++// credentials parses the OAuth credentials from the cache key.
++func (a *API) credentials() (clientID, clientSecret, refreshToken string, err error) {
 +	if a.key == "" {
- 		return errors.New("nest: unable to find cached credentials")
++		return "", "", "", errors.New("nest: unable to find cached credentials")
  	}
+-	cacheMu.Unlock()
+ 
+-	if refreshKey == "" {
+-		return errors.New("nest: unable to find cached credentials")
++	parts := strings.SplitN(a.key, ":", 3)
++	if len(parts) != 3 {
++		return "", "", "", errors.New("nest: invalid cache key format")
+ 	}
++	return parts[0], parts[1], parts[2], nil
++}
  
 -	// Parse credentials from cache key
 -	parts := strings.Split(refreshKey, ":")
-+	// Parse credentials from the cache key
-+	parts := strings.SplitN(a.key, ":", 3)
- 	if len(parts) != 3 {
- 		return errors.New("nest: invalid cache key format")
+-	if len(parts) != 3 {
+-		return errors.New("nest: invalid cache key format")
++// refreshToken renews a token that is about to expire. It goes through the
++// cache, so it is only for the clock-based refresh: after a 401 the cached
++// token can be the rejected one, see replaceToken.
++func (a *API) refreshToken() error {
++	clientID, clientSecret, refreshToken, err := a.credentials()
++	if err != nil {
++		return err
  	}
-@@ -295,7 +292,7 @@ func (a *API) ExtendStream() error {
+-	clientID, clientSecret, refreshToken := parts[0], parts[1], parts[2]
  
- 	req.Header.Set("Authorization", "Bearer "+a.Token)
+ 	// Get new API instance which will refresh the token
+ 	newAPI, err := NewAPI(clientID, clientSecret, refreshToken)
+@@ -262,6 +316,46 @@ func (a *API) refreshToken() error {
+ 	return nil
+ }
  
++// replaceToken gets a new token after Google rejected the token `failed` with a
++// 401. The cache cannot be trusted here: it may still hold `failed` within its
++// clock expiry, and every camera on the account shares that entry. So unless
++// another camera has already replaced it, request a new token and store it for
++// all of them. cacheMu is held across the request, so cameras that get a 401
++// at the same moment make one token request between them.
++func (a *API) replaceToken(failed string) error {
++	clientID, clientSecret, refreshToken, err := a.credentials()
++	if err != nil {
++		return err
++	}
++
++	cacheMu.Lock()
++	defer cacheMu.Unlock()
++
++	if api := cache[a.key]; api != nil && api.Token != failed &&
++		time.Now().Add(tokenExpiryMargin).Before(api.ExpiresAt) {
++		a.Token = api.Token
++		a.ExpiresAt = api.ExpiresAt
++		return nil
++	}
++
++	// Drop the rejected token first, so that if the request fails the next
++	// NewAPI asks Google again instead of handing it out.
++	if api := cache[a.key]; api != nil && api.Token == failed {
++		delete(cache, a.key)
++	}
++
++	api, err := fetchToken(clientID, clientSecret, refreshToken)
++	if err != nil {
++		return err
++	}
++
++	cache[a.key] = api
++
++	a.Token = api.Token
++	a.ExpiresAt = api.ExpiresAt
++	return nil
++}
++
+ func (a *API) ExtendStream() error {
+ 	var reqv struct {
+ 		Command string `json:"command"`
+@@ -286,17 +380,8 @@ func (a *API) ExtendStream() error {
+ 		return err
+ 	}
+ 
+-	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
+-		a.StreamProjectID + "/devices/" + a.StreamDeviceID + ":executeCommand"
+-	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
+-	if err != nil {
+-		return err
+-	}
+-
+-	req.Header.Set("Authorization", "Bearer "+a.Token)
+-
 -	client := &http.Client{Timeout: time.Second * 5000}
-+	client := &http.Client{Timeout: time.Second * 10}
- 	res, err := client.Do(req)
+-	res, err := client.Do(req)
++	uri := sdmURL + a.StreamProjectID + "/devices/" + a.StreamDeviceID + ":executeCommand"
++	res, err := a.do("POST", uri, b)
  	if err != nil {
  		return err
-@@ -348,7 +345,7 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
+ 	}
+@@ -339,20 +424,12 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
+ 		return "", err
+ 	}
  
- 	req.Header.Set("Authorization", "Bearer "+a.Token)
- 
+-	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
+-		projectID + "/devices/" + deviceID + ":executeCommand"
+-	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
+-	if err != nil {
+-		return "", err
+-	}
+-
+-	req.Header.Set("Authorization", "Bearer "+a.Token)
+-
 -	client := &http.Client{Timeout: time.Second * 5000}
-+	client := &http.Client{Timeout: time.Second * 10}
- 	res, err := client.Do(req)
+-	res, err := client.Do(req)
++	uri := sdmURL + projectID + "/devices/" + deviceID + ":executeCommand"
++	res, err := a.do("POST", uri, b)
  	if err != nil {
  		return "", err
-@@ -412,11 +409,12 @@ func (a *API) StopRTSPStream() error {
+ 	}
++	defer res.Body.Close()
  
- 	req.Header.Set("Authorization", "Bearer "+a.Token)
+ 	if res.StatusCode != 200 {
+ 		return "", errors.New("nest: wrong status: " + res.Status)
+@@ -403,20 +480,12 @@ func (a *API) StopRTSPStream() error {
+ 		return err
+ 	}
  
+-	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
+-		a.StreamProjectID + "/devices/" + a.StreamDeviceID + ":executeCommand"
+-	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
+-	if err != nil {
+-		return err
+-	}
+-
+-	req.Header.Set("Authorization", "Bearer "+a.Token)
+-
 -	client := &http.Client{Timeout: time.Second * 5000}
-+	client := &http.Client{Timeout: time.Second * 10}
- 	res, err := client.Do(req)
+-	res, err := client.Do(req)
++	uri := sdmURL + a.StreamProjectID + "/devices/" + a.StreamDeviceID + ":executeCommand"
++	res, err := a.do("POST", uri, b)
  	if err != nil {
  		return err
  	}
@@ -782,7 +1083,7 @@ index 4e9e4db..77b2e54 100644
  
  	if res.StatusCode != 200 {
  		return errors.New("nest: wrong status: " + res.Status)
-@@ -469,18 +467,71 @@ func (a *API) StartExtendStreamTimer() {
+@@ -469,18 +538,73 @@ func (a *API) StartExtendStreamTimer() {
  		return
  	}
  
@@ -810,7 +1111,7 @@ index 4e9e4db..77b2e54 100644
 +			select {
 +			case <-timer.C:
 +				// The OAuth token lives ~1 hour, sessions can live longer
-+				if time.Now().After(a.ExpiresAt.Add(-30 * time.Second)) {
++				if time.Now().After(a.ExpiresAt.Add(-tokenExpiryMargin)) {
 +					if err := a.refreshToken(); err != nil {
 +						if fails++; fails <= 3 {
 +							timer.Reset(15 * time.Second)
@@ -852,35 +1153,36 @@ index 4e9e4db..77b2e54 100644
  	}
 +	// Wait for the goroutine to actually exit before returning, so a caller (RTSPClient.Stop)
 +	// can't race an in-flight ExtendStream writing StreamToken/StreamExtensionToken against
-+	// StopRTSPStream clearing them. Bounded by the 10s HTTP client timeout.
++	// StopRTSPStream clearing them. Bounded by a few 10s HTTP timeouts: the extend
++	// request, a token request before it and, after a 401, a token request and the
++	// retry, each token request possibly queued behind other cameras' on cacheMu.
 +	if a.extendDone != nil {
 +		<-a.extendDone
 +		a.extendDone = nil
 +	}
  }
 diff --git a/pkg/nest/client.go b/pkg/nest/client.go
-index 6a57091..416b6cf 100644
+index 6a57091..832a56e 100644
 --- a/pkg/nest/client.go
 +++ b/pkg/nest/client.go
-@@ -97,62 +97,67 @@ func (c *WebRTCClient) MarshalJSON() ([]byte, error) {
+@@ -96,63 +96,79 @@ func (c *WebRTCClient) MarshalJSON() ([]byte, error) {
+ 	return c.conn.MarshalJSON()
  }
  
- func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, error) {
+-func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, error) {
 -	maxRetries := 3
 -	retryDelay := time.Second * 30
 -	var lastErr error
--
++// rtcConfig is the PeerConnection configuration for WebRTC dials. A var so tests can
++// dial a loopback camera without reaching Google's STUN server.
++var rtcConfig = pion.Configuration{ICEServers: []pion.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}}
+ 
 -	for attempt := 0; attempt < maxRetries; attempt++ {
 -		rtcAPI, err := webrtc.NewAPI()
 -		if err != nil {
 -			return nil, err
 -		}
--
--		conf := pion.Configuration{}
--		pc, err := rtcAPI.NewPeerConnection(conf)
--		if err != nil {
--			return nil, err
--		}
++func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, error) {
 +	// Fix: use udp4-only to avoid ICE failure on hosts with broken/partial IPv6.
 +	// Stock go2rtc uses webrtc.NewAPI() which passes nil filters, gathering on all
 +	// network types (UDP4/UDP6/TCP4/TCP6). On hosts where IPv6 addresses exist but
@@ -892,6 +1194,16 @@ index 6a57091..416b6cf 100644
 +	// The proper upstream fix would plumb the parsed webrtc.Filters through to this
 +	// function. This fork hardcodes udp4 as a working reference.
 +	rtcAPI, err := webrtc.NewServerAPI("", "", &webrtc.Filters{Networks: []string{"udp4"}})
++	if err != nil {
++		return nil, err
++	}
+ 
+-		conf := pion.Configuration{}
+-		pc, err := rtcAPI.NewPeerConnection(conf)
+-		if err != nil {
+-			return nil, err
+-		}
++	pc, err := rtcAPI.NewPeerConnection(rtcConfig)
 +	if err != nil {
 +		return nil, err
 +	}
@@ -908,17 +1220,6 @@ index 6a57091..416b6cf 100644
 -			{Kind: core.KindVideo, Direction: core.DirectionRecvonly},
 -			{Kind: "app"}, // important for Nest
 -		}
-+	conf := pion.Configuration{ICEServers: []pion.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}}
-+	pc, err := rtcAPI.NewPeerConnection(conf)
-+	if err != nil {
-+		return nil, err
-+	}
- 
--		// 3. Create offer with candidates
--		offer, err := conn.CreateCompleteOffer(medias)
--		if err != nil {
--			return nil, err
--		}
 +	conn := webrtc.NewConn(pc)
 +	conn.FormatName = "nest/webrtc"
 +	conn.Mode = core.ModeActiveProducer
@@ -932,6 +1233,17 @@ index 6a57091..416b6cf 100644
 +		{Kind: "app"}, // important for Nest
 +	}
  
+-		// 3. Create offer with candidates
+-		offer, err := conn.CreateCompleteOffer(medias)
+-		if err != nil {
+-			return nil, err
+-		}
++	offer, err := conn.CreateCompleteOffer(medias)
++	if err != nil {
++		_ = pc.Close()
++		return nil, err
++	}
+ 
 -		// 4. Exchange SDP via Hass
 -		answer, err := nestAPI.ExchangeSDP(projectID, deviceID, offer)
 -		if err != nil {
@@ -941,16 +1253,6 @@ index 6a57091..416b6cf 100644
 -				retryDelay *= 2
 -				continue
 -			}
--			return nil, err
--		}
-+	offer, err := conn.CreateCompleteOffer(medias)
-+	if err != nil {
-+		_ = pc.Close()
-+		return nil, err
-+	}
- 
--		// 5. Set answer with remote medias
--		if err = conn.SetAnswer(answer); err != nil {
 -			return nil, err
 -		}
 +	// Inner retry loop removed: FAILED_PRECONDITION ("camera not available") is
@@ -968,9 +1270,21 @@ index 6a57091..416b6cf 100644
 +		return nil, err
 +	}
  
--		return &WebRTCClient{conn: conn, api: nestAPI}, nil
+-		// 5. Set answer with remote medias
+-		if err = conn.SetAnswer(answer); err != nil {
+-			return nil, err
+-		}
 +	if err = conn.SetAnswer(answer); err != nil {
 +		_ = pc.Close()
++		return nil, err
++	}
+ 
+-		return &WebRTCClient{conn: conn, api: nestAPI}, nil
++	// Don't publish the Conn until its video codec is final: OnTrack narrows
++	// media.Codecs and appends sprop-parameter-sets to FmtpLine, and consumers read
++	// both without a lock once Dial returns. This fails only if the connection closed.
++	if err = conn.WaitNestVideo(); err != nil {
++		_ = conn.Close()
 +		return nil, err
  	}
  
@@ -979,7 +1293,7 @@ index 6a57091..416b6cf 100644
  }
  
  func rtspConn(nestAPI *API, rawURL, projectID, deviceID string) (*RTSPClient, error) {
-@@ -166,6 +171,7 @@ func rtspConn(nestAPI *API, rawURL, projectID, deviceID string) (*RTSPClient, er
+@@ -166,6 +182,7 @@ func rtspConn(nestAPI *API, rawURL, projectID, deviceID string) (*RTSPClient, er
  		return nil, err
  	}
  	if err := rtspClient.Describe(); err != nil {
@@ -987,7 +1301,7 @@ index 6a57091..416b6cf 100644
  		return nil, err
  	}
  
-@@ -187,8 +193,10 @@ func (c *RTSPClient) Start() error {
+@@ -187,8 +204,10 @@ func (c *RTSPClient) Start() error {
  }
  
  func (c *RTSPClient) Stop() error {
@@ -1000,18 +1314,20 @@ index 6a57091..416b6cf 100644
  }
  
 diff --git a/pkg/webrtc/conn.go b/pkg/webrtc/conn.go
-index 924fd55..66ee523 100644
+index 924fd55..4b9d444 100644
 --- a/pkg/webrtc/conn.go
 +++ b/pkg/webrtc/conn.go
-@@ -1,17 +1,26 @@
+@@ -1,17 +1,29 @@
  package webrtc
  
  import (
 +	"encoding/base64"
 +	"encoding/binary"
  	"encoding/json"
++	"errors"
  	"fmt"
  	"strings"
++	"sync"
 +	"sync/atomic"
  	"time"
  
@@ -1019,6 +1335,7 @@ index 924fd55..66ee523 100644
 +	"github.com/AlexxIT/go2rtc/pkg/h264"
  	"github.com/pion/rtcp"
  	"github.com/pion/rtp"
++	"github.com/pion/rtp/codecs"
  	"github.com/pion/webrtc/v4"
 +	zlog "github.com/rs/zerolog/log"
  )
@@ -1030,8 +1347,58 @@ index 924fd55..66ee523 100644
  type Conn struct {
  	core.Connection
  	core.Listener
-@@ -34,6 +43,13 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -22,8 +34,43 @@ type Conn struct {
+ 
+ 	offer  string
+ 	closed core.Waiter
++
++	// tracksMu guards Receivers. OnTrack runs one goroutine per remote track, and each
++	// calls GetTrack, while the streams layer calls GetTrack and Stop from its own.
++	tracksMu sync.Mutex
++
++	// recv counts bytes from every track's read loop; MarshalJSON reports it as Recv.
++	recv atomic.Int64
++
++	// Nest dial gate, see WaitNestVideo.
++	nestMu        sync.Mutex
++	nestPublished bool          // set by WaitNestVideo; after it OnTrack writes no FmtpLine or media.Codecs
++	nestVideo     chan struct{} // closed once the video track's receiver exists (and pre-publication, media.Codecs is narrowed)
++	nestSpropDone chan struct{} // closed once sprop-parameter-sets is written, or can't be
++	nestDead      chan struct{} // closed by Close
++	nestVideoOnce sync.Once
++	nestSpropOnce sync.Once
++	nestDeadOnce  sync.Once
+ }
+ 
++// Bounds for WaitNestVideo. NestVideoTimeout is how long a dial waits for the first video
++// packet; NestSpropTimeout is how long it then waits for SPS/PPS. Past either, the Conn
++// is returned without what's missing, never failed: no video by then is left to the
++// connect watchdog (30s from Connected) and the producer's reconnect loop, as before
++// the gate existed. Both waits run under the streams producer's lock, and the stream's
++// lock waits on that one in stopProducers, mainly while a reconnect dials, so they're
++// kept short. They also move time from after a consumer attaches to before: an RTSP
++// client that triggers a cold dial, or sends DESCRIBE during a reconnect, gets its reply
++// up to NestVideoTimeout+NestSpropTimeout later than before. The session's opening
++// keyframe has then already passed, so its first decodable frame can also come up to
++// one PLI interval (2s) later, against the probe time sprop saves the client. Normally
++// the wait is ICE plus the first packet. NestSpropTimeout leaves room for the PLI
++// ticker's first request, sent 2s into the track, and the keyframe it asks for.
++var (
++	NestVideoTimeout = 10 * time.Second
++	NestSpropTimeout = 4 * time.Second
++)
++
+ func NewConn(pc *webrtc.PeerConnection) *Conn {
+ 	c := &Conn{
+ 		Connection: core.Connection{
+@@ -32,8 +79,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+ 			Transport:  pc,
+ 		},
  		pc: pc,
++
++		nestVideo:     make(chan struct{}),
++		nestSpropDone: make(chan struct{}),
++		nestDead:      make(chan struct{}),
  	}
  
 +	// Patched (Nest): set true once the Nest video track delivers its first RTP packet.
@@ -1044,44 +1411,36 @@ index 924fd55..66ee523 100644
  	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
  		// last candidate will be empty
  		if candidate != nil {
-@@ -74,6 +90,36 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -74,23 +132,86 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			return
  		}
  
-+		// Adopt the transmitted codec into a receiver a consumer is already on, so the
-+		// GetTrack below (Conn.GetTrack, pkg/webrtc/producer.go:8 -- it shadows
-+		// core.Connection.GetTrack) finds it by pointer identity instead of minting a second
-+		// receiver.
-+		//
-+		// getMediaCodec resolves `codec` from the payload type actually being transmitted, but
-+		// media.Codecs is narrowed to that entry only BELOW. A consumer that wired up earlier
-+		// matched the FIRST codec in the answer, which for Nest need not be the transmitted
-+		// one -- so OnTrack ends up feeding a receiver with no consumers while the consumer
-+		// sits on one that never receives. Observed live: receiver A childs=true bytes=0
-+		// profile=<nil> beside receiver B childs=false bytes=3546841 profile=Main. Audio is
-+		// unaffected (single Opus payload type), which is why it is so quiet: ffmpeg keeps
-+		// reading audio so its socket timeout never fires, and frag_keyframe cannot cut a
-+		// fragment without video keyframes.
-+		//
-+		// Deliberately not the reverse (moving senders onto the new receiver): that receiver is
-+		// absent from Producer.receivers, so stopProducers would see no attached senders and
-+		// stop a producer that still has live consumers.
-+		//
-+		// Gated to Nest to bound the blast radius here; the pointer-vs-value mismatch is
-+		// generic to any producer whose answer keeps several codecs on one media.
+-		track, err := c.GetTrack(media, codec)
++		var track *core.Receiver
++		var err error
 +		if c.FormatName == "nest/webrtc" {
-+			for _, recv := range c.Receivers {
-+				if recv.Media == media && recv.Codec != codec && recv.Codec.Match(codec) {
-+					recv.Codec = codec
-+					break
-+				}
-+			}
++			track, err = c.nestGetTrack(media, codec)
++		} else {
++			track, err = c.GetTrack(media, codec)
 +		}
-+
- 		track, err := c.GetTrack(media, codec)
  		if err != nil {
  			return
-@@ -87,10 +133,60 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+ 		}
+ 
+-		switch c.Mode {
+-		case core.ModePassiveProducer, core.ModeActiveProducer:
+-			// replace the theoretical list of codecs with the actual list of codecs
+-			if len(media.Codecs) > 1 {
+-				media.Codecs = []*core.Codec{codec}
++		// nestGetTrack does this itself (for the same modes), under the lock that orders it
++		// against publication.
++		if c.FormatName != "nest/webrtc" {
++			switch c.Mode {
++			case core.ModePassiveProducer, core.ModeActiveProducer:
++				// replace the theoretical list of codecs with the actual list of codecs
++				if len(media.Codecs) > 1 {
++					media.Codecs = []*core.Codec{codec}
++				}
  			}
  		}
  
@@ -1102,6 +1461,9 @@ index 924fd55..66ee523 100644
 +		// Declared out here so the read-loop exit paths below can name the session in their logs.
 +		var connID int64
 +		var badRTP int
++		var nestReorder nestRTPReorder
++		var nestWaitPartitionHead bool
++		var nestPartitionHead codecs.H264Packet
 +		if isNestVideoTrack {
 +			nestVideoSeen.Store(true) // disarms the connect watchdog in OnConnectionStateChange
 +		}
@@ -1145,7 +1507,7 @@ index 924fd55..66ee523 100644
  					if err := pc.WriteRTCP(pkts); err != nil {
  						return
  					}
-@@ -98,10 +194,143 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -98,20 +219,275 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			}()
  		}
  
@@ -1156,16 +1518,30 @@ index 924fd55..66ee523 100644
 +		// no sprop; SPS/PPS arrive in-band (usually bundled in a STAP-A). Upstream does the
 +		// equivalent for H265 (pkg/dvrip). Gated on FormatName like the PLI patch above.
 +		//
-+		// Note (accepted race): FmtpLine is appended from this receive goroutine without a
-+		// lock. In practice SPS/PPS are captured within the first few frames (the 2s PLI above
-+		// forces an early keyframe), before any RTSP consumer's DESCRIBE clones the codec, so
-+		// the write happens-before the read. A -race build could flag a consumer connecting
-+		// during the sub-2s warm-up window; upstream's H265 append in pkg/dvrip is unguarded
-+		// the same way. Codec.Match ignores FmtpLine, so this can't affect media matching.
-+		// Left lock-free to mirror upstream; documented rather than hidden.
-+		captureSprop := c.FormatName == "nest/webrtc" && codec.Name == core.CodecH264 &&
-+			!strings.Contains(codec.FmtpLine, "sprop-parameter-sets=")
++		// The codec is shared: consumers clone it (pkg/rtsp, pkg/mp4), hand it to
++		// h264.RTPDepay, or marshal it on every /api/streams request, none of them under a
++		// lock. So FmtpLine is written only BEFORE the Conn is published: pkg/nest's dial
++		// calls WaitNestVideo, which holds the Conn back until this write is done (or gives
++		// up on it) and then sets nestPublished, after which nothing here writes the codec.
++		// An earlier version appended at any time and called it an accepted race; every
++		// reconnect reopened the window, and the two separate += could expose a half line.
++		// Read under nestMu too: a second video track pre-publication would write it.
++		var captureSprop bool
++		if c.FormatName == "nest/webrtc" && codec.Name == core.CodecH264 {
++			c.nestMu.Lock()
++			captureSprop = !c.nestPublished && !strings.Contains(codec.FmtpLine, "sprop-parameter-sets=")
++			c.nestMu.Unlock()
++		}
 +		var spropSPS, spropPPS []byte
++
++		// nestGetTrack has created the receiver and, before publication, narrowed
++		// media.Codecs to its codec. Tell WaitNestVideo.
++		if isNestVideoTrack {
++			c.nestVideoOnce.Do(func() { close(c.nestVideo) })
++			if !captureSprop {
++				c.nestSpropOnce.Do(func() { close(c.nestSpropDone) })
++			}
++		}
 +
 +		// Patched: stall watchdog for the Nest video track. An expired/quiet Nest WebRTC session
 +		// stops delivering media WITHOUT erroring the connection, so producer.go never reconnects
@@ -1289,7 +1665,8 @@ index 924fd55..66ee523 100644
  				return
  			}
  
-@@ -109,13 +338,79 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+-			c.Recv += n
++			c.recv.Add(int64(n))
  
  			packet := &rtp.Packet{}
  			if err := packet.Unmarshal(b[:n]); err != nil {
@@ -1316,21 +1693,14 @@ index 924fd55..66ee523 100644
  				return
  			}
  
- 			if len(packet.Payload) == 0 {
-+				// WebRTC padding / bandwidth-probe packet: not real media. Must NOT refresh
-+				// lastVideoNS, or a camera that keeps probing through a drought would keep the
-+				// "no video RTP" watchdog from ever firing.
- 				continue
- 			}
- 
-+			if isNestVideo {
++			if len(packet.Payload) != 0 && isNestVideo {
 +				lastVideoNS.Store(int64(time.Since(nestEpoch)))
 +				if isRTPKeyframe(packet.Payload) {
 +					lastIDRNS.Store(int64(time.Since(nestEpoch)))
 +				}
 +			}
 +
-+			if captureSprop {
++			if len(packet.Payload) != 0 && captureSprop {
 +				save := func(nal []byte) {
 +					if len(nal) == 0 {
 +						return
@@ -1356,20 +1726,65 @@ index 924fd55..66ee523 100644
 +					save(pl)
 +				}
 +				if spropSPS != nil && spropPPS != nil {
-+					if codec.FmtpLine != "" {
-+						codec.FmtpLine += ";"
-+					}
-+					codec.FmtpLine += "sprop-parameter-sets=" +
++					sprop := "sprop-parameter-sets=" +
 +						base64.StdEncoding.EncodeToString(spropSPS) + "," +
 +						base64.StdEncoding.EncodeToString(spropPPS)
++					c.nestMu.Lock()
++					if !c.nestPublished {
++						if codec.FmtpLine != "" {
++							sprop = codec.FmtpLine + ";" + sprop
++						}
++						codec.FmtpLine = sprop // one write, never a half line
++					}
++					c.nestMu.Unlock()
++					c.nestSpropOnce.Do(func() { close(c.nestSpropDone) })
 +					captureSprop = false
 +				}
 +			}
 +
- 			track.WriteRTP(packet)
- 		}
- 	})
-@@ -137,6 +432,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
++			if isNestVideo {
++				result := nestReorder.push(packet, time.Now())
++
++				if result.reanchored {
++					zlog.Warn().
++						Int64("conn", connID).
++						Uint16("old_head", result.oldHead).
++						Uint16("new_seq", result.newSeq).
++						Msg("nest: RTP sequence re-anchored")
++				}
++
++				if result.gapExpired {
++					zlog.Warn().
++						Int64("conn", connID).
++						Int("missing", int(result.missing)).
++						Msg("nest: RTP reorder gap abandoned, waiting for partition head")
++				}
++
++				write := nestRTPPacketsToWrite(
++					result,
++					nestWaitPartitionHead,
++					&nestPartitionHead,
++				)
++				nestWaitPartitionHead = write.waitPartitionHead
++
++				if write.recovered {
++					zlog.Debug().
++						Int64("conn", connID).
++						Uint16("seq", write.recoveredSeq).
++						Msg("nest: RTP recovered at partition head")
++				}
++
++				for _, ordered := range write.packets {
++					track.WriteRTP(ordered)
++				}
++				continue
++			}
++
++			// Preserve the existing behaviour for every non-Nest-H264 track.
+ 			if len(packet.Payload) == 0 {
+ 				continue
+ 			}
+@@ -137,6 +513,19 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  			for _, sender := range c.Senders {
  				sender.Start()
  			}
@@ -1389,10 +1804,83 @@ index 924fd55..66ee523 100644
  		case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
  			// disconnect event comes earlier, than failed
  			// but it comes only for success connections
-@@ -147,6 +455,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
+@@ -147,15 +536,170 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
  	return c
  }
  
++// nestGetTrack is OnTrack's GetTrack for a Nest Conn. Until WaitNestVideo publishes
++// the Conn, it may write shared state: it narrows media.Codecs to the transmitted
++// codec (and runs the #2389 adoption loop). nestMu orders those writes before
++// publication. A track that first arrives after publication writes neither, because
++// consumers and /api/streams read both without a lock. It registers under the first
++// listed codec of the same format (name, clock rate, channels) instead. That differs
++// from the transmitted codec only when the m-line lists the format more than once,
++// as Nest's video does with several H264 payload types: a video track that misses
++// NestVideoTimeout lands here. MatchMedia hands that same first entry to a consumer
++// whose own codec list contains the format, unless an earlier producer codec matches
++// the consumer first; such a consumer stays on a receiver this track never feeds,
++// exactly as it did before the gate existed.
++func (c *Conn) nestGetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
++	c.nestMu.Lock()
++	defer c.nestMu.Unlock()
++
++	if c.nestPublished {
++		if listed := media.MatchCodec(codec); listed != nil {
++			codec = listed
++		}
++		return c.GetTrack(media, codec)
++	}
++
++	// Adopt the transmitted codec into a receiver a consumer is already on, so the
++	// GetTrack below (Conn.GetTrack, pkg/webrtc/producer.go:8 -- it shadows
++	// core.Connection.GetTrack) finds it by pointer identity instead of minting a second
++	// receiver.
++	//
++	// getMediaCodec resolves `codec` from the payload type actually being transmitted, but
++	// media.Codecs is narrowed to that entry only BELOW. A consumer that wired up earlier
++	// matched the FIRST codec in the answer, which for Nest need not be the transmitted
++	// one -- so OnTrack ends up feeding a receiver with no consumers while the consumer
++	// sits on one that never receives. Observed live: receiver A childs=true bytes=0
++	// profile=<nil> beside receiver B childs=false bytes=3546841 profile=Main. Audio is
++	// unaffected (single Opus payload type), which is why it is so quiet: ffmpeg keeps
++	// reading audio so its socket timeout never fires, and frag_keyframe cannot cut a
++	// fragment without video keyframes.
++	//
++	// Deliberately not the reverse (moving senders onto the new receiver): that receiver is
++	// absent from Producer.receivers, so stopProducers would see no attached senders and
++	// stop a producer that still has live consumers.
++	//
++	// Gated to Nest to bound the blast radius here; the pointer-vs-value mismatch is
++	// generic to any producer whose answer keeps several codecs on one media.
++	//
++	// For Nest this loop can no longer match: before publication no consumer can reach the
++	// Conn (Dial hasn't returned, and on reconnect p.conn is still the old one), so every
++	// receiver here belongs to another track's media. It is kept as a guard for #2389 in
++	// case that ever changes.
++	c.tracksMu.Lock()
++	for _, recv := range c.Receivers {
++		if recv.Media == media && recv.Codec != codec && recv.Codec.Match(codec) {
++			recv.Codec = codec
++			break
++		}
++	}
++	c.tracksMu.Unlock()
++
++	track, err := c.GetTrack(media, codec)
++	if err != nil {
++		return nil, err
++	}
++
++	switch c.Mode {
++	case core.ModePassiveProducer, core.ModeActiveProducer:
++		// replace the theoretical list of codecs with the actual list of codecs
++		if len(media.Codecs) > 1 {
++			media.Codecs = []*core.Codec{codec}
++		}
++	}
++	return track, nil
++}
++
 +// isRTPKeyframe reports whether an RTP H264 payload begins or contains an IDR NAL.
 +// Handles single NAL (type 5), STAP-A (24, bundled), and FU-A (28) start fragments.
 +// h264.IsKeyframe expects AVCC (length-prefixed), not RTP payloads, so detect here.
@@ -1422,8 +1910,72 @@ index 924fd55..66ee523 100644
 +}
 +
  func (c *Conn) MarshalJSON() ([]byte, error) {
- 	return json.Marshal(c.Connection)
+-	return json.Marshal(c.Connection)
++	c.tracksMu.Lock()
++	conn := c.Connection
++	c.tracksMu.Unlock()
++	conn.Recv = c.bytesRecv()
++	return json.Marshal(conn)
++}
++
++func (c *Conn) bytesRecv() int {
++	return int(c.recv.Load())
  }
+ 
+ func (c *Conn) Close() error {
++	c.nestDeadOnce.Do(func() { close(c.nestDead) })
+ 	c.closed.Done(nil)
+ 	return c.pc.Close()
+ }
+ 
++// WaitNestVideo holds a Nest dial until OnTrack has finished writing the video track's
++// shared state, so the Conn can be handed to the streams layer with no writer left on
++// it. For that track OnTrack narrows media.Codecs to the codec actually transmitted
++// (an answer can list several) and appends sprop-parameter-sets to its FmtpLine, and
++// consumers and /api/streams read both without a lock once Dial returns.
++//
++// It waits up to NestVideoTimeout for the video track and then up to NestSpropTimeout
++// for SPS/PPS, and returns without whichever didn't arrive. It fails only if the
++// connection closes first; the caller should then close the Conn. Either way it marks
++// the Conn published, and from then on OnTrack writes neither FmtpLine nor
++// media.Codecs (see nestGetTrack), so a track that arrives late needs no wait. The cost
++// lasts for the session: one whose video or SPS/PPS missed the window never gets
++// sprop-parameter-sets, and a late track's media stays un-narrowed, until a re-dial.
++func (c *Conn) WaitNestVideo() error {
++	defer func() {
++		c.nestMu.Lock()
++		c.nestPublished = true
++		c.nestMu.Unlock()
++	}()
++
++	timer := time.NewTimer(NestVideoTimeout)
++	defer timer.Stop()
++
++	select {
++	case <-c.nestVideo:
++	case <-c.nestDead:
++		return errors.New("webrtc: connection closed before video arrived")
++	case <-timer.C:
++		select {
++		case <-c.nestVideo: // arrived as the timer fired
++		default:
++			return nil
++		}
++	}
++
++	timer.Reset(NestSpropTimeout)
++	select {
++	case <-c.nestSpropDone:
++	case <-c.nestDead:
++		return errors.New("webrtc: connection closed while waiting for SPS/PPS")
++	case <-timer.C:
++	}
++	return nil
++}
++
+ func (c *Conn) AddCandidate(candidate string) error {
+ 	// pion uses only candidate value from json/object candidate struct
+ 	return c.pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: candidate})
 diff --git a/pkg/core/waiter.go b/pkg/core/waiter.go
 index c61e3be..68d7e31 100644
 --- a/pkg/core/waiter.go
@@ -1576,4 +2128,2229 @@ index 0000000..c3efddf
 +		return !found
 +	})
 +	return found
++}
+diff --git a/pkg/core/waiter_test.go b/pkg/core/waiter_test.go
+new file mode 100644
+index 0000000..0cd0e98
+--- /dev/null
++++ b/pkg/core/waiter_test.go
+@@ -0,0 +1,59 @@
++package core
++
++import (
++	"errors"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// Done must publish its error before the WaitGroup.Done that releases Wait, which
++// reads w.err without the lock. In the old order (release, then store) a waiter could
++// return the previous value, nil, for a connection that ended with an error.
++//
++// Run it with -race. The race report is what fails the old order, every time; the
++// assertion only occasionally sees nil, with or without -race, because the window is
++// a few instructions wide. Only an iteration in which Wait is already blocked when
++// Done runs exercises the bug: if Done comes first, the mutex orders the write before
++// the read and there is nothing to detect. The sleep makes the blocked case the usual
++// one; it can't make the fixed code fail, since both orders return errEnded there.
++func TestWaiterDoneErrorReachesWaiter(t *testing.T) {
++	errEnded := errors.New("ended")
++
++	for i := 0; i < 100; i++ {
++		var w Waiter
++		w.Add(1) // as a running task would, so Wait below blocks instead of auto-starting
++
++		got := make(chan error, 1)
++		go func() { got <- w.Wait() }()
++		time.Sleep(5 * time.Millisecond) // let Wait block, so Done is what releases it
++
++		w.Done(errEnded)
++
++		select {
++		case err := <-got:
++			require.ErrorIs(t, err, errEnded, "iteration %d: Wait returned before Done's error was stored", i)
++		case <-time.After(time.Second):
++			t.Fatal("Wait did not return after the last Done")
++		}
++	}
++}
++
++// A Done before anyone waits must still hand its error to a later Wait. This path
++// (the else branch in Done) was not changed by the fix; the test pins it so a future
++// reordering can't break it.
++func TestWaiterDoneBeforeWait(t *testing.T) {
++	errEnded := errors.New("ended")
++	var w Waiter
++	w.Done(errEnded)
++
++	got := make(chan error, 1)
++	go func() { got <- w.Wait() }()
++	select {
++	case err := <-got:
++		require.ErrorIs(t, err, errEnded)
++	case <-time.After(time.Second):
++		t.Fatal("Wait blocked after a Done that came first")
++	}
++}
+diff --git a/pkg/h264/rtp_test.go b/pkg/h264/rtp_test.go
+new file mode 100644
+index 0000000..ac49869
+--- /dev/null
++++ b/pkg/h264/rtp_test.go
+@@ -0,0 +1,168 @@
++package h264
++
++import (
++	"testing"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/pion/rtp"
++	"github.com/stretchr/testify/require"
++)
++
++func testDepay() (core.HandlerFunc, *[][]byte) {
++	got := &[][]byte{}
++
++	handler := RTPDepay(
++		&core.Codec{Name: core.CodecH264},
++		func(packet *rtp.Packet) {
++			payload := append([]byte(nil), packet.Payload...)
++			*got = append(*got, payload)
++		},
++	)
++
++	return handler, got
++}
++
++func TestRTPDepayRestartsOnNewFUAStart(t *testing.T) {
++	handler, got := testDepay()
++
++	// A complete NAL has already been accumulated in this access unit, but the
++	// RTP marker is false, so it has not yet been emitted downstream.
++	handler(&rtp.Packet{
++		Header: rtp.Header{
++			SequenceNumber: 100,
++			Marker:         false,
++		},
++		Payload: []byte{0x41, 0x11, 0x22},
++	})
++
++	require.Empty(t, *got)
++
++	// Start a fragmented IDR in the same access unit, but never finish it.
++	handler(&rtp.Packet{
++		Header: rtp.Header{SequenceNumber: 101},
++		Payload: []byte{
++			0x7c,        // FU-A, NRI=3
++			0x80 | 0x05, // start, IDR
++			0xaa,
++		},
++	})
++
++	// A new FU-A start means the previous access unit was abandoned. This must
++	// discard both the unfinished FU-A and the complete NAL already in buf.
++	handler(&rtp.Packet{
++		Header: rtp.Header{SequenceNumber: 102},
++		Payload: []byte{
++			0x7c,
++			0x80 | 0x05,
++			0xbb,
++		},
++	})
++
++	// Finish the replacement IDR.
++	handler(&rtp.Packet{
++		Header: rtp.Header{
++			SequenceNumber: 103,
++			Marker:         true,
++		},
++		Payload: []byte{
++			0x7c,
++			0x40 | 0x05, // end, IDR
++			0xcc,
++		},
++	})
++
++	require.Len(t, *got, 1)
++
++	// AVCC: length=3, NAL header=0x65, then only the replacement FU payload.
++	// The earlier standalone NAL (0x41 0x11 0x22) must not survive.
++	require.Equal(t,
++		[]byte{0x00, 0x00, 0x00, 0x03, 0x65, 0xbb, 0xcc},
++		(*got)[0],
++	)
++}
++
++func TestRTPDepayDropsOrphanFUAFragmentsAfterSync(t *testing.T) {
++	handler, got := testDepay()
++
++	// Establish normal synchronized operation with a complete P-frame.
++	handler(&rtp.Packet{
++		Header: rtp.Header{
++			SequenceNumber: 100,
++			Marker:         true,
++		},
++		Payload: []byte{0x41, 0x11, 0x22},
++	})
++
++	require.Len(t, *got, 1)
++
++	// Middle fragment with no FU-A start.
++	handler(&rtp.Packet{
++		Header:  rtp.Header{SequenceNumber: 101},
++		Payload: []byte{0x7c, 0x05, 0xaa},
++	})
++
++	// End fragment still has no valid start.
++	handler(&rtp.Packet{
++		Header: rtp.Header{
++			SequenceNumber: 102,
++			Marker:         true,
++		},
++		Payload: []byte{0x7c, 0x40 | 0x05, 0xbb},
++	})
++
++	// No corrupt synthetic IDR should have been emitted.
++	require.Len(t, *got, 1)
++}
++
++func TestRTPDepayAbandonsFragmentOnStandaloneNAL(t *testing.T) {
++	handler, got := testDepay()
++
++	// Begin a fragmented IDR.
++	handler(&rtp.Packet{
++		Header:  rtp.Header{SequenceNumber: 100},
++		Payload: []byte{0x7c, 0x80 | 0x05, 0xaa},
++	})
++
++	// Instead of an FU-A continuation, a standalone P-frame arrives.
++	// The stale fragmented state must be discarded.
++	handler(&rtp.Packet{
++		Header: rtp.Header{
++			SequenceNumber: 101,
++			Marker:         true,
++		},
++		Payload: []byte{0x41, 0x33, 0x44},
++	})
++
++	require.Len(t, *got, 1)
++	require.Equal(t,
++		[]byte{0x00, 0x00, 0x00, 0x03, 0x41, 0x33, 0x44},
++		(*got)[0],
++	)
++}
++
++func TestRTPDepayDropsOrphanEndAfterStandaloneNAL(t *testing.T) {
++	handler, got := testDepay()
++
++	handler(&rtp.Packet{
++		Header:  rtp.Header{SequenceNumber: 100},
++		Payload: []byte{0x7c, 0x80 | 0x05, 0xaa},
++	})
++
++	handler(&rtp.Packet{
++		Header: rtp.Header{
++			SequenceNumber: 101,
++			Marker:         true,
++		},
++		Payload: []byte{0x41, 0x33, 0x44},
++	})
++
++	handler(&rtp.Packet{
++		Header: rtp.Header{
++			SequenceNumber: 102,
++			Marker:         true,
++		},
++		Payload: []byte{0x7c, 0x40 | 0x05, 0xbb},
++	})
++
++	require.Len(t, *got, 1)
++}
+diff --git a/pkg/nest/api_test.go b/pkg/nest/api_test.go
+new file mode 100644
+index 0000000..7d54aaa
+--- /dev/null
++++ b/pkg/nest/api_test.go
+@@ -0,0 +1,493 @@
++package nest
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// fakeGoogle stands in for the OAuth token endpoint and the SDM API.
++// Each token request hands out the next token: tok1, tok2, ...
++// SDM requests made with a token in revoked get a 401, even though that
++// token's clock expiry is still an hour away.
++type fakeGoogle struct {
++	tokenRequests atomic.Int32
++	tokenFail     atomic.Bool  // the token endpoint answers 500
++	expiresIn     atomic.Int32 // seconds, 0 means 3600
++
++	mu       sync.Mutex
++	revoked  map[string]bool
++	status   []int    // SDM statuses to return before the normal answer, one per request
++	bearers  []string // the token on every SDM request, in order
++	onSDM401 func()   // called before an SDM 401 is written
++}
++
++func newFakeGoogle(t *testing.T) *fakeGoogle {
++	g := &fakeGoogle{revoked: map[string]bool{}}
++
++	mux := http.NewServeMux()
++	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
++		// assert, not require: this runs on a server goroutine, where FailNow must not be called
++		n := g.tokenRequests.Add(1)
++		assert.NoError(t, r.ParseForm())
++		assert.Equal(t, "refresh_token", r.PostForm.Get("grant_type"))
++		assert.Equal(t, "refresh", r.PostForm.Get("refresh_token"))
++		if g.tokenFail.Load() {
++			w.WriteHeader(http.StatusInternalServerError)
++			return
++		}
++		expiresIn := g.expiresIn.Load()
++		if expiresIn == 0 {
++			expiresIn = 3600
++		}
++		_ = json.NewEncoder(w).Encode(map[string]any{
++			"access_token": fmt.Sprintf("tok%d", n),
++			"expires_in":   expiresIn,
++			"token_type":   "Bearer",
++		})
++	})
++	mux.HandleFunc("/sdm/", func(w http.ResponseWriter, r *http.Request) {
++		bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
++
++		g.mu.Lock()
++		g.bearers = append(g.bearers, bearer)
++		revoked := g.revoked[bearer]
++		status := 0
++		if len(g.status) > 0 && !revoked { // a 401 does not use up a queued status
++			status, g.status = g.status[0], g.status[1:]
++		}
++		on401 := g.onSDM401
++		g.mu.Unlock()
++
++		if revoked {
++			if on401 != nil {
++				on401()
++			}
++			// Google's 401 has a JSON error body
++			w.Header().Set("Content-Type", "application/json")
++			w.WriteHeader(http.StatusUnauthorized)
++			_, _ = w.Write([]byte(`{"error":{"code":401,"message":"Request had invalid authentication credentials.","status":"UNAUTHENTICATED"}}`))
++			return
++		}
++		if status != 0 {
++			w.WriteHeader(status)
++			return
++		}
++
++		_ = json.NewEncoder(w).Encode(map[string]any{
++			"results": map[string]any{
++				"answerSdp":      "answer",
++				"expiresAt":      time.Now().Add(5 * time.Minute),
++				"mediaSessionId": "session",
++			},
++		})
++	})
++
++	srv := httptest.NewServer(mux)
++	t.Cleanup(srv.Close)
++
++	oldToken, oldSDM, oldDelay := tokenURL, sdmURL, busyRetryDelay
++	tokenURL = srv.URL + "/token"
++	sdmURL = srv.URL + "/sdm/"
++	busyRetryDelay = 10 * time.Millisecond
++	t.Cleanup(func() { tokenURL, sdmURL, busyRetryDelay = oldToken, oldSDM, oldDelay })
++
++	cacheMu.Lock()
++	cache = map[string]*API{}
++	cacheMu.Unlock()
++
++	return g
++}
++
++func (g *fakeGoogle) revoke(token string) {
++	g.mu.Lock()
++	g.revoked[token] = true
++	g.mu.Unlock()
++}
++
++func (g *fakeGoogle) setStatus(status ...int) {
++	g.mu.Lock()
++	g.status = status
++	g.mu.Unlock()
++}
++
++func (g *fakeGoogle) sdmBearers() []string {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	return append([]string(nil), g.bearers...)
++}
++
++func cachedToken(t *testing.T) string {
++	cacheMu.Lock()
++	defer cacheMu.Unlock()
++	api := cache["client:secret:refresh"]
++	require.NotNil(t, api, "no cache entry")
++	return api.Token
++}
++
++func newTestAPI(t *testing.T) *API {
++	api, err := NewAPI("client", "secret", "refresh")
++	require.NoError(t, err)
++	return api
++}
++
++// Google revokes a token before its clock expiry. A 401 must get a new token
++// right away, not the cached one back, and the retry must succeed without the
++// 409/429 backoff.
++func TestExchangeSDP401GetsNewToken(t *testing.T) {
++	g := newFakeGoogle(t)
++	api := newTestAPI(t)
++	require.Equal(t, "tok1", api.Token)
++	g.revoke("tok1")
++
++	answer, err := api.ExchangeSDP("project", "device", "offer")
++	require.NoError(t, err)
++	require.Equal(t, "answer", answer)
++	require.Equal(t, "tok2", api.Token)
++	require.Equal(t, int32(2), g.tokenRequests.Load())
++	require.Equal(t, []string{"tok1", "tok2"}, g.sdmBearers())
++}
++
++// The new token replaces the shared cache entry, so the next camera to dial
++// starts with it instead of the revoked one, with no token request of its own.
++func TestReplacedTokenIsShared(t *testing.T) {
++	g := newFakeGoogle(t)
++	api := newTestAPI(t)
++	g.revoke("tok1")
++
++	_, err := api.ExchangeSDP("project", "device", "offer")
++	require.NoError(t, err)
++	require.Equal(t, "tok2", cachedToken(t))
++
++	other := newTestAPI(t)
++	require.Equal(t, "tok2", other.Token)
++	require.Equal(t, int32(2), g.tokenRequests.Load())
++}
++
++// Cameras that hit a 401 at the same moment make one token request between them.
++func TestConcurrent401sMakeOneTokenRequest(t *testing.T) {
++	g := newFakeGoogle(t)
++	const cameras = 4
++	apis := make([]*API, cameras)
++	for i := range apis {
++		apis[i] = newTestAPI(t)
++	}
++	require.Equal(t, int32(1), g.tokenRequests.Load())
++	g.revoke("tok1")
++
++	// Hold every 401 until all cameras have sent their request, so all of
++	// them hold the revoked token when they ask for a new one.
++	var arrived sync.WaitGroup
++	arrived.Add(cameras)
++	g.mu.Lock()
++	g.onSDM401 = func() {
++		arrived.Done()
++		arrived.Wait()
++	}
++	g.mu.Unlock()
++
++	var wg sync.WaitGroup
++	errs := make([]error, cameras)
++	for i, api := range apis {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			_, errs[i] = api.ExchangeSDP("project", fmt.Sprintf("device%d", i), "offer")
++		}()
++	}
++	wg.Wait()
++
++	for i, api := range apis {
++		require.NoError(t, errs[i])
++		require.Equal(t, "tok2", api.Token)
++	}
++	require.Equal(t, int32(2), g.tokenRequests.Load())
++}
++
++// A camera whose token is older than the cache's (another camera already
++// replaced it) takes the cached one instead of asking Google again.
++func TestStale401AdoptsCachedToken(t *testing.T) {
++	g := newFakeGoogle(t)
++	first := newTestAPI(t)
++	second := newTestAPI(t)
++	g.revoke("tok1")
++
++	_, err := first.ExchangeSDP("project", "device1", "offer")
++	require.NoError(t, err)
++	require.Equal(t, int32(2), g.tokenRequests.Load())
++
++	_, err = second.ExchangeSDP("project", "device2", "offer")
++	require.NoError(t, err)
++	require.Equal(t, "tok2", second.Token)
++	require.Equal(t, int32(2), g.tokenRequests.Load())
++}
++
++// The retry after a 401 happens inside the request and does not use up one of
++// ExchangeSDP's three attempts: 401, then 409, 409, then success, still succeeds.
++func Test401RetryUsesNoAttempt(t *testing.T) {
++	g := newFakeGoogle(t)
++	api := newTestAPI(t)
++	g.revoke("tok1")
++	g.setStatus(http.StatusConflict, http.StatusConflict)
++
++	answer, err := api.ExchangeSDP("project", "device", "offer")
++	require.NoError(t, err)
++	require.Equal(t, "answer", answer)
++	require.Equal(t, []string{"tok1", "tok2", "tok2", "tok2"}, g.sdmBearers())
++}
++
++// The 401 response is read to the end and closed before the token request, so
++// the connection goes back to the pool and the token request can reuse it. Go
++// before 1.27 drops a connection whose body is closed unread; 1.27 drains it,
++// but only after Close returns. So check the body itself, not the connections.
++func Test401BodyIsClosed(t *testing.T) {
++	g := newFakeGoogle(t)
++	api := newTestAPI(t)
++	g.revoke("tok1")
++
++	rt := &bodyRecorder{base: http.DefaultTransport}
++	http.DefaultTransport = rt
++	// Registered after newFakeGoogle's srv.Close, so it runs first (LIFO) and
++	// srv.Close finds the real transport to close its idle connections on.
++	t.Cleanup(func() { http.DefaultTransport = rt.base })
++
++	_, err := api.ExchangeSDP("project", "device", "offer")
++	require.NoError(t, err)
++	require.Equal(t, []string{"/sdm/ 401", "/token 200", "/sdm/ 200"}, rt.log)
++	// As the token request was sent:
++	require.True(t, rt.eof, "401 body not read to EOF")
++	require.True(t, rt.closed, "401 body not closed")
++}
++
++// bodyRecorder logs each request's path and status, and records whether the
++// last 401's body had been read to EOF and closed when the next request went out.
++type bodyRecorder struct {
++	base        http.RoundTripper
++	log         []string
++	last401     *recordedBody
++	eof, closed bool
++}
++
++func (r *bodyRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
++	if b := r.last401; b != nil {
++		r.eof, r.closed, r.last401 = b.eof, b.closed, nil
++	}
++	res, err := r.base.RoundTrip(req)
++	if err != nil {
++		return nil, err
++	}
++	path := req.URL.Path
++	if strings.HasPrefix(path, "/sdm/") {
++		path = "/sdm/"
++	}
++	r.log = append(r.log, fmt.Sprintf("%s %d", path, res.StatusCode))
++	if res.StatusCode == http.StatusUnauthorized {
++		r.last401 = &recordedBody{ReadCloser: res.Body}
++		res.Body = r.last401
++	}
++	return res, nil
++}
++
++type recordedBody struct {
++	io.ReadCloser
++	eof, closed bool
++}
++
++func (b *recordedBody) Read(p []byte) (int, error) {
++	n, err := b.ReadCloser.Read(p)
++	if err == io.EOF {
++		b.eof = true
++	}
++	return n, err
++}
++
++func (b *recordedBody) Close() error {
++	b.closed = true
++	return b.ReadCloser.Close()
++}
++
++// A 409 or 429 is not a token problem: back off and retry with the same
++// token, and make no token request.
++func TestBusyMakesNoTokenRequest(t *testing.T) {
++	for _, status := range []int{http.StatusConflict, http.StatusTooManyRequests} {
++		t.Run(http.StatusText(status), func(t *testing.T) {
++			g := newFakeGoogle(t)
++			api := newTestAPI(t)
++			g.setStatus(status, status)
++
++			answer, err := api.ExchangeSDP("project", "device", "offer")
++			require.NoError(t, err)
++			require.Equal(t, "answer", answer)
++			require.Equal(t, int32(1), g.tokenRequests.Load())
++			require.Equal(t, []string{"tok1", "tok1", "tok1"}, g.sdmBearers())
++		})
++	}
++}
++
++// The normal path uses the cached token: no extra token request.
++func TestCachedPathMakesNoTokenRequest(t *testing.T) {
++	g := newFakeGoogle(t)
++	api := newTestAPI(t)
++
++	_, err := api.ExchangeSDP("project", "device", "offer")
++	require.NoError(t, err)
++	require.NoError(t, api.ExtendStream())
++	_ = newTestAPI(t)
++	require.Equal(t, int32(1), g.tokenRequests.Load())
++	require.Equal(t, []string{"tok1", "tok1"}, g.sdmBearers())
++}
++
++// Other failures than 401 make no token request either.
++func TestOtherErrorsMakeNoTokenRequest(t *testing.T) {
++	g := newFakeGoogle(t)
++	api := newTestAPI(t)
++	g.setStatus(http.StatusBadRequest)
++
++	_, err := api.ExchangeSDP("project", "device", "offer")
++	require.ErrorContains(t, err, "400")
++	require.Equal(t, int32(1), g.tokenRequests.Load())
++}
++
++// A 401 on the token that was just fetched fails rather than loops.
++func TestSecond401Fails(t *testing.T) {
++	g := newFakeGoogle(t)
++	api := newTestAPI(t)
++	g.revoke("tok1")
++	g.revoke("tok2")
++
++	_, err := api.ExchangeSDP("project", "device", "offer")
++	require.ErrorContains(t, err, "401")
++	require.Equal(t, []string{"tok1", "tok2"}, g.sdmBearers())
++}
++
++// The extend loop's ExtendStream gets the same 401 handling, so a revoked
++// token does not stop extension and stall the stream.
++func TestExtendStream401GetsNewToken(t *testing.T) {
++	g := newFakeGoogle(t)
++	api := newTestAPI(t)
++	_, err := api.ExchangeSDP("project", "device", "offer")
++	require.NoError(t, err)
++	g.revoke("tok1")
++
++	require.NoError(t, api.ExtendStream())
++	require.Equal(t, "tok2", api.Token)
++	require.Equal(t, "tok2", cachedToken(t))
++	require.Equal(t, int32(2), g.tokenRequests.Load())
++}
++
++// If the token request after a 401 fails, the rejected token must not stay in
++// the cache: the next dial asks Google again instead of starting with it.
++func TestFailedReplaceDropsRejectedToken(t *testing.T) {
++	g := newFakeGoogle(t)
++	api := newTestAPI(t)
++	g.revoke("tok1")
++	g.tokenFail.Store(true)
++
++	_, err := api.ExchangeSDP("project", "device", "offer")
++	require.ErrorContains(t, err, "500")
++
++	g.tokenFail.Store(false)
++	other := newTestAPI(t)
++	require.Equal(t, "tok3", other.Token)
++}
++
++// A cached token about to expire is not handed out.
++func TestNearlyExpiredTokenIsNotCached(t *testing.T) {
++	g := newFakeGoogle(t)
++	g.expiresIn.Store(20)
++	require.Equal(t, "tok1", newTestAPI(t).Token)
++	g.expiresIn.Store(0)
++	require.Equal(t, "tok2", newTestAPI(t).Token)
++}
++
++func TestEmptyAccessTokenIsAnError(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		_, _ = w.Write([]byte(`{"expires_in":3600}`))
++	}))
++	t.Cleanup(srv.Close)
++	old := tokenURL
++	tokenURL = srv.URL
++	t.Cleanup(func() { tokenURL = old })
++	cacheMu.Lock()
++	cache = map[string]*API{}
++	cacheMu.Unlock()
++
++	_, err := NewAPI("client", "secret", "refresh")
++	require.Error(t, err)
++}
++
++// The 401 retry does not sleep the busy backoff. busyRetryDelay is set to an
++// hour so any sleep on the 401 path would hang the test instead of passing
++// under the 10ms value newFakeGoogle installs.
++func TestExchangeSDP401DoesNotBackOff(t *testing.T) {
++	g := newFakeGoogle(t)
++	busyRetryDelay = time.Hour
++	api := newTestAPI(t)
++	g.revoke("tok1")
++	start := time.Now()
++	_, err := api.ExchangeSDP("project", "device", "offer")
++	require.NoError(t, err)
++	require.Less(t, time.Since(start), 5*time.Second)
++	require.Equal(t, "tok2", api.Token)
++}
++
++// replaceToken updates ExpiresAt too (the extend loop keys its clock refresh
++// off it).
++func TestReplaceTokenUpdatesExpiry(t *testing.T) {
++	g := newFakeGoogle(t)
++	api := newTestAPI(t)
++	g.expiresIn.Store(7200)
++	g.revoke("tok1")
++	_, err := api.ExchangeSDP("project", "device", "offer")
++	require.NoError(t, err)
++	cacheMu.Lock()
++	exp := cache[api.key].ExpiresAt
++	cacheMu.Unlock()
++	require.Equal(t, exp, api.ExpiresAt)
++	require.Greater(t, api.ExpiresAt, time.Now().Add(90*time.Minute))
++}
++
++// A cached token that differs from the rejected one but is itself about to
++// expire is not adopted; a new one is requested.
++func TestStale401DoesNotAdoptNearlyExpiredToken(t *testing.T) {
++	g := newFakeGoogle(t)
++	first := newTestAPI(t)
++	second := newTestAPI(t) // both tok1
++	g.revoke("tok1")
++	g.expiresIn.Store(20)
++	_, err := second.ExchangeSDP("project", "device2", "offer") // replaces with tok2, 20s left
++	require.NoError(t, err)
++	require.Equal(t, "tok2", cachedToken(t))
++	g.expiresIn.Store(0)
++
++	_, err = first.ExchangeSDP("project", "device1", "offer")
++	require.NoError(t, err)
++	require.Equal(t, "tok3", first.Token)
++	require.Equal(t, int32(3), g.tokenRequests.Load())
++}
++
++// The extend loop refreshes the token by clock before extending.
++func TestExtendLoopRefreshesNearExpiry(t *testing.T) {
++	g := newFakeGoogle(t)
++	g.expiresIn.Store(20) // tok1 is inside the margin from the start
++	api := newTestAPI(t)
++	g.expiresIn.Store(0)
++	_, err := api.ExchangeSDP("project", "device", "offer")
++	require.NoError(t, err)
++	api.StreamExpiresAt = time.Now() // timer fires at once
++	api.StartExtendStreamTimer()
++	require.Eventually(t, func() bool { return len(g.sdmBearers()) >= 2 }, 5*time.Second, 10*time.Millisecond)
++	api.StopExtendStreamTimer()
++	require.Equal(t, "tok2", api.Token)
++	require.Equal(t, []string{"tok1", "tok2"}, g.sdmBearers()[:2])
++}
+diff --git a/pkg/nest/client_test.go b/pkg/nest/client_test.go
+new file mode 100644
+index 0000000..df00580
+--- /dev/null
++++ b/pkg/nest/client_test.go
+@@ -0,0 +1,151 @@
++package nest
++
++import (
++	"bytes"
++	"encoding/binary"
++	"encoding/json"
++	"io"
++	"net/http"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/pion/rtp"
++	pion "github.com/pion/webrtc/v4"
++	"github.com/stretchr/testify/require"
++)
++
++// The dial gate only works if rtcConn waits on it before returning the Conn: OnTrack
++// narrows the video media.Codecs and writes sprop-parameter-sets, and the streams layer
++// starts reading both as soon as Dial returns. So, as a consumer would, look at the
++// Conn the moment rtcConn returns: both writes must already be done.
++func TestRtcConnReturnsOnlyAfterTheGate(t *testing.T) {
++	cam := &loopbackCamera{t: t}
++	old := http.DefaultTransport
++	http.DefaultTransport = cam // ExchangeSDP's client uses it
++	t.Cleanup(func() { http.DefaultTransport = old })
++	oldConf := rtcConfig
++	rtcConfig = pion.Configuration{} // no STUN: host candidates only
++	t.Cleanup(func() { rtcConfig = oldConf })
++
++	client, err := rtcConn(&API{Token: "test"}, "nest:test", "project", "device")
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = client.Stop() })
++
++	var video *core.Media
++	for _, media := range client.GetMedias() {
++		if media.Kind == core.KindVideo {
++			video = media
++		}
++	}
++	require.NotNil(t, video)
++	require.Len(t, video.Codecs, 1, "rtcConn returned before OnTrack narrowed the video codecs")
++	require.Contains(t, video.Codecs[0].FmtpLine, "sprop-parameter-sets=",
++		"rtcConn returned before OnTrack wrote sprop-parameter-sets")
++}
++
++// loopbackCamera answers GenerateWebRtcStream like Google, with a local pion peer that
++// sends H264: non-IDR slices, then SPS/PPS from 300ms after it connects.
++type loopbackCamera struct {
++	t  *testing.T
++	mu sync.Mutex
++}
++
++func (c *loopbackCamera) RoundTrip(req *http.Request) (*http.Response, error) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	t := c.t
++	require.True(t, strings.HasSuffix(req.URL.Path, ":executeCommand"), req.URL.String())
++
++	var reqv struct {
++		Params struct {
++			Offer string `json:"offerSdp"`
++		} `json:"params"`
++	}
++	require.NoError(t, json.NewDecoder(req.Body).Decode(&reqv))
++
++	pc, err := pion.NewPeerConnection(pion.Configuration{})
++	require.NoError(t, err)
++	track, err := pion.NewTrackLocalStaticRTP(pion.RTPCodecCapability{
++		MimeType: pion.MimeTypeH264, ClockRate: 90000,
++		SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
++	}, "video", "cam")
++	require.NoError(t, err)
++	_, err = pc.AddTrack(track)
++	require.NoError(t, err)
++
++	require.NoError(t, pc.SetRemoteDescription(pion.SessionDescription{Type: pion.SDPTypeOffer, SDP: reqv.Params.Offer}))
++	answer, err := pc.CreateAnswer(nil)
++	require.NoError(t, err)
++	gathered := pion.GatheringCompletePromise(pc)
++	require.NoError(t, pc.SetLocalDescription(answer))
++	<-gathered
++
++	stop := make(chan struct{})
++	done := make(chan struct{})
++	go sendH264(pc, track, stop, done)
++	t.Cleanup(func() {
++		close(stop)
++		<-done
++		_ = pc.Close()
++	})
++
++	var resv struct {
++		Results struct {
++			Answer         string    `json:"answerSdp"`
++			ExpiresAt      time.Time `json:"expiresAt"`
++			MediaSessionID string    `json:"mediaSessionId"`
++		} `json:"results"`
++	}
++	resv.Results.Answer = pc.LocalDescription().SDP
++	resv.Results.ExpiresAt = time.Now().Add(5 * time.Minute)
++	resv.Results.MediaSessionID = "test"
++	b, err := json.Marshal(resv)
++	require.NoError(t, err)
++
++	return &http.Response{
++		StatusCode: 200, Status: "200 OK", Header: http.Header{},
++		Body: io.NopCloser(bytes.NewReader(b)), Request: req,
++	}, nil
++}
++
++func sendH264(pc *pion.PeerConnection, track *pion.TrackLocalStaticRTP, stop, done chan struct{}) {
++	defer close(done)
++	sps := []byte{0x67, 0x42, 0xe0, 0x1f, 0x8c, 0x8d, 0x40, 0x50, 0x1e, 0xd0}
++	pps := []byte{0x68, 0xce, 0x3c, 0x80}
++
++	tick := time.NewTicker(10 * time.Millisecond)
++	defer tick.Stop()
++
++	var start time.Time
++	var seq uint16
++	for {
++		select {
++		case <-stop:
++			return
++		case <-tick.C:
++		}
++		if start.IsZero() {
++			if pc.ConnectionState() != pion.PeerConnectionStateConnected {
++				continue
++			}
++			start = time.Now()
++		}
++
++		seq++
++		payload := []byte{0x41, 0x9a, 0x00, 0x01} // non-IDR slice
++		if time.Since(start) >= 300*time.Millisecond && seq%20 == 0 {
++			payload = []byte{24} // STAP-A: SPS + PPS
++			for _, nal := range [][]byte{sps, pps} {
++				payload = binary.BigEndian.AppendUint16(payload, uint16(len(nal)))
++				payload = append(payload, nal...)
++			}
++		}
++		_ = track.WriteRTP(&rtp.Packet{
++			Header:  rtp.Header{Version: 2, Marker: true, SequenceNumber: seq, Timestamp: uint32(seq) * 900},
++			Payload: payload,
++		})
++	}
++}
+diff --git a/pkg/webrtc/client.go b/pkg/webrtc/client.go
+index bc2c4f8..e295cdc 100644
+--- a/pkg/webrtc/client.go
++++ b/pkg/webrtc/client.go
+@@ -62,18 +62,18 @@ func (c *Conn) SetAnswer(answer string) (err error) {
+ 		Type: webrtc.SDPTypeAnswer,
+ 		SDP:  fakeFormatsInAnswer(c.pc.LocalDescription().SDP, answer),
+ 	}
+-	if err = c.pc.SetRemoteDescription(desc); err != nil {
+-		return err
+-	}
+ 
+ 	sd := &sdp.SessionDescription{}
+ 	if err = sd.Unmarshal([]byte(answer)); err != nil {
+ 		return err
+ 	}
+ 
++	// Set Medias before SetRemoteDescription: that call starts the transports, and
++	// OnTrack reads c.Medias in getMediaCodec, which panics if it finds no match.
+ 	c.Medias = UnmarshalMedias(sd.MediaDescriptions)
+ 
+-	return nil
++	// On failure Medias keeps the rejected answer's medias; callers close the Conn.
++	return c.pc.SetRemoteDescription(desc)
+ }
+ 
+ // fakeFormatsInAnswer - fix pion bug with remote SDP parsing:
+diff --git a/pkg/webrtc/nest_gate_test.go b/pkg/webrtc/nest_gate_test.go
+new file mode 100644
+index 0000000..e26f358
+--- /dev/null
++++ b/pkg/webrtc/nest_gate_test.go
+@@ -0,0 +1,154 @@
++package webrtc
++
++import (
++	"fmt"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/pion/webrtc/v4"
++	"github.com/stretchr/testify/require"
++)
++
++func withNestTimeouts(t *testing.T, video, sprop time.Duration) {
++	oldVideo, oldSprop := NestVideoTimeout, NestSpropTimeout
++	NestVideoTimeout, NestSpropTimeout = video, sprop
++	t.Cleanup(func() { NestVideoTimeout, NestSpropTimeout = oldVideo, oldSprop })
++}
++
++// SPS/PPS that arrive after WaitNestVideo gave up on them must not be written:
++// the Conn is published by then and consumers are reading the codec.
++func TestNestGate_LateSpropIsNotWritten(t *testing.T) {
++	withNestTimeouts(t, 5*time.Second, 200*time.Millisecond)
++	conn, _ := dialFakeCamera(t, "nest/webrtc", camOpts{spropAfter: time.Second})
++	require.NoError(t, conn.WaitNestVideo())
++
++	// read straight through the moment the camera starts sending SPS/PPS
++	fmtp := readVideoFmtp(conn, 2*time.Second)
++	require.NotContains(t, fmtp, "sprop-parameter-sets=")
++}
++
++// A camera that never sends SPS/PPS still gets its Conn, after the sprop window.
++func TestNestGate_NoSpropStillPublishes(t *testing.T) {
++	withNestTimeouts(t, 5*time.Second, 300*time.Millisecond)
++	conn, _ := dialFakeCamera(t, "nest/webrtc", camOpts{spropAfter: -1})
++
++	start := time.Now()
++	require.NoError(t, conn.WaitNestVideo())
++	require.GreaterOrEqual(t, time.Since(start), 300*time.Millisecond)
++	require.False(t, strings.Contains(readVideoFmtp(conn, 100*time.Millisecond), "sprop-parameter-sets="))
++}
++
++// A video codec whose answer already carries sprop-parameter-sets has nothing to
++// capture, so the gate must not sit out NestSpropTimeout waiting for SPS/PPS.
++func TestNestGate_SpropInAnswerDoesNotWait(t *testing.T) {
++	withNestTimeouts(t, 5*time.Second, 10*time.Second)
++	conn, _ := dialFakeCamera(t, "nest/webrtc", camOpts{spropAfter: -1,
++		answerFmtp: "sprop-parameter-sets=Z0LgH4yNQFAe0A==,aM48gA=="})
++
++	start := time.Now()
++	require.NoError(t, conn.WaitNestVideo())
++	require.Less(t, time.Since(start), 5*time.Second, "waited for SPS/PPS the answer already had")
++	require.Equal(t, 1, strings.Count(videoMedia(t, conn).Codecs[0].FmtpLine, "sprop-parameter-sets="))
++}
++
++// No video at all is not a dial failure: the Conn is returned once NestVideoTimeout
++// passes, and the connect watchdog and reconnect loop deal with it as they always did.
++func TestNestGate_NoVideoStillPublishes(t *testing.T) {
++	withNestTimeouts(t, 300*time.Millisecond, time.Second)
++	conn := newNestConn(t)
++
++	start := time.Now()
++	require.NoError(t, conn.WaitNestVideo())
++	require.GreaterOrEqual(t, time.Since(start), 300*time.Millisecond)
++}
++
++// A video track that arrives after NestVideoTimeout must write nothing shared, and
++// must still reach a consumer that attached in the meantime. The answer lists H264
++// at PT 96 first, while the camera sends PT 97, so this is the #2389 mismatch.
++func TestNestGate_LateVideoAfterTimeout(t *testing.T) {
++	withNestTimeouts(t, 200*time.Millisecond, 200*time.Millisecond)
++	conn, _ := dialFakeCamera(t, "nest/webrtc", camOpts{spropAfter: 300 * time.Millisecond, videoAfter: time.Second})
++	require.NoError(t, conn.WaitNestVideo())
++
++	video := attachConsumer(t, conn, core.KindVideo, core.CodecH264)
++
++	fmtp := readVideoFmtp(conn, 2*time.Second) // across the late track's arrival
++	require.NotContains(t, fmtp, "sprop-parameter-sets=")
++	require.Eventually(t, func() bool { return video.Load() > 0 }, 3*time.Second, 20*time.Millisecond,
++		"late video was not delivered to the consumer")
++	require.Greater(t, len(videoMedia(t, conn).Codecs), 1, "late track narrowed a published media")
++}
++
++// The point of the gate for #2389: once WaitNestVideo returns, the video media lists
++// only the codec actually sent, so a consumer's MatchMedia/GetTrack lands on the
++// receiver OnTrack feeds, even though the answer listed another H264 first.
++func TestNestGate_VideoNarrowedBeforePublish(t *testing.T) {
++	withNestTimeouts(t, 5*time.Second, 200*time.Millisecond)
++	conn, cam := dialFakeCamera(t, "nest/webrtc", camOpts{spropAfter: -1})
++	require.NoError(t, conn.WaitNestVideo())
++
++	media := videoMedia(t, conn)
++	require.Len(t, media.Codecs, 1)
++	sent := media.Codecs[0]
++	require.Contains(t, sent.FmtpLine, "profile-level-id=42e01f") // the camera's track
++	require.NotEqual(t, firstH264PT(t, cam.pc.LocalDescription().SDP), sent.PayloadType,
++		"answer must list another H264 first, or this doesn't test #2389")
++
++	conn.tracksMu.Lock()
++	fed := append([]*core.Receiver(nil), conn.Receivers...)
++	conn.tracksMu.Unlock()
++	require.Len(t, fed, 1) // OnTrack's
++
++	want := &core.Media{Kind: core.KindVideo, Direction: core.DirectionSendonly, Codecs: []*core.Codec{{Name: core.CodecH264}}}
++	prodCodec, _ := media.MatchMedia(want)
++	track, err := conn.GetTrack(media, prodCodec)
++	require.NoError(t, err)
++	require.Same(t, fed[0], track)
++}
++
++func videoMedia(t *testing.T, conn *Conn) *core.Media {
++	for _, media := range conn.GetMedias() {
++		if media.Kind == core.KindVideo {
++			return media
++		}
++	}
++	t.Fatal("no video media")
++	return nil
++}
++
++func firstH264PT(t *testing.T, sdp string) uint8 {
++	for _, line := range strings.Split(sdp, "\n") {
++		var pt uint8
++		if _, err := fmt.Sscanf(line, "a=rtpmap:%d H264/", &pt); err == nil {
++			return pt
++		}
++	}
++	t.Fatal("no H264 in the answer")
++	return 0
++}
++
++// A connection that closes during the wait fails the dial at once.
++func TestNestGate_CloseFailsAtOnce(t *testing.T) {
++	withNestTimeouts(t, 10*time.Second, time.Second)
++	conn := newNestConn(t)
++
++	go func() {
++		time.Sleep(100 * time.Millisecond)
++		_ = conn.Close()
++	}()
++
++	start := time.Now()
++	require.ErrorContains(t, conn.WaitNestVideo(), "closed")
++	require.Less(t, time.Since(start), 5*time.Second)
++}
++
++func newNestConn(t *testing.T) *Conn {
++	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
++	require.NoError(t, err)
++	conn := NewConn(pc)
++	conn.FormatName = "nest/webrtc"
++	t.Cleanup(func() { _ = conn.Close() })
++	return conn
++}
+diff --git a/pkg/webrtc/nest_reorder.go b/pkg/webrtc/nest_reorder.go
+new file mode 100644
+index 0000000..b2a3ff3
+--- /dev/null
++++ b/pkg/webrtc/nest_reorder.go
+@@ -0,0 +1,248 @@
++package webrtc
++
++import (
++	"time"
++
++	"github.com/pion/rtp"
++	"github.com/pion/rtp/codecs"
++)
++
++// Nest retransmissions are commonly delayed by tens to hundreds of
++// milliseconds. Multi-camera diagnostics observed p99 around 277ms, so wait
++// up to 300ms for a missing sequence number. The wait applies only while a
++// sequence gap is open and adds no latency to normal in-order traffic.
++//
++// Bound pending packets as well as time. Real traces have shown retransmitted
++// packets arriving more than 50 sequence numbers behind the newest packet, so
++// 128 leaves margin while keeping the queue strictly bounded.
++const (
++	nestRTPReorderMaxWait    = 300 * time.Millisecond
++	nestRTPReorderMaxPending = 128
++)
++
++type nestRTPReorderResult struct {
++	packets    []*rtp.Packet
++	gapExpired bool
++	missing    uint16
++
++	reanchored bool
++	oldHead    uint16
++	newSeq     uint16
++}
++
++type nestRTPReorder struct {
++	started bool
++	next    uint16
++
++	pending  map[uint16]*rtp.Packet
++	gapSince time.Time
++
++	// A sustained run of packets that all appear behind the playout head can
++	// indicate that the sender reset its RTP sequence number while keeping the
++	// same SSRC. A single late packet must not disturb a healthy stream.
++	behindHead int
++}
++
++// push accepts RTP packets in arrival order and returns packets that are safe
++// to emit in sequence order.
++//
++// A sequence gap starts a bounded wait. If the missing packet arrives within
++// the window, buffered packets are released in order. If the window expires,
++// the missing sequence numbers are abandoned and any later retransmission of
++// them is dropped as late.
++//
++// Sequence comparisons deliberately use signed 16-bit differences so RTP
++// wraparound (65535 -> 0) is handled naturally.
++func (r *nestRTPReorder) push(packet *rtp.Packet, now time.Time) nestRTPReorderResult {
++	var result nestRTPReorderResult
++
++	if !r.started {
++		r.started = true
++		r.next = packet.SequenceNumber
++		r.pending = make(map[uint16]*rtp.Packet)
++	}
++
++	// Expire an existing gap BEFORE considering the newly arrived packet.
++	// Therefore a retransmission arriving after the 300ms deadline cannot
++	// retroactively heal a gap whose wait window has already elapsed.
++	if !r.gapSince.IsZero() && now.Sub(r.gapSince) >= nestRTPReorderMaxWait {
++		packets, missing := r.expireGap(now)
++		result.packets = append(result.packets, packets...)
++		if missing != 0 {
++			result.gapExpired = true
++			result.missing += missing
++		}
++	}
++
++	diff := int16(packet.SequenceNumber - r.next)
++
++	// Behind the playout head: normally an ordinary duplicate or a
++	// retransmission that arrived after its reorder window expired.
++	//
++	// Signed 16-bit RTP sequence comparisons are intentionally ambiguous for
++	// jumps of half the sequence space or more. If a sustained run of packets
++	// all appears behind the head, assume the sender reset its sequence number
++	// while retaining the same SSRC and re-anchor on the current packet.
++	if diff < 0 {
++		r.behindHead++
++		if r.behindHead < nestRTPReorderMaxPending {
++			return result
++		}
++
++		result.reanchored = true
++		result.oldHead = r.next
++		result.newSeq = packet.SequenceNumber
++
++		r.next = packet.SequenceNumber
++		r.pending = make(map[uint16]*rtp.Packet)
++		r.gapSince = time.Time{}
++		r.behindHead = 0
++
++		r.pending[packet.SequenceNumber] = packet
++		result.packets = append(result.packets, r.drain(now)...)
++		return result
++	}
++
++	// Any packet at or ahead of the current head breaks a behind-head streak.
++	r.behindHead = 0
++
++	// A packet already waiting in the queue is a duplicate retransmission.
++	if _, ok := r.pending[packet.SequenceNumber]; ok {
++		return result
++	}
++
++	// Payload contents intentionally do not matter here. In particular,
++	// zero-payload padding packets still occupy RTP sequence numbers and must
++	// fill their slot even though the caller won't forward their payload.
++	r.pending[packet.SequenceNumber] = packet
++	result.packets = append(result.packets, r.drain(now)...)
++
++	// If the time window hasn't fired but the queue reaches its hard bound,
++	// abandon the current gap rather than allowing unbounded growth.
++	if len(r.pending) >= nestRTPReorderMaxPending {
++		packets, missing := r.expireGap(now)
++		result.packets = append(result.packets, packets...)
++		if missing != 0 {
++			result.gapExpired = true
++			result.missing += missing
++		}
++	}
++
++	return result
++}
++
++type nestRTPWriteResult struct {
++	packets           []*rtp.Packet
++	waitPartitionHead bool
++	recovered         bool
++	recoveredSeq      uint16
++}
++
++// nestRTPPacketsToWrite applies the post-reorder H264 recovery gate.
++//
++// After an abandoned gap or sequence re-anchor, packets are suppressed
++// until a partition head arrives so orphan fragments are never forwarded.
++// Padding occupies sequence-number space but is never written downstream.
++func nestRTPPacketsToWrite(
++	result nestRTPReorderResult,
++	waitPartitionHead bool,
++	partitionHead *codecs.H264Packet,
++) nestRTPWriteResult {
++	write := nestRTPWriteResult{
++		waitPartitionHead: waitPartitionHead || result.gapExpired || result.reanchored,
++	}
++
++	for _, packet := range result.packets {
++		if len(packet.Payload) == 0 {
++			continue
++		}
++
++		if write.waitPartitionHead {
++			if !partitionHead.IsPartitionHead(packet.Payload) {
++				continue
++			}
++
++			write.waitPartitionHead = false
++			write.recovered = true
++			write.recoveredSeq = packet.SequenceNumber
++		}
++
++		write.packets = append(write.packets, packet)
++	}
++
++	return write
++}
++
++// drain emits every contiguous packet starting at the current playout head.
++// If draining one repaired gap exposes another, the new gap receives its own
++// full wait window.
++func (r *nestRTPReorder) drain(now time.Time) []*rtp.Packet {
++	startNext := r.next
++	var packets []*rtp.Packet
++
++	for {
++		packet, ok := r.pending[r.next]
++		if !ok {
++			break
++		}
++
++		delete(r.pending, r.next)
++		packets = append(packets, packet)
++		r.next++
++	}
++
++	switch {
++	case len(r.pending) == 0:
++		r.gapSince = time.Time{}
++
++	case r.next != startNext:
++		// We advanced through one repaired gap and stopped at a new one.
++		r.gapSince = now
++
++	case r.gapSince.IsZero():
++		// First packet observed beyond a newly opened gap.
++		r.gapSince = now
++	}
++
++	return packets
++}
++
++// expireGap abandons the missing sequence numbers up to the nearest buffered
++// packet ahead of the current playout head, then drains from that point.
++func (r *nestRTPReorder) expireGap(now time.Time) ([]*rtp.Packet, uint16) {
++	if len(r.pending) == 0 {
++		r.gapSince = time.Time{}
++		return nil, 0
++	}
++
++	var (
++		bestSeq      uint16
++		bestDistance int
++		found        bool
++	)
++
++	for seq := range r.pending {
++		diff := int16(seq - r.next)
++		if diff <= 0 {
++			continue
++		}
++
++		distance := int(diff)
++		if !found || distance < bestDistance {
++			bestSeq = seq
++			bestDistance = distance
++			found = true
++		}
++	}
++
++	if !found {
++		return nil, 0
++	}
++
++	missing := uint16(bestDistance)
++
++	r.next = bestSeq
++	r.gapSince = time.Time{}
++
++	return r.drain(now), missing
++}
+diff --git a/pkg/webrtc/nest_reorder_test.go b/pkg/webrtc/nest_reorder_test.go
+new file mode 100644
+index 0000000..147421d
+--- /dev/null
++++ b/pkg/webrtc/nest_reorder_test.go
+@@ -0,0 +1,453 @@
++package webrtc
++
++import (
++	"testing"
++	"time"
++
++	"github.com/pion/rtp"
++	"github.com/pion/rtp/codecs"
++	"github.com/stretchr/testify/require"
++)
++
++func nestTestPacket(seq uint16) *rtp.Packet {
++	return &rtp.Packet{
++		Header: rtp.Header{
++			SequenceNumber: seq,
++		},
++		Payload: []byte{0x01},
++	}
++}
++
++func nestTestPadding(seq uint16) *rtp.Packet {
++	return &rtp.Packet{
++		Header: rtp.Header{
++			SequenceNumber: seq,
++		},
++	}
++}
++
++func nestPacketSeqs(packets []*rtp.Packet) []uint16 {
++	seqs := make([]uint16, len(packets))
++	for i, packet := range packets {
++		seqs[i] = packet.SequenceNumber
++	}
++	return seqs
++}
++
++func TestNestRTPReorderInOrder(t *testing.T) {
++	var r nestRTPReorder
++	now := time.Unix(1, 0)
++
++	res := r.push(nestTestPacket(100), now)
++	require.Equal(t, []uint16{100}, nestPacketSeqs(res.packets))
++	require.False(t, res.gapExpired)
++
++	res = r.push(nestTestPacket(101), now.Add(time.Millisecond))
++	require.Equal(t, []uint16{101}, nestPacketSeqs(res.packets))
++	require.False(t, res.gapExpired)
++}
++
++func TestNestRTPReorderDelayedBurst(t *testing.T) {
++	var r nestRTPReorder
++	now := time.Unix(1, 0)
++
++	require.Equal(t,
++		[]uint16{100},
++		nestPacketSeqs(r.push(nestTestPacket(100), now).packets),
++	)
++
++	require.Empty(t,
++		r.push(nestTestPacket(103), now.Add(10*time.Millisecond)).packets,
++	)
++	require.Empty(t,
++		r.push(nestTestPacket(104), now.Add(20*time.Millisecond)).packets,
++	)
++
++	res := r.push(nestTestPacket(101), now.Add(80*time.Millisecond))
++	require.Equal(t, []uint16{101}, nestPacketSeqs(res.packets))
++	require.False(t, res.gapExpired)
++
++	res = r.push(nestTestPacket(102), now.Add(100*time.Millisecond))
++	require.Equal(t, []uint16{102, 103, 104}, nestPacketSeqs(res.packets))
++	require.False(t, res.gapExpired)
++}
++
++func TestNestRTPReorderDuplicate(t *testing.T) {
++	var r nestRTPReorder
++	now := time.Unix(1, 0)
++
++	require.Equal(t,
++		[]uint16{100},
++		nestPacketSeqs(r.push(nestTestPacket(100), now).packets),
++	)
++
++	require.Empty(t,
++		r.push(nestTestPacket(102), now.Add(10*time.Millisecond)).packets,
++	)
++
++	// Duplicate while the packet is still buffered.
++	require.Empty(t,
++		r.push(nestTestPacket(102), now.Add(20*time.Millisecond)).packets,
++	)
++
++	res := r.push(nestTestPacket(101), now.Add(30*time.Millisecond))
++	require.Equal(t, []uint16{101, 102}, nestPacketSeqs(res.packets))
++
++	// Duplicate after the packet was already emitted.
++	require.Empty(t,
++		r.push(nestTestPacket(101), now.Add(40*time.Millisecond)).packets,
++	)
++}
++
++func TestNestRTPReorderWraparound(t *testing.T) {
++	var r nestRTPReorder
++	now := time.Unix(1, 0)
++
++	res := r.push(nestTestPacket(65534), now)
++	require.Equal(t, []uint16{65534}, nestPacketSeqs(res.packets))
++
++	require.Empty(t,
++		r.push(nestTestPacket(0), now.Add(10*time.Millisecond)).packets,
++	)
++
++	res = r.push(nestTestPacket(65535), now.Add(20*time.Millisecond))
++	require.Equal(t, []uint16{65535, 0}, nestPacketSeqs(res.packets))
++
++	res = r.push(nestTestPacket(1), now.Add(30*time.Millisecond))
++	require.Equal(t, []uint16{1}, nestPacketSeqs(res.packets))
++}
++
++func TestNestRTPReorderPaddingFillsGap(t *testing.T) {
++	var r nestRTPReorder
++	now := time.Unix(1, 0)
++
++	require.Equal(t,
++		[]uint16{100},
++		nestPacketSeqs(r.push(nestTestPacket(100), now).packets),
++	)
++
++	require.Empty(t,
++		r.push(nestTestPacket(102), now.Add(10*time.Millisecond)).packets,
++	)
++
++	// Padding has no media payload but still consumes sequence 101.
++	res := r.push(nestTestPadding(101), now.Add(20*time.Millisecond))
++	require.Equal(t, []uint16{101, 102}, nestPacketSeqs(res.packets))
++	require.False(t, res.gapExpired)
++}
++
++func TestNestRTPReorderLatePacketAfterTimeout(t *testing.T) {
++	var r nestRTPReorder
++	now := time.Unix(1, 0)
++
++	require.Equal(t,
++		[]uint16{100},
++		nestPacketSeqs(r.push(nestTestPacket(100), now).packets),
++	)
++
++	require.Empty(t,
++		r.push(nestTestPacket(102), now.Add(10*time.Millisecond)).packets,
++	)
++
++	// 101 arrives after the 300ms gap deadline. The gap must be expired
++	// first, releasing 102; 101 is then behind the playout head and dropped.
++	res := r.push(nestTestPacket(101), now.Add(311*time.Millisecond))
++
++	require.True(t, res.gapExpired)
++	require.Equal(t, uint16(1), res.missing)
++	require.Equal(t, []uint16{102}, nestPacketSeqs(res.packets))
++	require.Empty(t, r.pending)
++}
++
++func TestNestRTPReorderNewGapGetsFullWindow(t *testing.T) {
++	var r nestRTPReorder
++	now := time.Unix(1, 0)
++
++	require.Equal(t,
++		[]uint16{100},
++		nestPacketSeqs(r.push(nestTestPacket(100), now).packets),
++	)
++
++	// First gap: missing 101.
++	require.Empty(t,
++		r.push(nestTestPacket(102), now.Add(10*time.Millisecond)).packets,
++	)
++
++	// A second gap already exists behind 104: missing 103.
++	require.Empty(t,
++		r.push(nestTestPacket(104), now.Add(100*time.Millisecond)).packets,
++	)
++
++	// Repair the first gap at 150ms. This emits 101,102 and starts a fresh
++	// timer for the newly exposed gap at 103.
++	res := r.push(nestTestPacket(101), now.Add(150*time.Millisecond))
++	require.Equal(t, []uint16{101, 102}, nestPacketSeqs(res.packets))
++	require.False(t, res.gapExpired)
++
++	// Only 100ms has elapsed for the second gap, so it must NOT expire.
++	res = r.push(nestTestPacket(105), now.Add(250*time.Millisecond))
++	require.Empty(t, res.packets)
++	require.False(t, res.gapExpired)
++
++	// Repair it within its own 300ms window.
++	res = r.push(nestTestPacket(103), now.Add(300*time.Millisecond))
++	require.Equal(t, []uint16{103, 104, 105}, nestPacketSeqs(res.packets))
++	require.False(t, res.gapExpired)
++}
++
++func TestNestRTPReorderPendingBound(t *testing.T) {
++	var r nestRTPReorder
++	now := time.Unix(1, 0)
++
++	require.Equal(t,
++		[]uint16{100},
++		nestPacketSeqs(r.push(nestTestPacket(100), now).packets),
++	)
++
++	// Leave sequence 101 missing and fill the queue with 128 packets.
++	var res nestRTPReorderResult
++	for i := 0; i < nestRTPReorderMaxPending; i++ {
++		res = r.push(
++			nestTestPacket(uint16(102+i)),
++			now.Add(time.Duration(i+1)*time.Millisecond),
++		)
++	}
++
++	require.True(t, res.gapExpired)
++	require.Equal(t, uint16(1), res.missing)
++	require.Len(t, res.packets, nestRTPReorderMaxPending)
++	require.Equal(t, uint16(102), res.packets[0].SequenceNumber)
++	require.Equal(t, uint16(229), res.packets[len(res.packets)-1].SequenceNumber)
++}
++
++func TestNestRTPReorderResyncAfterLargeForwardJump(t *testing.T) {
++	var r nestRTPReorder
++	now := time.Unix(1, 0)
++
++	require.Equal(t,
++		[]uint16{1000},
++		nestPacketSeqs(r.push(nestTestPacket(1000), now).packets),
++	)
++
++	// A +40000 jump is interpreted as behind by a signed 16-bit comparison.
++	// Do not re-anchor on a single packet, but recover after a sustained run.
++	start := 1001 + 40000
++	var res nestRTPReorderResult
++
++	for i := 0; i < nestRTPReorderMaxPending-1; i++ {
++		res = r.push(
++			nestTestPacket(uint16(start+i)),
++			now.Add(time.Duration(i+1)*time.Millisecond),
++		)
++		require.Empty(t, res.packets)
++	}
++
++	anchor := uint16(start + nestRTPReorderMaxPending - 1)
++	res = r.push(
++		nestTestPacket(anchor),
++		now.Add(nestRTPReorderMaxPending*time.Millisecond),
++	)
++	require.Equal(t, []uint16{anchor}, nestPacketSeqs(res.packets))
++	require.Empty(t, r.pending)
++
++	res = r.push(
++		nestTestPacket(anchor+1),
++		now.Add((nestRTPReorderMaxPending+1)*time.Millisecond),
++	)
++	require.Equal(t, []uint16{anchor + 1}, nestPacketSeqs(res.packets))
++}
++
++func TestNestRTPReorderResyncAfterBackwardJump(t *testing.T) {
++	var r nestRTPReorder
++	now := time.Unix(1, 0)
++
++	require.Equal(t,
++		[]uint16{1000},
++		nestPacketSeqs(r.push(nestTestPacket(1000), now).packets),
++	)
++
++	// The sender resets from expected sequence 1001 back to 465. A short run
++	// could still be delayed traffic, so only re-anchor after the threshold.
++	start := 465
++	var res nestRTPReorderResult
++
++	for i := 0; i < nestRTPReorderMaxPending-1; i++ {
++		res = r.push(
++			nestTestPacket(uint16(start+i)),
++			now.Add(time.Duration(i+1)*time.Millisecond),
++		)
++		require.Empty(t, res.packets)
++	}
++
++	anchor := uint16(start + nestRTPReorderMaxPending - 1)
++	res = r.push(
++		nestTestPacket(anchor),
++		now.Add(nestRTPReorderMaxPending*time.Millisecond),
++	)
++	require.Equal(t, []uint16{anchor}, nestPacketSeqs(res.packets))
++	require.Empty(t, r.pending)
++
++	res = r.push(
++		nestTestPacket(anchor+1),
++		now.Add((nestRTPReorderMaxPending+1)*time.Millisecond),
++	)
++	require.Equal(t, []uint16{anchor + 1}, nestPacketSeqs(res.packets))
++}
++
++func TestNestRTPPacketsToWriteWaitsForPartitionHead(t *testing.T) {
++	var partitionHead codecs.H264Packet
++
++	// A real reorder loss is declared. Padding is ignored, and the FU-A tail
++	// must not be forwarded because its partition head was lost.
++	first := nestRTPPacketsToWrite(
++		nestRTPReorderResult{
++			gapExpired: true,
++			packets: []*rtp.Packet{
++				nestTestPadding(200),
++				{
++					Header:  rtp.Header{SequenceNumber: 201},
++					Payload: []byte{0x7c, 0x05, 0xaa}, // FU-A middle/tail
++				},
++			},
++		},
++		false,
++		&partitionHead,
++	)
++
++	require.Empty(t, first.packets)
++	require.True(t, first.waitPartitionHead)
++	require.False(t, first.recovered)
++
++	// The wait state persists into the next push. Another orphan fragment is
++	// discarded; forwarding resumes exactly at the next FU-A partition head.
++	second := nestRTPPacketsToWrite(
++		nestRTPReorderResult{
++			packets: []*rtp.Packet{
++				{
++					Header:  rtp.Header{SequenceNumber: 202},
++					Payload: []byte{0x7c, 0x05, 0xbb}, // still orphaned
++				},
++				{
++					Header:  rtp.Header{SequenceNumber: 203},
++					Payload: []byte{0x7c, 0x80 | 0x05, 0xcc}, // FU-A start
++				},
++				{
++					Header:  rtp.Header{SequenceNumber: 204},
++					Payload: []byte{0x7c, 0x40 | 0x05, 0xdd}, // FU-A end
++				},
++			},
++		},
++		first.waitPartitionHead,
++		&partitionHead,
++	)
++
++	require.Equal(t, []uint16{203, 204}, nestPacketSeqs(second.packets))
++	require.False(t, second.waitPartitionHead)
++	require.True(t, second.recovered)
++	require.Equal(t, uint16(203), second.recoveredSeq)
++}
++
++func TestNestRTPReorderReanchorWaitsForPartitionHead(t *testing.T) {
++	var r nestRTPReorder
++	var head codecs.H264Packet
++	now := time.Unix(0, 0)
++	wait := false
++	var forwarded []*rtp.Packet
++
++	feed := func(p *rtp.Packet) {
++		w := nestRTPPacketsToWrite(r.push(p, now), wait, &head)
++		wait = w.waitPartitionHead
++		forwarded = append(forwarded, w.packets...)
++	}
++
++	for s := uint16(40000); s < 40010; s++ {
++		feed(&rtp.Packet{
++			Header:  rtp.Header{SequenceNumber: s},
++			Payload: []byte{0x41, 0x01},
++		})
++	}
++
++	feed(&rtp.Packet{
++		Header:  rtp.Header{SequenceNumber: 40010},
++		Payload: []byte{0x7c, 0x80 | 0x05, 0xaa},
++	})
++
++	forwarded = nil
++
++	for i := 0; i < nestRTPReorderMaxPending; i++ {
++		now = now.Add(5 * time.Millisecond)
++		feed(&rtp.Packet{
++			Header: rtp.Header{
++				SequenceNumber: uint16(39000 + i),
++			},
++			Payload: []byte{0x7c, 0x05, 0xbb},
++		})
++	}
++
++	require.Empty(t, forwarded)
++}
++
++func TestNestRTPReorderIsolatedLatePacketsNeverReanchor(t *testing.T) {
++	var r nestRTPReorder
++	now := time.Unix(0, 0)
++	seq := uint16(1000)
++
++	r.push(nestTestPacket(seq), now)
++
++	for i := 0; i < 3*nestRTPReorderMaxPending; i++ {
++		seq++
++		now = now.Add(10 * time.Millisecond)
++
++		res := r.push(nestTestPacket(seq), now)
++		require.Equal(t, []uint16{seq}, nestPacketSeqs(res.packets))
++
++		res = r.push(nestTestPacket(seq-50), now)
++		require.Empty(t, res.packets)
++	}
++}
++
++func TestNestRTPPacketsToWriteSkipsPaddingWhenHealthy(t *testing.T) {
++	var head codecs.H264Packet
++
++	res := nestRTPReorderResult{
++		packets: []*rtp.Packet{
++			nestTestPacket(1),
++			nestTestPadding(2),
++			nestTestPacket(3),
++		},
++	}
++
++	w := nestRTPPacketsToWrite(res, false, &head)
++
++	require.Equal(t, []uint16{1, 3}, nestPacketSeqs(w.packets))
++}
++
++func TestNestRTPReorderReanchorResetsBehindStreak(t *testing.T) {
++	var r nestRTPReorder
++	now := time.Unix(0, 0)
++
++	r.push(nestTestPacket(40000), now)
++
++	seq := uint16(39000)
++
++	// Backward reset: behind the old head in signed 16-bit terms.
++	var res nestRTPReorderResult
++
++	for i := 0; i < nestRTPReorderMaxPending; i++ {
++		res = r.push(nestTestPacket(seq), now)
++		seq++
++	}
++
++	require.True(t, res.reanchored)
++
++	// A stray packet behind the new head must not re-anchor again.
++	res = r.push(nestTestPacket(38000), now)
++
++	require.False(t, res.reanchored)
++	require.Empty(t, res.packets)
++
++	// In-order forwarding must continue normally.
++	res = r.push(nestTestPacket(seq), now)
++
++	require.Equal(t, []uint16{seq}, nestPacketSeqs(res.packets))
++}
+diff --git a/pkg/webrtc/producer.go b/pkg/webrtc/producer.go
+index 32e958e..d7ff336 100644
+--- a/pkg/webrtc/producer.go
++++ b/pkg/webrtc/producer.go
+@@ -8,6 +8,11 @@ import (
+ func (c *Conn) GetTrack(media *core.Media, codec *core.Codec) (*core.Receiver, error) {
+ 	core.Assert(media.Direction == core.DirectionRecvonly)
+ 
++	// OnTrack calls this from one goroutine per remote track, and the streams layer from
++	// its own; unlocked, two calls could both miss below and one append would be lost.
++	c.tracksMu.Lock()
++	defer c.tracksMu.Unlock()
++
+ 	for _, track := range c.Receivers {
+ 		if track.Codec == codec {
+ 			return track, nil
+@@ -47,3 +52,21 @@ func (c *Conn) Start() error {
+ 	c.closed.Wait()
+ 	return nil
+ }
++
++// Stop shadows the promoted core.Connection.Stop, which the streams layer and
++// nest.WebRTCClient.Stop call. That one ranges over Receivers while a late OnTrack may
++// still be appending in GetTrack, so take a snapshot under the lock. The closes run
++// outside it, so none of them can block while holding it.
++func (c *Conn) Stop() error {
++	c.tracksMu.Lock()
++	receivers := append([]*core.Receiver(nil), c.Receivers...)
++	c.tracksMu.Unlock()
++
++	for _, receiver := range receivers {
++		receiver.Close()
++	}
++	for _, sender := range c.Senders {
++		sender.Close()
++	}
++	return c.pc.Close()
++}
+diff --git a/pkg/webrtc/race_test.go b/pkg/webrtc/race_test.go
+new file mode 100644
+index 0000000..ad997db
+--- /dev/null
++++ b/pkg/webrtc/race_test.go
+@@ -0,0 +1,357 @@
++package webrtc
++
++import (
++	"encoding/binary"
++	"fmt"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/AlexxIT/go2rtc/pkg/core"
++	"github.com/pion/rtp"
++	"github.com/pion/webrtc/v4"
++	"github.com/stretchr/testify/require"
++)
++
++// These tests are meant to be run with -race. Each one drives a code path that
++// had an unsynchronized access, so without the fix the race detector fails it.
++
++// fakeCamera is a pion peer on loopback that answers like a camera: it sends
++// H264 video and, optionally, Opus audio.
++type fakeCamera struct {
++	pc    *webrtc.PeerConnection
++	video *webrtc.TrackLocalStaticRTP
++	audio *webrtc.TrackLocalStaticRTP
++
++	camOpts
++	stop chan struct{}
++	done sync.WaitGroup
++}
++
++// camOpts times a fakeCamera's streams, counted from the moment it connects.
++type camOpts struct {
++	audio      bool
++	spropAfter time.Duration // send SPS/PPS only this long after connecting (-1: never)
++	audioAfter time.Duration // start audio only this long after connecting
++	videoAfter time.Duration // start video only this long after connecting
++	answerFmtp string        // appended to every H264 fmtp line of the camera's answer
++}
++
++// dialFakeCamera connects a go2rtc Conn (as an active producer, the way
++// pkg/nest does) to a fakeCamera, and starts the camera sending.
++func dialFakeCamera(t *testing.T, formatName string, opts camOpts) (*Conn, *fakeCamera) {
++	t.Helper()
++
++	api, err := NewAPI()
++	require.NoError(t, err)
++	pc, err := api.NewPeerConnection(webrtc.Configuration{})
++	require.NoError(t, err)
++
++	conn := NewConn(pc)
++	conn.FormatName = formatName
++	conn.Mode = core.ModeActiveProducer
++
++	offer, err := conn.CreateCompleteOffer([]*core.Media{
++		{Kind: core.KindAudio, Direction: core.DirectionRecvonly},
++		{Kind: core.KindVideo, Direction: core.DirectionRecvonly},
++		{Kind: "app"},
++	})
++	require.NoError(t, err)
++
++	cam := &fakeCamera{camOpts: opts, stop: make(chan struct{})}
++	cam.pc, err = webrtc.NewPeerConnection(webrtc.Configuration{})
++	require.NoError(t, err)
++
++	cam.video, err = webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
++		MimeType: webrtc.MimeTypeH264, ClockRate: 90000,
++		SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
++	}, "video", "cam")
++	require.NoError(t, err)
++	_, err = cam.pc.AddTrack(cam.video)
++	require.NoError(t, err)
++
++	if opts.audio {
++		cam.audio, err = webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
++			MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2,
++		}, "audio", "cam")
++		require.NoError(t, err)
++		_, err = cam.pc.AddTrack(cam.audio)
++		require.NoError(t, err)
++	}
++
++	require.NoError(t, cam.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offer}))
++	answer, err := cam.pc.CreateAnswer(nil)
++	require.NoError(t, err)
++	gathered := webrtc.GatheringCompletePromise(cam.pc)
++	require.NoError(t, cam.pc.SetLocalDescription(answer))
++	<-gathered
++
++	// Start sending BEFORE SetAnswer. A goroutine started after it would give the
++	// race detector a happens-before edge from everything SetAnswer wrote to the
++	// camera's sends, and from there (through pion's shared locks) to our OnTrack.
++	// A real camera has no such edge, and the edge hid the SetAnswer race.
++	cam.done.Add(1)
++	go cam.send()
++
++	answerSDP := cam.pc.LocalDescription().SDP
++	if opts.answerFmtp != "" {
++		// pion's answer echoes the offer's fmtp, so a camera that puts more in its
++		// answer, as a camera could, is simulated by editing the SDP.
++		var h264 []string
++		for _, line := range strings.Split(answerSDP, "\r\n") {
++			var pt int
++			if _, err := fmt.Sscanf(line, "a=rtpmap:%d H264/", &pt); err == nil {
++				h264 = append(h264, fmt.Sprintf("a=fmtp:%d ", pt))
++			}
++		}
++		lines := strings.Split(answerSDP, "\r\n")
++		for i, line := range lines {
++			for _, prefix := range h264 {
++				if strings.HasPrefix(line, prefix) {
++					lines[i] = line + ";" + opts.answerFmtp
++				}
++			}
++		}
++		answerSDP = strings.Join(lines, "\r\n")
++		require.Contains(t, answerSDP, opts.answerFmtp)
++	}
++	require.NoError(t, conn.SetAnswer(answerSDP))
++
++	t.Cleanup(func() {
++		close(cam.stop)
++		cam.done.Wait()
++		_ = cam.pc.Close()
++		_ = conn.Close()
++	})
++	return conn, cam
++}
++
++var (
++	testSPS = []byte{0x67, 0x42, 0xe0, 0x1f, 0x8c, 0x8d, 0x40, 0x50, 0x1e, 0xd0}
++	testPPS = []byte{0x68, 0xce, 0x3c, 0x80}
++)
++
++func (cam *fakeCamera) send() {
++	defer cam.done.Done()
++
++	t := time.NewTicker(10 * time.Millisecond)
++	defer t.Stop()
++
++	// spropAfter and audioAfter count from the connection, not from the first
++	// write: packets written before it are dropped.
++	var start time.Time
++	var seq uint16
++	var ts uint32
++	for {
++		select {
++		case <-cam.stop:
++			return
++		case <-t.C:
++		}
++
++		if start.IsZero() {
++			if cam.pc.ConnectionState() != webrtc.PeerConnectionStateConnected {
++				continue
++			}
++			start = time.Now()
++		}
++
++		seq++
++		ts += 900
++
++		var payload []byte
++		if cam.spropAfter >= 0 && time.Since(start) >= cam.spropAfter && seq%20 == 0 {
++			// STAP-A carrying SPS + PPS, as libwebrtc bundles them ahead of an IDR
++			payload = []byte{24}
++			for _, nal := range [][]byte{testSPS, testPPS} {
++				payload = binary.BigEndian.AppendUint16(payload, uint16(len(nal)))
++				payload = append(payload, nal...)
++			}
++		} else {
++			payload = []byte{0x41, 0x9a, 0x00, 0x01} // non-IDR slice
++		}
++
++		if time.Since(start) >= cam.videoAfter {
++			_ = cam.video.WriteRTP(&rtp.Packet{
++				Header:  rtp.Header{Version: 2, Marker: true, SequenceNumber: seq, Timestamp: ts},
++				Payload: payload,
++			})
++		}
++		if cam.audio != nil && time.Since(start) >= cam.audioAfter {
++			_ = cam.audio.WriteRTP(&rtp.Packet{
++				Header:  rtp.Header{Version: 2, Marker: true, SequenceNumber: seq, Timestamp: uint32(seq) * 480},
++				Payload: []byte{0xfc, 0xff, 0xfe},
++			})
++		}
++	}
++}
++
++// waitPublishable calls the Nest dial gate when the Conn has one. It is
++// looked up through an interface so this file compiles against code without
++// the gate, where the test then shows the race the gate removes.
++func waitPublishable(t *testing.T, conn *Conn) {
++	t.Helper()
++	if g, ok := any(conn).(interface{ WaitNestVideo() error }); ok {
++		require.NoError(t, g.WaitNestVideo())
++	}
++}
++
++// Race 1: OnTrack appended sprop-parameter-sets to the published codec's
++// FmtpLine, and narrowed media.Codecs, while consumers read both (MatchMedia,
++// rtsp/mp4 Clone, h264.RTPDepay, Codec.MarshalJSON on /api/streams). The reads
++// below are what a consumer does once Dial has returned the Conn to the streams
++// layer. Audio starts late, so its track arrives after the Conn is published.
++func TestRace_NestSpropFmtpLine(t *testing.T) {
++	conn, _ := dialFakeCamera(t, "nest/webrtc", camOpts{audio: true, spropAfter: 300 * time.Millisecond, audioAfter: 1200 * time.Millisecond})
++	waitPublishable(t, conn)
++	audio := attachConsumer(t, conn, core.KindAudio, core.CodecOpus)
++
++	// keep reading until well after the audio track starts (1.2s after connecting)
++	fmtp := readVideoFmtp(conn, 2*time.Second)
++	require.Contains(t, fmtp, "sprop-parameter-sets=Z0LgH4yNQFAe0A==,aM48gA==")
++	require.Equal(t, 1, strings.Count(fmtp, "sprop-parameter-sets="))
++
++	// the consumer attached before the audio track existed must still get its packets
++	require.Eventually(t, func() bool { return audio.Load() > 0 }, 3*time.Second, 20*time.Millisecond,
++		"late audio track was not delivered to the consumer")
++}
++
++// attachConsumer wires a consumer that accepts codecName to conn the way
++// streams.AddConsumer does (MatchMedia, GetTrack, a Sender on the receiver), and
++// returns its count of received payload bytes. Call it before that track starts.
++func attachConsumer(t *testing.T, conn *Conn, kind, codecName string) *atomic.Int64 {
++	t.Helper()
++	want := &core.Media{Kind: kind, Direction: core.DirectionSendonly, Codecs: []*core.Codec{{Name: codecName}}}
++	for _, media := range conn.GetMedias() {
++		prodCodec, _ := media.MatchMedia(want)
++		if prodCodec == nil {
++			continue
++		}
++		track, err := conn.GetTrack(media, prodCodec)
++		require.NoError(t, err)
++
++		var n atomic.Int64
++		sender := core.NewSender(want, prodCodec)
++		sender.Handler = func(packet *rtp.Packet) { n.Add(int64(len(packet.Payload))) }
++		sender.HandleRTP(track)
++
++		// core.Receiver.Input ranges over its children without the lock that
++		// AppendChild and RemoveChild take, an upstream race outside these tests. So
++		// attach only before the track starts, and never detach: the sender's goroutine
++		// just idles until the test binary exits. GetTransceivers takes pion's pc.mu as
++		// a write lock, and the late OnTrack's getMediaCodec takes it again, which gives
++		// the race detector its edge from this attach to the first packet. The edge
++		// holds only if this runs before that OnTrack, which the callers' camOpts
++		// delays (audioAfter, videoAfter) arrange in wall-clock time.
++		_ = conn.pc.GetTransceivers()
++		return &n
++	}
++	t.Fatalf("no %s media offers %s", kind, codecName)
++	return nil
++}
++
++// readVideoFmtp reads every media's codecs as a consumer would, repeatedly for
++// d, and returns the last video FmtpLine it saw.
++func readVideoFmtp(conn *Conn, d time.Duration) (fmtp string) {
++	for deadline := time.Now().Add(d); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
++		for _, media := range conn.GetMedias() {
++			for _, codec := range media.Codecs {
++				clone := codec.Clone() // as pkg/rtsp/consumer.go
++				if media.Kind == core.KindVideo {
++					fmtp = clone.FmtpLine
++				}
++			}
++		}
++	}
++	return
++}
++
++// Race 2: GetTrack's lookup-or-append on Receivers ran unlocked, while OnTrack
++// calls it from one goroutine per remote track (and the streams layer from its own).
++func TestRace_GetTrackConcurrentAppend(t *testing.T) {
++	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
++	require.NoError(t, err)
++	conn := NewConn(pc)
++	conn.Mode = core.ModeActiveProducer
++	t.Cleanup(func() { _ = conn.Close() })
++
++	media := &core.Media{Kind: core.KindVideo, Direction: core.DirectionRecvonly}
++
++	const perWorker = 50
++	var wg sync.WaitGroup
++	for w := 0; w < 2; w++ {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for i := 0; i < perWorker; i++ {
++				_, _ = conn.GetTrack(media, &core.Codec{Name: core.CodecH264})
++			}
++		}()
++	}
++	wg.Wait()
++
++	require.Len(t, conn.Receivers, 2*perWorker) // none lost to a concurrent append
++}
++
++// Race 3: the promoted core.Connection.Stop iterated Receivers while a late
++// OnTrack could still be appending in GetTrack.
++func TestRace_StopWhileGetTrack(t *testing.T) {
++	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
++	require.NoError(t, err)
++	conn := NewConn(pc)
++	conn.Mode = core.ModeActiveProducer
++
++	media := &core.Media{Kind: core.KindVideo, Direction: core.DirectionRecvonly}
++	_, _ = conn.GetTrack(media, &core.Codec{Name: core.CodecH264})
++
++	started := make(chan struct{})
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		_, _ = conn.GetTrack(media, &core.Codec{Name: core.CodecH264})
++		close(started)
++		for i := 0; i < 2000; i++ {
++			_, _ = conn.GetTrack(media, &core.Codec{Name: core.CodecH264})
++		}
++	}()
++
++	<-started // every append after this one is concurrent with Stop
++	require.NoError(t, conn.Stop())
++	<-done
++}
++
++// Race 4: SetAnswer assigned c.Medias after SetRemoteDescription, which starts
++// the transports whose OnTrack reads c.Medias in getMediaCodec. Video only, and
++// not Nest, so the read loop has no other shared write to trip over.
++func TestRace_SetAnswerMediasBeforeOnTrack(t *testing.T) {
++	conn, _ := dialFakeCamera(t, "webrtc", camOpts{})
++	requireMediaThenClose(t, conn)
++}
++
++// Race 5: `c.Recv += n` ran in every track's read goroutine, so audio and video
++// raced each other. MarshalJSON must still report the total.
++func TestRace_RecvFromTwoTracks(t *testing.T) {
++	conn, _ := dialFakeCamera(t, "webrtc", camOpts{audio: true})
++	requireMediaThenClose(t, conn)
++}
++
++// requireMediaThenClose lets media flow, closes the Conn and checks that bytes
++// were counted. It reads the counter, not MarshalJSON, because MarshalJSON also
++// reads Receiver.Bytes, which core.Receiver writes per packet without a lock.
++func requireMediaThenClose(t *testing.T, conn *Conn) {
++	t.Helper()
++	time.Sleep(time.Second)
++	_ = conn.Close()
++	require.Greater(t, bytesRecv(conn), 0, "no media arrived")
++}
++
++// bytesRecv reads the fixed Conn's atomic counter. Through an interface so this
++// file compiles against the code before the fix, which only had the racy Recv.
++func bytesRecv(conn *Conn) int {
++	if r, ok := any(conn).(interface{ bytesRecv() int }); ok {
++		return r.bytesRecv()
++	}
++	return conn.Recv
++}
+diff --git a/pkg/webrtc/recv_json_test.go b/pkg/webrtc/recv_json_test.go
+new file mode 100644
+index 0000000..5dd0b93
+--- /dev/null
++++ b/pkg/webrtc/recv_json_test.go
+@@ -0,0 +1,23 @@
++package webrtc
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/pion/webrtc/v4"
++	"github.com/stretchr/testify/require"
++)
++
++// The read loops count into an atomic, not into Connection.Recv, so /api/streams
++// only sees the total if MarshalJSON copies it across.
++func TestMarshalJSONReportsBytesRecv(t *testing.T) {
++	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
++	require.NoError(t, err)
++	conn := NewConn(pc)
++	t.Cleanup(func() { _ = conn.Close() })
++
++	conn.recv.Add(1234)
++	b, err := conn.MarshalJSON()
++	require.NoError(t, err)
++	require.True(t, strings.Contains(string(b), `"bytes_recv":1234`), string(b))
 +}
