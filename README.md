@@ -20,7 +20,7 @@ This guide walks through the full setup from scratch: getting API access to your
 - **[`install.sh`](install.sh)** — one-shot installer for everything after your Google credentials. Re-running is safe but **not** a no-op: it recreates the go2rtc container (dropping every warm stream) and rewrites the warmer unit. If your go2rtc config does **not** live at the default `~/go2rtc-nest`, pass `--go2rtc-dir` — otherwise a re-run builds a fresh config at the default path and your existing one goes unused. see [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
 - **[`docker-compose.yml`](docker-compose.yml)** — the go2rtc + warmer half of the stack as Compose services.
 - **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches), `setup-google-device-access.sh` (automates Part 1 — the Google Cloud half of the credentials setup), `test-prebuffer-e2e.js` (end-to-end proof the prebuffer ring actually recovers pre-trigger footage — see [Testing the prebuffer](#testing-the-prebuffer)), and `check-drift.sh` (read-only; proves your deployment still matches this repo — see [Checking for drift](#checking-for-drift)).
-- **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), five plugin diffs against stock 1.1.24 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`), and `homebridge-plugin/new-files/PrebufferManager.js` (a new file, copied in rather than patched — it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)).
+- **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), five plugin diffs against stock 1.1.25 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`, `config.schema.json`), and `homebridge-plugin/new-files/PrebufferManager.js` (a new file, copied in rather than patched — it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)).
 
 The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-21)** — build from the stable tag **`nestfix-1.9.14-21`** (the tags are a branchless chain on top of upstream master, so build from the tag — there is no branch to check out.). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
 
@@ -53,15 +53,15 @@ There are four layers. Each builds on the last:
 | Google credentials in hand, plugin not installed | [Part 2](#part-2-homebridge-and-the-nest-plugin) | Part 1 |
 | Homebridge **and** the plugin working, tiles blank | [Quick start](#quick-start-automated--if-parts-1--2-are-already-done) (installer) or [Part 3](#part-3-go2rtc--warm-streams-and-snapshots) to do it by hand | Parts 1–2 |
 
-**You will need on the host:** Docker, plus `git`, `curl`, `python3`, `node` and `patch`. `node` and `patch` are used by the plugin patcher, which runs on the host even if Homebridge itself is in a container. systemd for the warmer service. Building go2rtc wants roughly 1–1.5 GB of free RAM.
+**You will need on the host:** Docker, plus `git`, `curl`, `python3` and `patch`. `python3` and `patch` are used by the plugin patcher, which runs on the host even if Homebridge itself is in a container; `node` is not needed on the host. systemd for the warmer service. Building go2rtc wants roughly 1–1.5 GB of free RAM.
 
-**The plugin must be exactly 1.1.24.** The patches are cut against it and the patcher refuses any other version — worth checking before you build anything.
+**The plugin must be exactly 1.1.25.** The patches are cut against it and the patcher refuses any other version — worth checking before you build anything.
 
 Whichever row you're on, the `vEncoder: "copy"` note in [Part 2](#part-2-homebridge-and-the-nest-plugin) is a one-line config change worth having.
 
 ## Quick start (automated) — if Parts 1 & 2 are already done
 
-Most of Google Device Access (Part 1) **can** be scripted, which this guide used to deny. [`scripts/setup-google-device-access.sh`](scripts/setup-google-device-access.sh) automates the Cloud project, the SDM and Pub/Sub APIs, the topic, the `sdm-publisher` IAM binding, the pull subscription and the token exchange. Only three things genuinely need a browser and a human: the **$5 Device Access registration** (it takes a payment), the **OAuth consent screen and client**, and **approving the authorization URL**. The script walks you to each page and waits. The approach is [@WeekendSuperhero's](https://github.com/WeekendSuperhero), from [potmat/homebridge-google-nest-sdm#209](https://github.com/potmat/homebridge-google-nest-sdm/pull/209). Once you have those credentials in a working **Homebridge + homebridge-google-nest-sdm 1.1.24** install, the rest is one script.
+Most of Google Device Access (Part 1) **can** be scripted, which this guide used to deny. [`scripts/setup-google-device-access.sh`](scripts/setup-google-device-access.sh) automates the Cloud project, the SDM and Pub/Sub APIs, the topic, the `sdm-publisher` IAM binding, the pull subscription and the token exchange. Only three things genuinely need a browser and a human: the **$5 Device Access registration** (it takes a payment), the **OAuth consent screen and client**, and **approving the authorization URL**. The script walks you to each page and waits. The approach is [@WeekendSuperhero's](https://github.com/WeekendSuperhero), from [potmat/homebridge-google-nest-sdm#209](https://github.com/potmat/homebridge-google-nest-sdm/pull/209). Once you have those credentials in a working **Homebridge + homebridge-google-nest-sdm 1.1.25** install, the rest is one script.
 
 **Option A — `install.sh`** (idempotent; builds the patched go2rtc image, sets up the tmpfs, generates the config, starts go2rtc, installs the warmer service, applies the plugin patches):
 
@@ -146,10 +146,10 @@ Then install the Nest plugin by [@potmat](https://github.com/potmat):
 
 ```bash
 # From the Homebridge UI (Settings > Plugins > Search), or:
-npm install homebridge-google-nest-sdm@1.1.24
+npm install homebridge-google-nest-sdm@1.1.25
 ```
 
-**Pin the version.** The patches in this repo are cut against **1.1.24** and `apply-snapshot-patch.sh` refuses to run against anything else, so an unpinned install that picks up a newer release will stop you at the patch step.
+**Pin the version.** The patches in this repo are cut against **1.1.25** and `apply-snapshot-patch.sh` refuses to run against anything else, so an unpinned install that picks up a newer release will stop you at the patch step. 1.1.25 is also the release that stops the plugin writing your OAuth token into `homebridge.log` when a Google API call fails ([PR #225](https://github.com/potmat/homebridge-google-nest-sdm/pull/225)), so don't stay on 1.1.24.
 
 Configure it with your Device Access credentials in Homebridge's `config.json`. The block goes in the top-level `platforms` array:
 
@@ -463,11 +463,11 @@ cd nest-homekit-cameras
 HOMEBRIDGE_DIR=/path/to/homebridge ./scripts/apply-snapshot-patch.sh
 ```
 
-The script pins the plugin version it was cut against (**1.1.24**) and **refuses to run on a different one** — the compiled `dist/` layout moves between releases, so a stale patch could silently break things. It's idempotent (safe to re-run) and **exits non-zero** if any patch is missing or won't apply, so a re-apply can never leave you half-patched. Want to see exactly what changes? Read the diffs in `patches/homebridge-plugin/`.
+The script pins the plugin version it was cut against (**1.1.25**) and **refuses to run on a different one** — the compiled `dist/` layout moves between releases, so a stale patch could silently break things. It's idempotent (safe to re-run) and **exits non-zero** if any patch is missing or won't apply, so a re-apply can never leave you half-patched. Want to see exactly what changes? Read the diffs in `patches/homebridge-plugin/`.
 
 **If you're on a different plugin version**, you have three options, in order of preference:
 
-1. **Install 1.1.24** (`npm install homebridge-google-nest-sdm@1.1.24`) and patch that. Simplest, and what this guide is tested against.
+1. **Install 1.1.25** (`npm install homebridge-google-nest-sdm@1.1.25`) and patch that. Simplest, and what this guide is tested against.
 2. **Open an issue** on this repo asking for the patches to be re-cut against your version.
 3. **Re-cut them yourself.** Take a pristine copy of your plugin's `dist/`, apply each hunk from `patches/homebridge-plugin/*.patch` by hand (they are small and commented), then `diff -u` pristine against patched to produce new `.patch` files, and bump `EXPECT_VER` in `apply-snapshot-patch.sh`. Check the [Related Issues and PRs](#related-issues-and-prs) list first — if a patch has since been merged upstream, you may not need it at all.
 
@@ -743,7 +743,7 @@ docker logs homebridge 2>&1 | grep "Using local go2rtc RTSP"
 
 If it appears, live view is coming from the warm stream. If instead you see the plugin opening a Google dial, `go2rtcKey` didn't match a stream name — compare the accessory name against the stream names in `curl -s http://127.0.0.1:1985/api/streams`.
 
-To undo Part 6: reinstall the plugin (`npm install homebridge-google-nest-sdm@1.1.24`) and don't re-run the patch script. That reverts all five patches and removes `PrebufferManager.js`, so re-apply them if you still want the snapshot fix — there is no per-patch switch.
+To undo Part 6: reinstall the plugin (`npm install homebridge-google-nest-sdm@1.1.25`) and don't re-run the patch script. That reverts all five patches and removes `PrebufferManager.js`, so re-apply them if you still want the snapshot fix — there is no per-patch switch.
 
 ### When go2rtc receives but forwards nothing — check this FIRST
 
@@ -1042,7 +1042,7 @@ covers the go2rtc side, which it did not used to. On every run it reports whethe
 binary is patched and whether its revision matches the fork tag this repo ships; a mismatch
 reads `WRONG BUILD` and names both revisions. Adding `--deep` also verifies that all 16 files
 in `patches/go2rtc-nest.patch` match that tag, and separately reproduces the plugin's `dist/`
-from stock 1.1.24 plus the repo's patches.
+from stock 1.1.25 plus the repo's patches.
 
 That check exists because the blind spot was not hypothetical: the keyframe-watchdog fix
 (4s → 60s) lived in `patches/go2rtc-nest.patch` here for days while the fork tag the guide told
@@ -1095,6 +1095,7 @@ or the box may be ahead and carrying an undeployed hotfix (commit it).
 - [homebridge-google-nest-sdm PR #224](https://github.com/potmat/homebridge-google-nest-sdm/pull/224) — reset the recording session in a `finally` (follow-up to #223) — **open**; still carried here in `StreamingDelegate.js.patch`
 - [homebridge-google-nest-sdm PR #218](https://github.com/potmat/homebridge-google-nest-sdm/pull/218) by [@littlepope81](https://github.com/littlepope81) — hardens the Pub/Sub handler against `relationUpdate`/malformed events ([issue #214](https://github.com/potmat/homebridge-google-nest-sdm/issues/214)) — **merged in 1.1.24** (this repo's `Api.js.patch` now reuses the base guard and only adds reconnect)
 - [homebridge-google-nest-sdm PR #219](https://github.com/potmat/homebridge-google-nest-sdm/pull/219) by [@littlepope81](https://github.com/littlepope81) — drops replayed/stale events so a reconnect/restart backlog can't fire phantom motion/recordings — **merged in 1.1.24** (this repo relies on the base plugin's version; the standalone Camera.js/Doorbell.js stale-event patches were dropped once it merged)
+- [homebridge-google-nest-sdm PR #225](https://github.com/potmat/homebridge-google-nest-sdm/pull/225) by [@littlepope81](https://github.com/littlepope81) — stops Google API errors writing the OAuth Bearer token (and the event-image token) into `homebridge.log` — **merged in 1.1.25**, which is why the patches here are now cut against 1.1.25
 
 - [homebridge-google-nest-sdm #231](https://github.com/potmat/homebridge-google-nest-sdm/issues/231) — `MAX_EVENT_AGE_SECONDS = 30` discards real events, because Pub/Sub first deliveries are routinely 46-57s late — **open**; this repo raises the gate to 120s in `Camera.js.patch`
 - [homebridge-google-nest-sdm #232](https://github.com/potmat/homebridge-google-nest-sdm/issues/232) — HKSV clips truncated by x264 lookahead/B-frames, which a live source can never recover from — **open**; now moot on the go2rtc path, which no longer encodes at all

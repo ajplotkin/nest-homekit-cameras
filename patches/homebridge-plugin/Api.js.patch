@@ -1,6 +1,6 @@
 --- a/dist/sdm/Api.js
 +++ b/dist/sdm/Api.js
-@@ -34,6 +34,8 @@
+@@ -35,6 +35,8 @@
  class SmartDeviceManagement {
      constructor(config, log) {
          this.subscribed = true;
@@ -9,7 +9,7 @@
          this.log = log;
          this.oauth2Client = new google.Auth.OAuth2Client(config.clientId, config.clientSecret);
          this.projectId = config.projectId;
-@@ -58,23 +60,75 @@
+@@ -59,23 +61,75 @@
                      refresh_token: config.refreshToken
                  }
              });
@@ -95,7 +95,7 @@
                      const resourceUpdate = event.resourceUpdate;
                      if (!resourceUpdate) {
                          this.log.debug(event.relationUpdate
-@@ -99,14 +153,25 @@
+@@ -100,14 +154,25 @@
                      this.log.error('Could not handle event: ', (_a = error === null || error === void 0 ? void 0 : error.message) !== null && _a !== void 0 ? _a : error);
                  }
              });
@@ -126,7 +126,7 @@
          }
      }
      async list_devices() {
-@@ -140,4 +205,8 @@
+@@ -141,4 +206,8 @@
      }
  }
  exports.SmartDeviceManagement = SmartDeviceManagement;
