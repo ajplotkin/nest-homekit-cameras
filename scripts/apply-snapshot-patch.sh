@@ -133,10 +133,11 @@ if [ "$applied" = 1 ]; then
   echo "Done. Reload the plugin WITHOUT restarting the container:"
   echo "    docker exec $CONTAINER pkill -x homebridge"
   echo
-  echo "  Do NOT run 'docker restart $CONTAINER'. The image reinstalls plugins on"
-  echo "  container start, which deletes every patch just applied -- including"
-  echo "  dist/PrebufferManager.js. Killing the homebridge process instead lets s6"
-  echo "  respawn it in place: new code is loaded, the patches survive."
+  echo "  Prefer this to 'docker restart $CONTAINER'. Every container start runs npm install"
+  echo "  against Homebridge's package.json; if the pinned plugin version differs from the"
+  echo "  installed one, npm reinstalls the plugin and deletes every patch just applied --"
+  echo "  including dist/PrebufferManager.js. Killing the homebridge process lets s6 respawn"
+  echo "  it in place without that step: new code is loaded, the patches survive."
 else
   echo "All patches already present; nothing to do."
 fi
