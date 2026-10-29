@@ -1,5 +1,5 @@
---- a/config.schema.json	2026-08-06 19:40:06
-+++ b/config.schema.json	2026-08-06 19:40:06
+--- a/config.schema.json
++++ b/config.schema.json
 @@ -69,7 +69,25 @@
          "type": "integer",
          "required": false,

@@ -1,6 +1,6 @@
 --- a/dist/sdm/Camera.js
 +++ b/dist/sdm/Camera.js
-@@ -43,6 +43,23 @@
+@@ -44,6 +44,23 @@
      async getSnapshot() {
          if (this.image)
              return this.image;
@@ -24,7 +24,7 @@
          //Nest cams do not have any method to get a current snapshot,
          //starting streams up just to retrieve one is slow and will cause
          //the SDM API to hit a rate limit of creating too many streams
-@@ -130,21 +147,25 @@
+@@ -131,21 +148,25 @@
      }
      isEventStale(event) {
          const ageSeconds = (Date.now() - new Date(event.timestamp).getTime()) / 1000;
@@ -55,7 +55,7 @@
          if (this.isEventStale(event))
              return;
          lodash_1.default.forEach(event.resourceUpdate.events, (value, key) => {
-@@ -153,16 +174,30 @@
+@@ -154,16 +175,30 @@
                  case Events.Constants.CameraPerson:
                      if (event.eventThreadState && event.eventThreadState != Events_1.ThreadStateType.STARTED)
                          return;
@@ -87,7 +87,7 @@
                                      this.onMotion();
                              });
                          }
-@@ -183,5 +218,12 @@
+@@ -184,5 +219,12 @@
      }
  }
  exports.Camera = Camera;

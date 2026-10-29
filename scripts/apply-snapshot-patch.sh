@@ -18,12 +18,15 @@ PATCH_DIR="${PATCH_DIR:-$SCRIPT_DIR/../patches/homebridge-plugin}"
 HOMEBRIDGE_DIR="${HOMEBRIDGE_DIR:-$HOME/homebridge}"
 PLUGIN="${PLUGIN:-$HOMEBRIDGE_DIR/node_modules/homebridge-google-nest-sdm}"
 CONTAINER="${HOMEBRIDGE_CONTAINER:-homebridge}"
-EXPECT_VER="1.1.24"
+EXPECT_VER="1.1.25"
 
 [ -d "$PLUGIN" ] || { echo "ERROR: plugin not found at $PLUGIN (set HOMEBRIDGE_DIR)"; exit 1; }
 [ -d "$PATCH_DIR" ] || { echo "ERROR: patch dir not found at $PATCH_DIR"; exit 1; }
 
-CUR_VER=$(node -e "console.log(require('$PLUGIN/package.json').version)" 2>/dev/null)
+# python3 first: the Pi HOST has no node (only the container does), so a node-only read came back
+# empty and the script refused with "plugin is ''" on the host it exists to recover. (2026-10-29)
+CUR_VER=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['version'])" "$PLUGIN/package.json" 2>/dev/null \
+  || node -e "console.log(require(process.argv[1]).version)" "$PLUGIN/package.json" 2>/dev/null)
 if [ "$CUR_VER" != "$EXPECT_VER" ]; then
   echo "REFUSING: plugin is '$CUR_VER' but these patches were cut from $EXPECT_VER."
   echo "The compiled dist/ layout moves between releases — re-cut the diffs against"
@@ -41,6 +44,9 @@ fi
 # stock — Camera.js uses 'nest-snaps'. (Camera.js.patch DOES still modify stale-event
 # handling: it raises MAX_EVENT_AGE_SECONDS 30->120 and adds a throttled drop warning, per
 # issue #231. Upstream's isEventStale from PR #219 is the base it builds on.)
+# 1.1.25 (2026-10-29) added upstream #225 (token-safe API error logging, new dist/sdm/ApiError.js).
+# Re-cut against it: only line numbers moved in Api.js / Camera.js; config.schema.json.patch only
+# lost its ---/+++ header timestamps.
 applied=0
 failed=0
 

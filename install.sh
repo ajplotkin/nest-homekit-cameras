@@ -11,7 +11,7 @@
 #
 # Prereqs you must already have (see the guide, Parts 1–2):
 #   - Docker
-#   - Homebridge running with homebridge-google-nest-sdm 1.1.24 configured
+#   - Homebridge running with homebridge-google-nest-sdm 1.1.25 configured
 #     (clientId/clientSecret/projectId/refreshToken in its config.json)
 #
 # Usage:
@@ -39,7 +39,7 @@ FORK_URL="${FORK_URL:-https://github.com/ajplotkin/go2rtc.git}"
 # (build from the tag; the nestfix tags are a branchless chain and no dev branch exists)
 FORK_BRANCH="${FORK_BRANCH:-nestfix-1.9.14-21}"
 BASE_IMAGE="${BASE_IMAGE:-alexxit/go2rtc:1.9.14}"
-PLUGIN_VER="1.1.24"
+PLUGIN_VER="1.1.25"
 REBUILD=0
 DRY_RUN=0
 
@@ -74,10 +74,12 @@ if ! docker info >/dev/null 2>&1; then DOCKER="sudo docker"; fi
 
 # ---- phase 0: preflight -----------------------------------------------------
 say "Preflight checks"
-# node and patch are needed by the plugin-patch phase. Checking them here rather than
-# there: without node, the version probe returns empty and you get "REFUSING: plugin is
-# ''" long after containers and services are already up.
-for c in git curl python3 node patch; do command -v "$c" >/dev/null 2>&1 || die "$c not found (install it first)"; done
+# python3 and patch are needed by the plugin-patch phase, so check them here: a missing one
+# used to surface as "REFUSING: plugin is ''" long after containers and services were up.
+# node is NOT needed on the host: the patcher reads the plugin version with python3 (node
+# only as a fallback), and a Homebridge-in-Docker host usually has no node outside the
+# container. Requiring it here refused to install on exactly that host. (2026-10-29)
+for c in git curl python3 patch; do command -v "$c" >/dev/null 2>&1 || die "$c not found (install it first)"; done
 $DOCKER info >/dev/null 2>&1 || die "cannot talk to docker (need sudo or docker group)"
 [ -f "$HB_CONFIG" ] || die "Homebridge config not found: $HB_CONFIG (pass --hb-config)"
 python3 - "$HB_CONFIG" <<'PY' || die "no homebridge-google-nest-sdm platform (with clientId/refreshToken) in the config"
