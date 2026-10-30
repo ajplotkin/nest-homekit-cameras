@@ -394,6 +394,18 @@ echo
 # Compares only the files the patch touches. The tag's diff against v1.9.14 covers ~109
 # files, but the rest is upstream dev churn (website, README, xiaomi/tutk/kasa) that this
 # patch deliberately does not carry.
+# md5 is macOS-only and md5sum Linux-only. With neither, both hashes below were empty
+# strings, "" = "" held, and every file read as matching: a false green on Linux.
+hash_stdin() {
+  if command -v md5sum >/dev/null 2>&1; then md5sum | cut -d' ' -f1
+  elif command -v md5 >/dev/null 2>&1; then md5 -q
+  else echo "no-hash-tool-$RANDOM$RANDOM"; fi
+}
+if [ "$DEEP" = "1" ] && ! command -v gh >/dev/null 2>&1; then
+  echo "Repo go2rtc patch vs fork tag"
+  printf "  %-34s %sskipped%s: needs the GitHub CLI (gh) to fetch the fork tag's diff\n" "go2rtc-nest.patch" "$YEL" "$OFF"
+  echo
+fi
 if [ "$DEEP" = "1" ] && command -v gh >/dev/null 2>&1; then
   echo "Repo go2rtc patch vs fork tag"
   G2P="$REPO_DIR/patches/go2rtc-nest.patch"
@@ -408,8 +420,8 @@ if [ "$DEEP" = "1" ] && command -v gh >/dev/null 2>&1; then
       MISMATCH=""; NCHECK=0
       for pf in $(grep '^+++ b/' "$G2P" | sed 's|^+++ b/||' | sort -u); do
         NCHECK=$((NCHECK + 1))
-        a="$(awk -v F="$pf" '/^\+\+\+ b\//{on=($3=="b/"F)} on && /^[-+ ]/ && !/^(\+\+\+|---)/' "$G2P" | md5)"
-        b="$(awk -v F="$pf" '/^\+\+\+ b\//{on=($3=="b/"F)} on && /^[-+ ]/ && !/^(\+\+\+|---)/' "$TAGDIFF" | md5)"
+        a="$(awk -v F="$pf" '/^\+\+\+ b\//{on=($2=="b/"F)} on && /^[-+ ]/ && !/^(\+\+\+|---)/' "$G2P" | hash_stdin)"
+        b="$(awk -v F="$pf" '/^\+\+\+ b\//{on=($2=="b/"F)} on && /^[-+ ]/ && !/^(\+\+\+|---)/' "$TAGDIFF" | hash_stdin)"
         [ "$a" = "$b" ] || MISMATCH="$MISMATCH $pf"
       done
       if [ -z "$MISMATCH" ]; then
