@@ -16,8 +16,8 @@
 #   ./check-drift.sh                                  # everything on this machine
 #   ./check-drift.sh --host you@your-pi.local   # everything on a remote Pi
 #   ./check-drift.sh --deep --host pi        # also prove the patches reproduce dist/
-#   ./check-drift.sh --host pi --homebridge /home/adamandaj/volumes/homebridge \
-#                    --scripts /home/adamandaj/scripts
+#   ./check-drift.sh --host pi --homebridge /home/you/homebridge \
+#                    --scripts /home/you/scripts
 #
 # With --host the install locations are resolved ON THE REMOTE (~/volumes/homebridge,
 # ~/homebridge, /var/lib/homebridge are probed in that order), so --homebridge and
@@ -401,8 +401,8 @@ echo
 #   * go2rtc stream keys -- the plugin derives them by slugifying the camera's room name
 #     and never checks that go2rtc serves them, so a Google Home rename kills a camera
 #     with no drift anywhere. (Values are never printed: config.json holds OAuth secrets.)
-#   * systemd units -- ~/scripts/systemd-units/ is what the config tarball captures, but
-#     /etc/systemd/system/ is what actually runs.
+#   * systemd units -- if you keep a copy of the unit files in <scripts>/systemd-units/ (to
+#     restore from), /etc/systemd/system/ is still what actually runs.
 # --- 2b. repo go2rtc patch  <->  fork tag ------------------------------------
 # The generation check above proves the RUNNING BINARY matches the fork tag. It says
 # nothing about whether this repo's go2rtc-nest.patch still matches that tag -- and those
@@ -496,17 +496,27 @@ else
   printf "  %-34s %sAPI unreachable%s\n" "go2rtc streams" "$YEL" "$OFF"; missing=$((missing + 1))
 fi
 
-# Units: staged copy (what the tarball restores) vs /etc (what actually runs), plus enabled.
-UNIT_DIFF="$(rexec "for u in \$(ls /home/adamandaj/scripts/systemd-units/*.service 2>/dev/null); do n=\$(basename \$u); if ! sudo diff -q \$u /etc/systemd/system/\$n >/dev/null 2>&1; then echo \$n; fi; done" | tr -d '\r' | tr '\n' ' ' | sed 's/ *$//')"
-if [ -z "$UNIT_DIFF" ]; then
-  printf "  %-34s %sstaged copies match /etc%s\n" "systemd units" "$GRN" "$OFF"
+# Units: your kept copy in <scripts>/systemd-units/ (what you would restore from) vs /etc (what
+# actually runs). This path used to be hardcoded to the author's home, so on any other box no
+# copies were found and the check reported "match" without comparing anything.
+# "N=" prefix: an ssh failure leaves stdout empty, which must not read as "no copies".
+UNIT_N="$(rexec "echo N=\$(ls '$SCRIPTS_DIR'/systemd-units/*.service 2>/dev/null | wc -l)" | tr -d ' \r' | sed -n 's/^N=\([0-9][0-9]*\)$/\1/p')"
+UNIT_DIFF="$(rexec "for u in '$SCRIPTS_DIR'/systemd-units/*.service; do [ -e \"\$u\" ] || continue; n=\$(basename \"\$u\"); sudo diff -q \"\$u\" \"/etc/systemd/system/\$n\" >/dev/null 2>&1 || echo \"\$n\"; done" | tr -d '\r' | tr '\n' ' ' | sed 's/ *$//')"
+if [ -z "$UNIT_N" ]; then
+  printf "  %-34s %scould not read%s %s(%s/systemd-units/)%s\n" "systemd units" "$YEL" "$OFF" "$DIM" "$SCRIPTS_DIR" "$OFF"
+  missing=$((missing + 1))
+elif [ "$UNIT_N" -eq 0 ]; then
+  printf "  %-34s %sskipped%s %s(no kept copies in %s/systemd-units/)%s\n" "systemd units" "$YEL" "$OFF" "$DIM" "$SCRIPTS_DIR" "$OFF"
+elif [ -z "$UNIT_DIFF" ]; then
+  printf "  %-34s %s%s kept copies match /etc%s\n" "systemd units" "$GRN" "$UNIT_N" "$OFF"
+  checked=$((checked + 1))
 else
   printf "  %-34s %sDIFFER%s: %s\n" "systemd units" "$RED" "$OFF" "$UNIT_DIFF"
-  printf "      %s~/scripts/systemd-units/ is what the backup tarball restores; /etc is\n" "$DIM"
-  printf "      what runs. A restore would put back the wrong unit.%s\n" "$OFF"
+  printf "      %s%s/systemd-units/ is what you would restore from; /etc is what\n" "$DIM" "$SCRIPTS_DIR"
+  printf "      runs. A restore would put back the wrong unit.%s\n" "$OFF"
   drift=$((drift + 1))
+  checked=$((checked + 1))
 fi
-checked=$((checked + 1))
 echo
 
 echo "Stale whole-file patch blobs"
