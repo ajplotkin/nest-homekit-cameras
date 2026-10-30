@@ -270,15 +270,21 @@ else
       fi
     else
       # Degrade to the old name check rather than failing: no network (git ls-remote) or the
-      # API unreachable are both ordinary, and neither is evidence of drift.
-      case "$G_IMAGE" in
-        *"${WANT_TAG##*-}"*)
-          printf "  %-34s %sname looks current%s %s(rev check unavailable)%s\n" "generation" "$YEL" "$OFF" "$DIM" "$OFF" ;;
-        *)
-          printf "  %-34s %sIMAGE PREDATES %s%s %s(rev check unavailable)%s\n" "generation" "$YEL" "$WANT_TAG" "$OFF" "$DIM" "$OFF" ;;
-      esac
-      printf "      %sCould not prove the build: %s.%s\n" "$DIM" \
-        "$([ -z "$G_REV" ] && echo "go2rtc API unreachable" || echo "could not resolve $WANT_TAG (offline?)")" "$OFF"
+      # API unreachable are both ordinary, and neither is evidence of drift. A binary that
+      # answers but carries no revision gets no name guess: its name proves nothing either.
+      if [ -z "$G_REV" ] && rexec "curl -s --max-time 8 http://127.0.0.1:${GO2RTC_API_PORT:-1985}/api 2>/dev/null" | grep -q '"version"'; then
+        printf "  %-34s %sunproven%s %s(no revision in the binary)%s\n" "generation" "$YEL" "$OFF" "$DIM" "$OFF"
+        G_WHY="the binary carries no git revision (built without git, e.g. in golang:*-alpine; rebuild with install.sh --rebuild)"
+      else
+        case "$G_IMAGE" in
+          *"${WANT_TAG##*-}"*)
+            printf "  %-34s %sname looks current%s %s(rev check unavailable)%s\n" "generation" "$YEL" "$OFF" "$DIM" "$OFF" ;;
+          *)
+            printf "  %-34s %sIMAGE PREDATES %s%s %s(rev check unavailable)%s\n" "generation" "$YEL" "$WANT_TAG" "$OFF" "$DIM" "$OFF" ;;
+        esac
+        if [ -z "$G_REV" ]; then G_WHY="go2rtc API unreachable"; else G_WHY="could not resolve $WANT_TAG (offline?)"; fi
+      fi
+      printf "      %sCould not prove the build: %s.%s\n" "$DIM" "$G_WHY" "$OFF"
     fi
   fi
   checked=$((checked + 1))
@@ -394,16 +400,10 @@ echo
 # Compares only the files the patch touches. The tag's diff against v1.9.14 covers ~109
 # files, but the rest is upstream dev churn (website, README, xiaomi/tutk/kasa) that this
 # patch deliberately does not carry.
-# md5 is macOS-only and md5sum Linux-only. With neither, both hashes below were empty
-# strings, "" = "" held, and every file read as matching: a false green on Linux.
-hash_stdin() {
-  if command -v md5sum >/dev/null 2>&1; then md5sum | cut -d' ' -f1
-  elif command -v md5 >/dev/null 2>&1; then md5 -q
-  else echo "no-hash-tool-$RANDOM$RANDOM"; fi
-}
 if [ "$DEEP" = "1" ] && ! command -v gh >/dev/null 2>&1; then
   echo "Repo go2rtc patch vs fork tag"
   printf "  %-34s %sskipped%s: needs the GitHub CLI (gh) to fetch the fork tag's diff\n" "go2rtc-nest.patch" "$YEL" "$OFF"
+  missing=$((missing+1))
   echo
 fi
 if [ "$DEEP" = "1" ] && command -v gh >/dev/null 2>&1; then
@@ -420,9 +420,12 @@ if [ "$DEEP" = "1" ] && command -v gh >/dev/null 2>&1; then
       MISMATCH=""; NCHECK=0
       for pf in $(grep '^+++ b/' "$G2P" | sed 's|^+++ b/||' | sort -u); do
         NCHECK=$((NCHECK + 1))
-        a="$(awk -v F="$pf" '/^\+\+\+ b\//{on=($2=="b/"F)} on && /^[-+ ]/ && !/^(\+\+\+|---)/' "$G2P" | hash_stdin)"
-        b="$(awk -v F="$pf" '/^\+\+\+ b\//{on=($2=="b/"F)} on && /^[-+ ]/ && !/^(\+\+\+|---)/' "$TAGDIFF" | hash_stdin)"
-        [ "$a" = "$b" ] || MISMATCH="$MISMATCH $pf"
+        # Compare the extracted bodies directly. This used `md5` (macOS-only) and selected the
+        # file with $3, which on a "+++ b/path" line is empty: both sides were always empty,
+        # so every file "matched" whatever the patch said. $2 is the path.
+        awk -v F="$pf" '/^\+\+\+ b\//{on=($2=="b/"F)} on && /^[-+ ]/ && !/^(\+\+\+|---)/' "$G2P" > "$WORK/g2p.body"
+        awk -v F="$pf" '/^\+\+\+ b\//{on=($2=="b/"F)} on && /^[-+ ]/ && !/^(\+\+\+|---)/' "$TAGDIFF" > "$WORK/tag.body"
+        if [ ! -s "$WORK/g2p.body" ] || ! cmp -s "$WORK/g2p.body" "$WORK/tag.body"; then MISMATCH="$MISMATCH $pf"; fi
       done
       if [ -z "$MISMATCH" ]; then
         printf "  %-34s %sall %s files match %s%s\n" "go2rtc-nest.patch" "$GRN" "$NCHECK" "$WANT_TAG" "$OFF"
@@ -434,11 +437,12 @@ if [ "$DEEP" = "1" ] && command -v gh >/dev/null 2>&1; then
         drift=$((drift + 1))
       fi
       checked=$((checked + 1))
+      verified=$((verified + 1))
     else
       printf "  %-34s %scould not fetch tag diff%s (offline?)\n" "go2rtc-nest.patch" "$YEL" "$OFF"
+      missing=$((missing+1))
     fi
   fi
-  verified=$((verified + 1))
   echo
 fi
 

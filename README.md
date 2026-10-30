@@ -19,7 +19,7 @@ This guide walks through the full setup from scratch: getting API access to your
 - **This README** — the complete, from-scratch guide (start here and read top to bottom).
 - **[`install.sh`](install.sh)** — one-shot installer for everything after your Google credentials. Re-running is safe but **not** a no-op: it recreates the go2rtc container (dropping every warm stream) and rewrites the warmer unit. If your go2rtc config does **not** live at the default `~/go2rtc-nest`, pass `--go2rtc-dir` — otherwise a re-run builds a fresh config at the default path and your existing one goes unused. see [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
 - **[`docker-compose.yml`](docker-compose.yml)** — the go2rtc + warmer half of the stack as Compose services.
-- **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches), `setup-google-device-access.sh` (automates Part 1 — the Google Cloud half of the credentials setup), `test-prebuffer-e2e.js` (end-to-end proof the prebuffer ring actually recovers pre-trigger footage — see [Testing the prebuffer](#testing-the-prebuffer)), `check-drift.sh` (read-only; proves your deployment still matches this repo — see [Checking for drift](#checking-for-drift)), `go2rtc-wedge-detector.py` (spots and optionally restarts a go2rtc stream that receives but stops forwarding — see [When go2rtc receives but forwards nothing](#when-go2rtc-receives-but-forwards-nothing--check-this-first)), and `pi/backup-configs.sh` (the author's own nightly config backup for the Pi, included as an example; its paths are specific to that box, so edit `SRC` and `DEST` before using it).
+- **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches), `setup-google-device-access.sh` (automates Part 1 — the Google Cloud half of the credentials setup), `test-prebuffer-e2e.js` (end-to-end proof the prebuffer ring actually recovers pre-trigger footage — see [Testing the prebuffer](#testing-the-prebuffer)), `check-drift.sh` (read-only; proves your deployment still matches this repo — see [Checking for drift](#checking-for-drift)), `go2rtc-wedge-detector.py` (spots and optionally restarts a go2rtc stream that receives but stops forwarding — see [When go2rtc receives but forwards nothing](#when-go2rtc-receives-but-forwards-nothing--check-this-first)), and `pi/backup-configs.sh` (the author's own config backup for the Pi, run by hand, included as an example; its paths are specific to that box, so edit `SRC` and `DEST` before using it).
 - **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), five plugin diffs against stock 1.1.25 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`, `config.schema.json`), and `homebridge-plugin/new-files/PrebufferManager.js` (a new file, copied in rather than patched — it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)).
 
 The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-21)** — build from the stable tag **`nestfix-1.9.14-21`** (the tags are a branchless chain on top of upstream master, so build from the tag — there is no branch to check out). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
@@ -154,7 +154,7 @@ npm install --save-exact homebridge-google-nest-sdm@1.1.25
 
 Or install it from the Homebridge UI (Plugins → search → choose version 1.1.25), then make the pin exact as described next.
 
-**Pin the version, exactly.** The patches in this repo are cut against **1.1.25** and `apply-snapshot-patch.sh` refuses to run against anything else, so an install that picks up a newer release will stop you at the patch step. Open Homebridge's `package.json` (in `/path/to/homebridge`, the directory mounted at `/homebridge`) and check the line reads `"homebridge-google-nest-sdm": "1.1.25"` with no `^` in front. The Homebridge UI, and `npm install` without `--save-exact`, both write `"^1.1.25"`; with a caret, the next container start after upstream publishes 1.1.26 upgrades the plugin and silently removes every patch (see [Part 5](#part-5-verify)). 1.1.25 is also the release that stops the plugin writing your OAuth token into `homebridge.log` when a Google API call fails ([PR #225](https://github.com/potmat/homebridge-google-nest-sdm/pull/225)), so don't stay on 1.1.24.
+**Pin the version, exactly.** The patches in this repo are cut against **1.1.25** and `apply-snapshot-patch.sh` refuses to run against anything else, so an install that picks up a newer release will stop you at the patch step. Open Homebridge's `package.json` (in `/path/to/homebridge`, the directory mounted at `/homebridge`) and check the line reads `"homebridge-google-nest-sdm": "1.1.25"` with no `^` in front. `npm install` without `--save-exact` writes `"^1.1.25"`, and so does the Homebridge UI, which installs plugins with `--save`; with a caret, the next container start after upstream publishes 1.1.26 upgrades the plugin and silently removes every patch (see [Part 5](#part-5-verify)). 1.1.25 is also the release that stops the plugin writing your OAuth token into `homebridge.log` when a Google API call fails ([PR #225](https://github.com/potmat/homebridge-google-nest-sdm/pull/225)), so don't stay on 1.1.24.
 
 Configure it with your Device Access credentials in Homebridge's `config.json`. The block goes in the top-level `platforms` array:
 
@@ -245,10 +245,16 @@ git checkout nestfix-1.9.14-21   # the release tag; the fork has no release bran
 ```bash
 # Build natively on a Pi (arm64, ~3 min). On a 2 GB Pi this can exhaust RAM and take
 # running services down with it — stop other containers first, or cross-compile elsewhere:
-docker run --rm -v "$PWD":/src -w /src \
-  -e GOCACHE=/tmp/gocache -e GOMODCACHE=/tmp/gomod \
-  golang:1.24-alpine sh -c \
+echo go2rtc_patched >> .git/info/exclude   # so a rebuild here doesn't stamp the binary "dirty"
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src \
+  -e HOME=/tmp -e GOCACHE=/tmp/gocache -e GOMODCACHE=/tmp/gomod \
+  -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/src \
+  golang:1.24 sh -c \
   "CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o go2rtc_patched ."
+# golang:1.24 rather than -alpine: it has git, so the build records the commit and
+# go2rtc's /api reports it (check-drift.sh compares it to the tag). --user keeps the
+# output yours; safe.directory stops git refusing a tree owned by another uid, which
+# would otherwise fail the build with "error obtaining VCS status".
 ```
 
 Create a Docker image using [@AlexxIT](https://github.com/AlexxIT)'s base (which provides the ffmpeg needed for JPEG transcoding):
@@ -469,7 +475,7 @@ cd nest-homekit-cameras
 HOMEBRIDGE_DIR=/path/to/homebridge ./scripts/apply-snapshot-patch.sh
 ```
 
-With Homebridge in Docker, npm runs as root inside the container, so the plugin's files are usually root-owned on the host and the script can't write them. If it reports a permissions failure, run it with `sudo`: `sudo HOMEBRIDGE_DIR=/path/to/homebridge ./scripts/apply-snapshot-patch.sh`. (`install.sh` checks for this and uses `sudo` for that step itself.)
+With Homebridge in Docker, npm runs as root inside the container, so the plugin's files are usually root-owned on the host and the script can't write them. If it reports a permissions failure, run it with `sudo`: `sudo env HOMEBRIDGE_DIR=/path/to/homebridge bash ./scripts/apply-snapshot-patch.sh`. (`install.sh` checks for this and uses `sudo` for that step itself.)
 
 The script pins the plugin version it was cut against (**1.1.25**) and **refuses to run on a different one** — the compiled `dist/` layout moves between releases, so a stale patch could silently break things. It's idempotent (safe to re-run) and **exits non-zero** if any patch is missing or won't apply, so a re-apply can never leave you half-patched. Want to see exactly what changes? Read the diffs in `patches/homebridge-plugin/`.
 
@@ -481,7 +487,7 @@ The script pins the plugin version it was cut against (**1.1.25**) and **refuses
 
 > **`PrebufferManager.js` is the exception to all of the above** — it is a whole file, not a diff, so there is nothing to re-cut and `patch` will never warn you that it has gone stale. On a new plugin release, check two things by hand: that `StreamingDelegate.js` still calls it the same way, and that upstream has not shipped its own prebuffer (see [#240](https://github.com/potmat/homebridge-google-nest-sdm/pull/240)) — if it has, drop ours rather than layering them. Then run `node test/prebuffer-noise.test.js` (it needs `node`, so run it on a workstation or inside the Homebridge container), which asserts the retry logging stays throttled both for a camera that was already off at startup and for one switched off after it had been streaming. It fakes ffmpeg, the clock and the timers, so it needs nothing running and finishes in about a second; it exits non-zero on failure. (The other automated checks here are [`scripts/check-drift.sh`](scripts/check-drift.sh), which compares the Pi against this repo, and [`scripts/test-prebuffer-e2e.js`](scripts/test-prebuffer-e2e.js), which needs a live restreamer.)
 
-> **These patches live in `node_modules` and are wiped by any `npm install` of the plugin.** Re-run `apply-snapshot-patch.sh` after any plugin install or upgrade — always in that order: `npm install` first, patch script second. (That is also how you *uninstall* them: reinstall the plugin and don't re-run the patcher.)
+> **These patches live in `node_modules` and are wiped by any `npm install` that names the plugin** (`npm install homebridge-google-nest-sdm@…`), even at the same version. Re-run `apply-snapshot-patch.sh` after any plugin install or upgrade — always in that order: `npm install` first, patch script second. (That is also how you *uninstall* them: reinstall the plugin and don't re-run the patcher.)
 >
 > **This applies all five patches plus one new file, including the Part 6 live-view routing** — the script has no per-patch switch. If you don't want Part 6, read it first and be aware Homebridge needs `--network host`.
 
@@ -1041,7 +1047,9 @@ It reports, in order:
   This is the only check that actually proves your deployment is the one documented here.
 - **go2rtc** — patch markers in the running binary, plus a **generation** check that compares the
   binary's self-reported git revision (`GET /api` -> `.revision`) against the fork tag `install.sh`
-  builds. A mismatch is drift, not advice.
+  builds. A mismatch is drift, not advice. A binary built without git (anything compiled in
+  `golang:*-alpine`, including `install.sh` before 2026-10-30) carries no revision, and the check
+  reports it as `unproven`; rebuild with `./install.sh --rebuild` to make it provable.
 - **Recovery kit freshness** — whether `~/nest-recovery/` on the box still matches the repo, since
   that kit is what you run when the patches are wiped (a plugin reinstall, or a container start
   whose pin no longer matches the installed version).
