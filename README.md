@@ -19,10 +19,10 @@ This guide walks through the full setup from scratch: getting API access to your
 - **This README** — the complete, from-scratch guide (start here and read top to bottom).
 - **[`install.sh`](install.sh)** — one-shot installer for everything after your Google credentials. Re-running is safe but **not** a no-op: it recreates the go2rtc container (dropping every warm stream) and rewrites the warmer unit. If your go2rtc config does **not** live at the default `~/go2rtc-nest`, pass `--go2rtc-dir` — otherwise a re-run builds a fresh config at the default path and your existing one goes unused. see [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
 - **[`docker-compose.yml`](docker-compose.yml)** — the go2rtc + warmer half of the stack as Compose services.
-- **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches), `setup-google-device-access.sh` (automates Part 1 — the Google Cloud half of the credentials setup), `test-prebuffer-e2e.js` (end-to-end proof the prebuffer ring actually recovers pre-trigger footage — see [Testing the prebuffer](#testing-the-prebuffer)), and `check-drift.sh` (read-only; proves your deployment still matches this repo — see [Checking for drift](#checking-for-drift)).
+- **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches), `setup-google-device-access.sh` (automates Part 1 — the Google Cloud half of the credentials setup), `test-prebuffer-e2e.js` (end-to-end proof the prebuffer ring actually recovers pre-trigger footage — see [Testing the prebuffer](#testing-the-prebuffer)), `check-drift.sh` (read-only; proves your deployment still matches this repo — see [Checking for drift](#checking-for-drift)), `go2rtc-wedge-detector.py` (spots and optionally restarts a go2rtc stream that receives but stops forwarding — see [When go2rtc receives but forwards nothing](#when-go2rtc-receives-but-forwards-nothing--check-this-first)), and `pi/backup-configs.sh` (the author's own nightly config backup for the Pi, included as an example; its paths are specific to that box, so edit `SRC` and `DEST` before using it).
 - **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), five plugin diffs against stock 1.1.25 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`, `config.schema.json`), and `homebridge-plugin/new-files/PrebufferManager.js` (a new file, copied in rather than patched — it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)).
 
-The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-21)** — build from the stable tag **`nestfix-1.9.14-21`** (the tags are a branchless chain on top of upstream master, so build from the tag — there is no branch to check out.). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
+The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-21)** — build from the stable tag **`nestfix-1.9.14-21`** (the tags are a branchless chain on top of upstream master, so build from the tag — there is no branch to check out). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
 
 Two things worth calling out for anyone arriving because their recordings are unreliable:
 **HKSV clips from the stock plugin are silent** (an `-an` overrides the whole audio block —
@@ -61,9 +61,9 @@ Whichever row you're on, the `vEncoder: "copy"` note in [Part 2](#part-2-homebri
 
 ## Quick start (automated) — if Parts 1 & 2 are already done
 
-Most of Google Device Access (Part 1) **can** be scripted, which this guide used to deny. [`scripts/setup-google-device-access.sh`](scripts/setup-google-device-access.sh) automates the Cloud project, the SDM and Pub/Sub APIs, the topic, the `sdm-publisher` IAM binding, the pull subscription and the token exchange. Only three things genuinely need a browser and a human: the **$5 Device Access registration** (it takes a payment), the **OAuth consent screen and client**, and **approving the authorization URL**. The script walks you to each page and waits. The approach is [@WeekendSuperhero's](https://github.com/WeekendSuperhero), from [potmat/homebridge-google-nest-sdm#209](https://github.com/potmat/homebridge-google-nest-sdm/pull/209). Once you have those credentials in a working **Homebridge + homebridge-google-nest-sdm 1.1.25** install, the rest is one script.
+Most of Google Device Access (Part 1) **can** be scripted, which this guide used to deny. [`scripts/setup-google-device-access.sh`](scripts/setup-google-device-access.sh) automates the Cloud project, the SDM and Pub/Sub APIs, the topic, the `sdm-publisher` IAM binding, the pull subscription and the token exchange. Only four things genuinely need a browser and a human: the **$5 Device Access registration** (it takes a payment, and it is where you link the Pub/Sub topic), the **OAuth consent screen**, the **OAuth client**, and **approving the authorization URL**. The script walks you to each page and waits. The approach is [@WeekendSuperhero's](https://github.com/WeekendSuperhero), from [potmat/homebridge-google-nest-sdm#209](https://github.com/potmat/homebridge-google-nest-sdm/pull/209). Once you have those credentials in a working **Homebridge + homebridge-google-nest-sdm 1.1.25** install, the rest is one script.
 
-**Option A — `install.sh`** (idempotent; builds the patched go2rtc image, sets up the tmpfs, generates the config, starts go2rtc, installs the warmer service, applies the plugin patches):
+**Option A — `install.sh`** (safe to re-run; builds the patched go2rtc image, sets up the tmpfs, generates the config, starts go2rtc, installs the warmer service, applies the plugin patches):
 
 ```bash
 git clone https://github.com/ajplotkin/nest-homekit-cameras.git
@@ -145,11 +145,16 @@ JSON it offers at creation time is the only copy you will ever get.
 Then install the Nest plugin by [@potmat](https://github.com/potmat):
 
 ```bash
-# From the Homebridge UI (Settings > Plugins > Search), or:
-npm install homebridge-google-nest-sdm@1.1.25
+# Homebridge in Docker (the official image): install inside the container
+docker exec homebridge npm --prefix /homebridge install --save-exact homebridge-google-nest-sdm@1.1.25
+
+# Homebridge installed natively: from the directory holding Homebridge's package.json
+npm install --save-exact homebridge-google-nest-sdm@1.1.25
 ```
 
-**Pin the version.** The patches in this repo are cut against **1.1.25** and `apply-snapshot-patch.sh` refuses to run against anything else, so an unpinned install that picks up a newer release will stop you at the patch step. 1.1.25 is also the release that stops the plugin writing your OAuth token into `homebridge.log` when a Google API call fails ([PR #225](https://github.com/potmat/homebridge-google-nest-sdm/pull/225)), so don't stay on 1.1.24.
+Or install it from the Homebridge UI (Plugins → search → choose version 1.1.25), then make the pin exact as described next.
+
+**Pin the version, exactly.** The patches in this repo are cut against **1.1.25** and `apply-snapshot-patch.sh` refuses to run against anything else, so an install that picks up a newer release will stop you at the patch step. Open Homebridge's `package.json` (in `/path/to/homebridge`, the directory mounted at `/homebridge`) and check the line reads `"homebridge-google-nest-sdm": "1.1.25"` with no `^` in front. The Homebridge UI, and `npm install` without `--save-exact`, both write `"^1.1.25"`; with a caret, the next container start after upstream publishes 1.1.26 upgrades the plugin and silently removes every patch (see [Part 5](#part-5-verify)). 1.1.25 is also the release that stops the plugin writing your OAuth token into `homebridge.log` when a Google API call fails ([PR #225](https://github.com/potmat/homebridge-google-nest-sdm/pull/225)), so don't stay on 1.1.24.
 
 Configure it with your Device Access credentials in Homebridge's `config.json`. The block goes in the top-level `platforms` array:
 
@@ -210,7 +215,7 @@ This is the piece that makes real snapshots possible: keep one stream warm per c
 > contact a Google STUN endpoint when negotiating a Nest stream. Noted because it is a functional change
 > beyond the udp4 filter.
 
-**Stock go2rtc (v1.9.14 as of this writing) cannot stream Nest cameras on many home networks.** Its `nest:` source uses [pion/webrtc](https://github.com/pion/webrtc) for WebRTC negotiation, and pion gathers ICE candidates on all network types including IPv6. On hosts where IPv6 addresses exist but have no working route — which is extremely common — the ICE agent fails silently and no media flows. You'll see `nest: wrong status: 400 Bad Request` in the logs or streams that start but never produce video.
+**Stock go2rtc cannot stream Nest cameras on many home networks** (checked through v1.9.15, released 2026-10-25; this fork is based on v1.9.14). Its `nest:` source uses [pion/webrtc](https://github.com/pion/webrtc) for WebRTC negotiation, and pion gathers ICE candidates on all network types including IPv6. On hosts where IPv6 addresses exist but have no working route — which is extremely common — the ICE agent fails silently and no media flows. You'll see `nest: wrong status: 400 Bad Request` in the logs or streams that start but never produce video.
 
 The `webrtc: filters:` YAML config exists for restricting network types, but `pkg/nest/client.go` bypasses it by calling `webrtc.NewAPI()` with nil filters. There is no config-only workaround. See [go2rtc #2311](https://github.com/AlexxIT/go2rtc/issues/2311) for discussion and diagnostic data.
 
@@ -230,12 +235,12 @@ The fork also removes an inner retry loop in `rtcConn` that burned ~130 SDM API 
 ```bash
 git clone https://github.com/ajplotkin/go2rtc.git
 cd go2rtc
-git checkout nestfix-1.9.14-21   # stable tag — not the dev branch
+git checkout nestfix-1.9.14-21   # the release tag; the fork has no release branch
 ```
 
 > **Prefer to patch stock go2rtc yourself?** Instead of cloning the fork, check out upstream go2rtc at the `v1.9.14` tag and apply [`patches/go2rtc-nest.patch`](patches/go2rtc-nest.patch) from this repo (`git clone https://github.com/AlexxIT/go2rtc && cd go2rtc && git checkout v1.9.14 && git apply /path/to/go2rtc-nest.patch`), then run the same build command below. The diff is the exact set of source changes described in this guide, plus the credited community PRs.
 >
-> **The two routes do not produce identical binaries.** The patch is a clean diff against `v1.9.14`, but the fork is branched from upstream `master` at [`c245815`](https://github.com/AlexxIT/go2rtc/commit/c245815) — v1.9.14 plus 70 upstream commits — so the fork tree differs from `v1.9.14` in 109 files while this patch touches 16. Within those 16 the two routes agree byte-for-byte (re-verified when the patch is re-cut from the tag); everywhere else the fork carries upstream work that `v1.9.14` does not. Build from the fork if you want what is actually running here; patch `v1.9.14` if you want a minimal, auditable delta from a released version.
+> **The two routes do not produce identical binaries.** The patch is a clean diff against `v1.9.14`, but the fork is branched from upstream `master` at [`c245815`](https://github.com/AlexxIT/go2rtc/commit/c245815) — v1.9.14 plus 70 upstream commits — so the fork tree differs from `v1.9.14` in 125 files while this patch touches 28 (16 sources and 12 tests). Within those 28 the two routes agree byte-for-byte (re-verified when the patch is re-cut from the tag); everywhere else the fork carries upstream work that `v1.9.14` does not. Build from the fork if you want what is actually running here; patch `v1.9.14` if you want a minimal, auditable delta from a released version.
 
 ```bash
 # Build natively on a Pi (arm64, ~3 min). On a 2 GB Pi this can exhaust RAM and take
@@ -298,7 +303,7 @@ This is also why **one camera per room** is required: two cameras in the same ro
 Run it:
 
 ```bash
-python3 ~/scripts/nest-go2rtc-sync.py \
+python3 ~/scripts/nest-go2rtc-sync.py --no-restart \
   --hb-config /path/to/homebridge/config.json \
   --out ~/go2rtc-nest/go2rtc.yaml
 
@@ -306,7 +311,7 @@ python3 ~/scripts/nest-go2rtc-sync.py \
 chmod 600 ~/go2rtc-nest/go2rtc.yaml
 ```
 
-On this first run the script will print `restarting go2rtc` and fail to find the container — that's expected; you start it two steps from now.
+`--no-restart` is for this first run only: the go2rtc container doesn't exist yet (you start it two steps from now), and without the flag the script tries to restart it, prints a warning and exits 1. Leave it off on later runs so a changed config is picked up.
 
 ### Re-running it later (adding or removing a camera)
 
@@ -355,7 +360,7 @@ for name, s in json.load(sys.stdin).items():
 
 # Grab a test snapshot
 curl -o /tmp/test.jpg "http://127.0.0.1:1985/api/frame.jpeg?src=front_door&cache=30s"
-file /tmp/test.jpg   # should say "JPEG image data"
+od -An -tx1 -N3 /tmp/test.jpg   # a JPEG starts with: ff d8 ff
 ```
 
 If streams show "cold", check the go2rtc logs (`docker logs go2rtc`). Common causes: camera switched off in the Google Home app (`FAILED_PRECONDITION`), IPv6 issue (see above), or URL encoding problems.
@@ -403,6 +408,7 @@ Install as a systemd service — write this to `/etc/systemd/system/go2rtc-snaps
 [Unit]
 Description=Keep go2rtc snapshot cache warm for Homebridge
 After=docker.service
+Wants=docker.service
 [Service]
 ExecStart=/home/YOUR_USER/scripts/go2rtc-snapshot-warmer.sh
 Restart=always
@@ -463,15 +469,17 @@ cd nest-homekit-cameras
 HOMEBRIDGE_DIR=/path/to/homebridge ./scripts/apply-snapshot-patch.sh
 ```
 
+With Homebridge in Docker, npm runs as root inside the container, so the plugin's files are usually root-owned on the host and the script can't write them. If it reports a permissions failure, run it with `sudo`: `sudo HOMEBRIDGE_DIR=/path/to/homebridge ./scripts/apply-snapshot-patch.sh`. (`install.sh` checks for this and uses `sudo` for that step itself.)
+
 The script pins the plugin version it was cut against (**1.1.25**) and **refuses to run on a different one** — the compiled `dist/` layout moves between releases, so a stale patch could silently break things. It's idempotent (safe to re-run) and **exits non-zero** if any patch is missing or won't apply, so a re-apply can never leave you half-patched. Want to see exactly what changes? Read the diffs in `patches/homebridge-plugin/`.
 
 **If you're on a different plugin version**, you have three options, in order of preference:
 
-1. **Install 1.1.25** (`npm install homebridge-google-nest-sdm@1.1.25`) and patch that. Simplest, and what this guide is tested against.
+1. **Install 1.1.25** (`npm install --save-exact homebridge-google-nest-sdm@1.1.25`, run inside the container for Docker as shown in [Part 2](#part-2-homebridge-and-the-nest-plugin)) and patch that. Simplest, and what this guide is tested against.
 2. **Open an issue** on this repo asking for the patches to be re-cut against your version.
 3. **Re-cut them yourself.** Take a pristine copy of your plugin's `dist/`, apply each hunk from `patches/homebridge-plugin/*.patch` by hand (they are small and commented), then `diff -u` pristine against patched to produce new `.patch` files, and bump `EXPECT_VER` in `apply-snapshot-patch.sh`. Check the [Related Issues and PRs](#related-issues-and-prs) list first — if a patch has since been merged upstream, you may not need it at all.
 
-> **`PrebufferManager.js` is the exception to all of the above** — it is a whole file, not a diff, so there is nothing to re-cut and `patch` will never warn you that it has gone stale. On a new plugin release, check two things by hand: that `StreamingDelegate.js` still calls it the same way, and that upstream has not shipped its own prebuffer (see [#240](https://github.com/potmat/homebridge-google-nest-sdm/pull/240)) — if it has, drop ours rather than layering them. Then run `node test/prebuffer-noise.test.js`, which asserts the retry logging stays throttled both for a camera that was already off at startup and for one switched off after it had been streaming. It fakes ffmpeg, the clock and the timers, so it needs nothing running and finishes in about a second; it exits non-zero on failure. (The other automated checks here are [`scripts/check-drift.sh`](scripts/check-drift.sh), which compares the Pi against this repo, and [`scripts/test-prebuffer-e2e.js`](scripts/test-prebuffer-e2e.js), which needs a live restreamer.)
+> **`PrebufferManager.js` is the exception to all of the above** — it is a whole file, not a diff, so there is nothing to re-cut and `patch` will never warn you that it has gone stale. On a new plugin release, check two things by hand: that `StreamingDelegate.js` still calls it the same way, and that upstream has not shipped its own prebuffer (see [#240](https://github.com/potmat/homebridge-google-nest-sdm/pull/240)) — if it has, drop ours rather than layering them. Then run `node test/prebuffer-noise.test.js` (it needs `node`, so run it on a workstation or inside the Homebridge container), which asserts the retry logging stays throttled both for a camera that was already off at startup and for one switched off after it had been streaming. It fakes ffmpeg, the clock and the timers, so it needs nothing running and finishes in about a second; it exits non-zero on failure. (The other automated checks here are [`scripts/check-drift.sh`](scripts/check-drift.sh), which compares the Pi against this repo, and [`scripts/test-prebuffer-e2e.js`](scripts/test-prebuffer-e2e.js), which needs a live restreamer.)
 
 > **These patches live in `node_modules` and are wiped by any `npm install` of the plugin.** Re-run `apply-snapshot-patch.sh` after any plugin install or upgrade — always in that order: `npm install` first, patch script second. (That is also how you *uninstall* them: reinstall the plugin and don't re-run the patcher.)
 >
@@ -487,7 +495,7 @@ docker exec homebridge pkill -x homebridge
 
 > **Prefer `pkill` to `docker restart` here.** Every container start runs `npm install` against Homebridge's `package.json`. If the pinned plugin version differs from the installed one, npm reinstalls the plugin and deletes every patch you just applied: `dist/PrebufferManager.js` disappears entirely and the cameras silently revert to stock behaviour, with no error anywhere. (On 2026-08-06 a restart did exactly that; the pin then pointed at a tarball, not an npm version.) With an exact pin that matches, a restart leaves the patches alone, but killing the `homebridge` process skips the install step altogether: s6 respawns it in place, the new code is loaded and the patches survive.
 >
-> If you *did* just recreate the container for the snapshot mount, that recreation also wiped the patches — re-run `apply-snapshot-patch.sh` afterwards, then reload with the command above.
+> If you just recreated the container for the snapshot mount, that start ran the same `npm install`: with an exact pin that matches, the patches are still there. Check with `ls /path/to/homebridge/node_modules/homebridge-google-nest-sdm/dist/PrebufferManager.js`; if it is missing, re-run `apply-snapshot-patch.sh`, then reload with the command above.
 
 After about 30 seconds:
 
@@ -590,7 +598,7 @@ This `StreamingDelegate.js` change ships as [`patches/homebridge-plugin/Streamin
 
 ### HKSV recording rides the warm stream too — and this matters more than live view
 
-The same `StreamingDelegate.js` patch routes **HomeKit Secure Video recording** through the warm RTSP stream as well, using the identical freshness check.
+The same `StreamingDelegate.js` patch routes **HomeKit Secure Video recording** through the warm RTSP stream as well, using the same name-based check: any camera with a matching go2rtc stream records from it.
 
 By default, when motion fires, the plugin's recording handler (`handleRecordingStreamRequest`) opens **yet another** fresh Google WebRTC session — a *second* concurrent stream for that camera (a *third* if you're also viewing live). That tips Nest over its per-device concurrent-stream limit, and every recording triggers an ugly cascade: the second dial contends with go2rtc's warm stream → go2rtc's stream gets throttled/dropped → it reconnects (a burst of `retry=` in the go2rtc log) → and the recording itself decodes garbage (`concealing 3721 DC/AC/MV errors in I frame`, corrupt frames) because it started against a contended, half-broken stream. The system "self-heals" a minute later, but the clip is ruined.
 
@@ -743,7 +751,7 @@ docker logs homebridge 2>&1 | grep "Using local go2rtc RTSP"
 
 If it appears, live view is coming from the warm stream. If instead you see the plugin opening a Google dial, `go2rtcKey` didn't match a stream name — compare the accessory name against the stream names in `curl -s http://127.0.0.1:1985/api/streams`.
 
-To undo Part 6: reinstall the plugin (`npm install homebridge-google-nest-sdm@1.1.25`) and don't re-run the patch script. That reverts all five patches and removes `PrebufferManager.js`, so re-apply them if you still want the snapshot fix — there is no per-patch switch.
+To undo Part 6: reinstall the plugin (`npm install --save-exact homebridge-google-nest-sdm@1.1.25`, inside the container for Docker) and don't re-run the patch script. That reverts all five patches and removes `PrebufferManager.js`, so re-apply them if you still want the snapshot fix — there is no per-patch switch.
 
 ### When go2rtc receives but forwards nothing — check this FIRST
 
@@ -990,6 +998,8 @@ node scripts/test-prebuffer-e2e.js \
   rtsp://127.0.0.1:8554 front_door
 ```
 
+It needs `node`, `ffmpeg` and `ffprobe` on the machine that runs it. The Homebridge image ships `node` and the plugin's bundled `ffmpeg` but no `ffprobe`, so run it on a workstation that can reach go2rtc's RTSP port (or in a throwaway `node` container with `ffmpeg` installed). Point it at a camera that is streaming: it checks the clip has both video and audio.
+
 It fills the ring against your real restreamer, asks for history anchored in the past,
 records a short live window, and then measures the finished clip. The assertions are
 written so a broken ring fails rather than passes quietly:
@@ -1017,6 +1027,8 @@ while looking at one file for an unrelated reason.
   --homebridge /path/to/homebridge --scripts /path/to/scripts
 ```
 
+Run it from a checkout of this repo on your workstation (macOS or Linux). `--deep` needs `npm` (to fetch stock 1.1.25) and the [GitHub CLI](https://cli.github.com/) (`gh`, for the go2rtc comparison); without either, that check is skipped and says so.
+
 It is **strictly read-only** — it never copies, patches or restarts anything. That is deliberate:
 the thing it exists to catch is a stale patch script quietly reverting good code, so a checker
 that could also "fix" would be the same hazard wearing a different hat.
@@ -1031,7 +1043,8 @@ It reports, in order:
   binary's self-reported git revision (`GET /api` -> `.revision`) against the fork tag `install.sh`
   builds. A mismatch is drift, not advice.
 - **Recovery kit freshness** — whether `~/nest-recovery/` on the box still matches the repo, since
-  that kit is what actually runs after a container start wipes the patches.
+  that kit is what you run when the patches are wiped (a plugin reinstall, or a container start
+  whose pin no longer matches the installed version).
 - **Process age** — whether Homebridge has actually been reloaded since the last `dist/` write.
 - **Stale whole-file patch blobs** — this repo shipped whole-file copies before 2026-07-19 and
   moved to unified diffs precisely because pasting a stale whole file silently reverts everything
@@ -1040,7 +1053,7 @@ It reports, in order:
 **What it does and does not check — read this before trusting a green result.** It now
 covers the go2rtc side, which it did not used to. On every run it reports whether the running
 binary is patched and whether its revision matches the fork tag this repo ships; a mismatch
-reads `WRONG BUILD` and names both revisions. Adding `--deep` also verifies that all 16 files
+reads `WRONG BUILD` and names both revisions. Adding `--deep` also verifies that all 28 files
 in `patches/go2rtc-nest.patch` match that tag, and separately reproduces the plugin's `dist/`
 from stock 1.1.25 plus the repo's patches.
 
@@ -1064,7 +1077,7 @@ code is executing. Only `--deep` answers that.
 > recovery script refuses on the one machine you need it on, and every wipe becomes manual
 > surgery. This deployment pinned a tarball reporting `1.1.23` whose `dist/` was byte-identical
 > to npm `1.1.24`; repointing the pin to `1.1.24` changed no running code and restored
-> one-command recovery.
+> one-command recovery. (That was before the move to 1.1.25; the pin is now `1.1.25`.)
 
 > **Keep the recovery kit ON the box.** "Re-run `apply-snapshot-patch.sh`" is only useful if the
 > script and `patches/` are actually there — a wipe is exactly when you don't want to be copying
@@ -1129,4 +1142,4 @@ or the box may be ahead and carrying an undeployed hotfix (commit it).
 
 ## License
 
-go2rtc is [MIT licensed](https://github.com/AlexxIT/go2rtc/blob/master/LICENSE). This fork carries a small set of Nest-focused patches: IPv4-only ICE in `pkg/nest/client.go`; keyframe-request, `sprop-parameter-sets`, and a stall watchdog in `pkg/webrtc/conn.go` (which also closes the transport when a Nest video track's `remote.Read` fails, since the watchdog's own `defer` would otherwise die with it, discards a malformed RTP packet rather than closing over a single bad byte, and measures its ages on the monotonic clock so an NTP step cannot read as a media gap); and stream-extension resilience in `pkg/nest/api.go`. It also incorporates the community PRs credited above. Only the `pkg/webrtc/conn.go` additions are gated to the Nest source (`FormatName == "nest/webrtc"`). The rest are **not** Nest-specific and affect any source that exercises them: `pkg/h264/rtp.go` (partition-head sync — every H264 RTP source), `pkg/h264/h264.go` (`GetFmtpLine` bounds guards — likewise every H264 source), `internal/streams/preload.go` (preload retry), `internal/streams/producer.go` (a debug line when a producer ends without an error), `internal/mjpeg/mjpeg.go` and `internal/mp4/mp4.go` (consumer reaping), `internal/ffmpeg/jpeg.go` (stderr surfacing), `pkg/core/writebuffer.go` and its new `pkg/core/writebuffer_test.go`, `pkg/core/waiter.go` (a result-publication race in `Waiter.Done`, found by [@donparlor](https://github.com/donparlor) and reproduced here under `-race`), and `pkg/homekit/helpers.go`. That is the full set — 16 files (13 sources plus `pkg/core/writebuffer_test.go`, `internal/streams/preload_cancel_test.go` and `pkg/webrtc/teardown_guard_test.go`), the same set the patch touches. They are bug fixes rather than Nest behaviour changes — three are upstream PRs (#2368/#2378/#2380) — but if you run other sources through this fork, know that they are in the path.
+go2rtc is [MIT licensed](https://github.com/AlexxIT/go2rtc/blob/master/LICENSE). This fork carries a small set of Nest-focused patches: IPv4-only ICE in `pkg/nest/client.go`; keyframe-request, `sprop-parameter-sets`, and a stall watchdog in `pkg/webrtc/conn.go` (which also closes the transport when a Nest video track's `remote.Read` fails, since the watchdog's own `defer` would otherwise die with it, discards a malformed RTP packet rather than closing over a single bad byte, and measures its ages on the monotonic clock so an NTP step cannot read as a media gap); and stream-extension resilience in `pkg/nest/api.go`. It also incorporates the community PRs credited above. Only the `pkg/webrtc/conn.go` additions are gated to the Nest source (`FormatName == "nest/webrtc"`). The rest are **not** Nest-specific and affect any source that exercises them: `pkg/h264/rtp.go` (partition-head sync — every H264 RTP source), `pkg/h264/h264.go` (`GetFmtpLine` bounds guards — likewise every H264 source), `internal/streams/preload.go` (preload retry), `internal/streams/producer.go` (a debug line when a producer ends without an error), `internal/mjpeg/mjpeg.go` and `internal/mp4/mp4.go` (consumer reaping), `internal/ffmpeg/jpeg.go` (stderr surfacing), `pkg/core/writebuffer.go` and its new `pkg/core/writebuffer_test.go`, `pkg/core/waiter.go` (a result-publication race in `Waiter.Done`, found by [@donparlor](https://github.com/donparlor) and reproduced here under `-race`), `pkg/homekit/helpers.go`, `pkg/webrtc/client.go` (sets the answer's medias before `SetRemoteDescription`, so an early `OnTrack` cannot panic — every WebRTC client source) and `pkg/webrtc/producer.go` (locks the track list and snapshots it on `Stop` — every WebRTC connection). The RTP reorder buffer in the new `pkg/webrtc/nest_reorder.go` runs only on Nest video tracks, gated in `conn.go`. That is the full set the patch touches: 16 sources plus 12 test files. They are bug fixes rather than Nest behaviour changes — three are upstream PRs (#2368/#2378/#2380) — but if you run other sources through this fork, know that they are in the path.

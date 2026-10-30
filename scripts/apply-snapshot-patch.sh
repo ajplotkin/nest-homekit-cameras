@@ -1,6 +1,6 @@
 #!/bin/bash
 # Re-applies the homebridge-google-nest-sdm plugin patches after any `npm install`
-# of the plugin (npm wipes node_modules, taking the patches with it).
+# of the plugin (npm re-extracts the plugin's directory, taking the patches with it).
 #
 # It applies the unified diffs in ../patches/homebridge-plugin/ to your installed
 # plugin. Each patch is idempotent (skipped if already present) and the script exits
@@ -11,6 +11,11 @@
 #   HOMEBRIDGE_DIR=/path/to/homebridge \
 #   HOMEBRIDGE_CONTAINER=my-homebridge \
 #   ./apply-snapshot-patch.sh
+#
+# With Homebridge in Docker the plugin's files are usually root-owned on the host (npm runs
+# as root in the container); if so, run it with sudo:  sudo HOMEBRIDGE_DIR=... ./apply-snapshot-patch.sh
+# DOCKER_CMD (default "docker") only changes the reload command printed at the end,
+# e.g. DOCKER_CMD="sudo docker" when your user is not in the docker group.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,6 +23,7 @@ PATCH_DIR="${PATCH_DIR:-$SCRIPT_DIR/../patches/homebridge-plugin}"
 HOMEBRIDGE_DIR="${HOMEBRIDGE_DIR:-$HOME/homebridge}"
 PLUGIN="${PLUGIN:-$HOMEBRIDGE_DIR/node_modules/homebridge-google-nest-sdm}"
 CONTAINER="${HOMEBRIDGE_CONTAINER:-homebridge}"
+DOCKER_CMD="${DOCKER_CMD:-docker}"
 EXPECT_VER="1.1.25"
 
 [ -d "$PLUGIN" ] || { echo "ERROR: plugin not found at $PLUGIN (set HOMEBRIDGE_DIR)"; exit 1; }
@@ -131,7 +137,7 @@ if [ "$failed" = 1 ]; then
 fi
 if [ "$applied" = 1 ]; then
   echo "Done. Reload the plugin WITHOUT restarting the container:"
-  echo "    docker exec $CONTAINER pkill -x homebridge"
+  echo "    $DOCKER_CMD exec $CONTAINER pkill -x homebridge"
   echo
   echo "  Prefer this to 'docker restart $CONTAINER'. Every container start runs npm install"
   echo "  against Homebridge's package.json; if the pinned plugin version differs from the"

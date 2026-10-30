@@ -97,7 +97,7 @@ run() {
   fi
 }
 
-# This script is inherently interactive: five steps need a human in a browser, and
+# This script is inherently interactive: four steps need a human in a browser, and
 # every value it cannot derive is read from /dev/tty (deliberately, so the prompts
 # still work when stdout is piped to a log).
 #
@@ -113,9 +113,9 @@ run() {
 # still leaks it to the terminal ahead of the clean message below.
 if ! { : >/dev/tty; } 2>/dev/null; then
   echo "ERROR: no controlling terminal." >&2
-  echo "This script is interactive -- the \$5 registration, the OAuth consent screen," >&2
-  echo "the OAuth client, linking the Pub/Sub topic and approving the authorization" >&2
-  echo "URL all need a browser and a human. Run it from a terminal." >&2
+  echo "This script is interactive -- the \$5 registration (where you also link the" >&2
+  echo "Pub/Sub topic), the OAuth consent screen, the OAuth client and approving the" >&2
+  echo "authorization URL all need a browser and a human. Run it from a terminal." >&2
   exit 1
 fi
 
@@ -306,7 +306,7 @@ if [ "$APPLY" != "1" ]; then
   exit 0
 fi
 
-TOKEN_RESPONSE="$(curl -s -X POST https://www.googleapis.com/oauth2/v4/token \
+TOKEN_RESPONSE="$(curl -s -X POST https://oauth2.googleapis.com/token \
   -d "client_id=${CLIENT_ID}" -d "client_secret=${CLIENT_SECRET}" \
   -d "code=${AUTH_CODE}" -d "grant_type=authorization_code" \
   -d "redirect_uri=https://www.google.com")"

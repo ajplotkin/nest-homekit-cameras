@@ -4,8 +4,9 @@
 # Nest-cameras-in-HomeKit, everything AFTER you have Google Device Access
 # credentials in a working Homebridge + homebridge-google-nest-sdm install.
 #
-# It is idempotent: re-running skips work already done. It changes nothing it
-# can't safely own — the one step it can't do for you (mounting the snapshot
+# Re-running is safe but not a no-op: it skips the image build and patches that are
+# already applied, but it recreates the go2rtc container (dropping every warm stream)
+# and rewrites the warmer unit. It changes nothing it can't safely own — the one step it can't do for you (mounting the snapshot
 # dir into YOUR Homebridge container) is detected and printed as an exact
 # instruction rather than guessed at.
 #
@@ -32,11 +33,10 @@ HB_CONTAINER="${HOMEBRIDGE_CONTAINER:-homebridge}"
 GO2RTC_CONTAINER="${GO2RTC_CONTAINER:-go2rtc}"
 IMAGE="${GO2RTC_IMAGE:-go2rtc-nestfix:1.9.14}"
 FORK_URL="${FORK_URL:-https://github.com/ajplotkin/go2rtc.git}"
-# Pinned to a stable TAG, not a moving branch. The dev branch carries in-progress
-# work (and at times debug logging), which must never land in someone's install.
-# `git clone --branch` accepts a tag, so this needs no other change. Override to
-# test a branch/tag: FORK_BRANCH=nestfix-1.9.14-10 ./install.sh
-# (build from the tag; the nestfix tags are a branchless chain and no dev branch exists)
+# Pinned to a release TAG. The nestfix tags are a branchless chain on top of upstream
+# master, so there is no branch to build from; work in progress is never tagged and so
+# never lands in someone's install. `git clone --branch` accepts a tag. Override to
+# build a different tag: FORK_BRANCH=nestfix-1.9.14-10 ./install.sh
 FORK_BRANCH="${FORK_BRANCH:-nestfix-1.9.14-21}"
 BASE_IMAGE="${BASE_IMAGE:-alexxit/go2rtc:1.9.14}"
 PLUGIN_VER="1.1.25"
@@ -47,6 +47,8 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '   \033[1;32mok\033[0m %s\n' "$*"; }
+# For results of a `run` step: in --dry-run nothing ran, so do not print "ok".
+did()  { if [ "$DRY_RUN" = 1 ]; then printf '   [dry-run] would have: %s\n' "$*"; else ok "$*"; fi; }
 warn() { printf '   \033[1;33m!!\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 run()  { if [ "$DRY_RUN" = 1 ]; then printf '   [dry-run] %s\n' "$*"; else eval "$@"; fi; }
@@ -63,7 +65,7 @@ while [ $# -gt 0 ]; do
     --image) IMAGE="$2"; shift 2;;
     --rebuild) REBUILD=1; shift;;
     --dry-run) DRY_RUN=1; shift;;
-    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    -h|--help) awk 'NR>2 && /^#/{sub(/^# ?/,""); print; next} NR>2{exit}' "$0"; exit 0;;
     *) die "unknown option: $1 (try --help)";;
   esac
 done
@@ -91,7 +93,7 @@ PY
 ok "Homebridge config has Nest credentials: $HB_CONFIG"
 PLUGIN_DIR="$HOMEBRIDGE_DIR/node_modules/homebridge-google-nest-sdm"
 if [ -f "$PLUGIN_DIR/package.json" ]; then
-  cur=$(python3 -c "import json;print(json.load(open('$PLUGIN_DIR/package.json'))['version'])" 2>/dev/null || echo "?")
+  cur=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['version'])" "$PLUGIN_DIR/package.json" 2>/dev/null || echo "?")
   [ "$cur" = "$PLUGIN_VER" ] && ok "plugin version $cur" || warn "plugin is $cur, patches are cut for $PLUGIN_VER — patch step will refuse; re-cut diffs first"
 else
   warn "plugin not found at $PLUGIN_DIR — the plugin-patch step will be skipped (set --homebridge-dir)"
@@ -104,13 +106,23 @@ if [ "$REBUILD" = 0 ] && $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then
 else
   BUILD_TMP="$GO2RTC_DIR/.build"
   run "mkdir -p '$GO2RTC_DIR'"
-  run "rm -rf '$BUILD_TMP' && git clone --quiet --branch '$FORK_BRANCH' --depth 1 '$FORK_URL' '$BUILD_TMP'"
+  # Go writes its module cache read-only, so a plain `rm -rf` of a previous build fails even
+  # for its owner; make it writable first. A build dir left root-owned by an older install.sh
+  # still cannot be removed without sudo, and saying so beats a bare "Permission denied".
+  run "{ chmod -R u+w '$BUILD_TMP' 2>/dev/null; rm -rf '$BUILD_TMP'; } || die \"cannot remove $BUILD_TMP (left root-owned by an older install.sh?) -- run: sudo rm -rf '$BUILD_TMP'   then re-run\""
+  run "git clone --quiet --branch '$FORK_BRANCH' --depth 1 '$FORK_URL' '$BUILD_TMP'"
   warn "the Go build below wants ~1-1.5 GB free RAM. On a low-memory host — e.g. a 2 GB Raspberry Pi already running Homebridge/HA — it can OOM and take services down. If that's your box, build the image on a beefier machine (this same repo, any arch you'll run) and move it over: 'docker save $IMAGE | ssh pi docker load', then re-run this script with --image $IMAGE (it detects the existing image and skips the build)."
   say "  compiling (arm64/amd64 native, a few minutes)…"
-  run "$DOCKER run --rm -v '$BUILD_TMP':/src -w /src -e GOCACHE=/src/.gocache -e GOMODCACHE=/src/.gomod golang:1.24-alpine sh -c 'CGO_ENABLED=0 go build -trimpath -ldflags \"-s -w\" -o go2rtc_patched .'"
-  run "printf 'FROM %s\nCOPY go2rtc_patched /usr/local/bin/go2rtc\n' '$BASE_IMAGE' > '$BUILD_TMP/Dockerfile'"
-  run "$DOCKER build -t '$IMAGE' '$BUILD_TMP'"
-  ok "built $IMAGE"
+  # --user: as root the build would leave .build/ (and its Go caches) root-owned on the
+  # host, and the next --rebuild's `rm -rf` as you would fail with Permission denied.
+  # -modcacherw: the module cache is otherwise written read-only (see the rm above).
+  run "$DOCKER run --rm --user $(id -u):$(id -g) -v '$BUILD_TMP':/src -w /src -e HOME=/src -e GOFLAGS=-modcacherw -e GOCACHE=/src/.gocache -e GOMODCACHE=/src/.gomod golang:1.24-alpine sh -c 'CGO_ENABLED=0 go build -trimpath -ldflags \"-s -w\" -o go2rtc_patched .'"
+  # Build the image from a directory holding only the binary: the source tree plus the Go
+  # module cache is hundreds of MB that `docker build` would otherwise send to the daemon.
+  run "mkdir -p '$BUILD_TMP/image' && cp '$BUILD_TMP/go2rtc_patched' '$BUILD_TMP/image/go2rtc_patched'"
+  run "printf 'FROM %s\nCOPY go2rtc_patched /usr/local/bin/go2rtc\n' '$BASE_IMAGE' > '$BUILD_TMP/image/Dockerfile'"
+  run "$DOCKER build -t '$IMAGE' '$BUILD_TMP/image'"
+  did "built $IMAGE"
 fi
 
 # ---- phase 2: tmpfs for snapshots -------------------------------------------
@@ -120,7 +132,7 @@ if [ "$SNAPS_DIR" = "/run/nest-snaps" ]; then
   if [ ! -f "$TMPFILE" ]; then
     run "echo 'd $SNAPS_DIR 0755 $(id -u) $(id -g) -' | sudo tee $TMPFILE >/dev/null"
     run "sudo systemd-tmpfiles --create $TMPFILE"
-    ok "tmpfs entry created (survives reboot, spares SD-card wear)"
+    did "tmpfs entry created (survives reboot, spares SD-card wear)"
   else ok "tmpfs entry already present"; fi
 fi
 run "mkdir -p '$SNAPS_DIR'"
@@ -131,7 +143,7 @@ run "mkdir -p '$SCRIPTS_DIR'"
 for s in nest-go2rtc-sync.py go2rtc-snapshot-warmer.sh; do
   run "install -m 0755 '$REPO_DIR/scripts/$s' '$SCRIPTS_DIR/$s'"
 done
-ok "sync + warmer installed"
+did "sync + warmer installed"
 
 say "Generate go2rtc.yaml from your Homebridge credentials"
 # --no-restart: the container is created a few lines below and reads this file on
@@ -143,7 +155,7 @@ say "Generate go2rtc.yaml from your Homebridge credentials"
 # short-circuits before the restart.)
 run "python3 '$SCRIPTS_DIR/nest-go2rtc-sync.py' --hb-config '$HB_CONFIG' --out '$GO2RTC_DIR/go2rtc.yaml' --container '$GO2RTC_CONTAINER' --no-restart"
 run "chmod 600 '$GO2RTC_DIR/go2rtc.yaml' || true"   # contains the OAuth secret
-ok "wrote $GO2RTC_DIR/go2rtc.yaml (chmod 600)"
+did "wrote $GO2RTC_DIR/go2rtc.yaml (chmod 600)"
 
 say "Start go2rtc container ($GO2RTC_CONTAINER)"
 if $DOCKER ps -a --format '{{.Names}}' | grep -qx "$GO2RTC_CONTAINER"; then
@@ -151,7 +163,7 @@ if $DOCKER ps -a --format '{{.Names}}' | grep -qx "$GO2RTC_CONTAINER"; then
   run "$DOCKER rm -f '$GO2RTC_CONTAINER' >/dev/null 2>&1 || true"
 fi
 run "$DOCKER run -d --name '$GO2RTC_CONTAINER' --restart unless-stopped --network host -v '$GO2RTC_DIR/go2rtc.yaml':/config/go2rtc.yaml '$IMAGE' >/dev/null"
-ok "go2rtc running"
+did "go2rtc running"
 
 # ---- phase 4: warmer systemd service ----------------------------------------
 say "Install snapshot-warmer service"
@@ -171,12 +183,20 @@ WantedBy=multi-user.target
 UNIT"
 run "sudo systemctl daemon-reload"
 run "sudo systemctl enable --now go2rtc-snapshot-warmer.service"
-ok "warmer service enabled + started"
+did "warmer service enabled + started"
 
 # ---- phase 5: plugin patches ------------------------------------------------
 if [ -f "$PLUGIN_DIR/package.json" ]; then
   say "Patch the Homebridge plugin"
-  run "HOMEBRIDGE_DIR='$HOMEBRIDGE_DIR' HOMEBRIDGE_CONTAINER='$HB_CONTAINER' PATCH_DIR='$REPO_DIR/patches/homebridge-plugin' bash '$REPO_DIR/scripts/apply-snapshot-patch.sh'"
+  # Homebridge in Docker runs npm as root, so on the host the plugin's files are usually
+  # root-owned and a plain-user patch run cannot write them. It exited 1 here, which under
+  # `set -e` ended the installer before the mount check and the closing instructions.
+  SUDO_PATCH=""
+  if [ ! -w "$PLUGIN_DIR/dist" ] || [ ! -w "$PLUGIN_DIR/dist/sdm" ]; then
+    SUDO_PATCH="sudo "
+    warn "plugin files are not writable by $(id -un) (normal for Homebridge in Docker) — patching with sudo"
+  fi
+  run "${SUDO_PATCH}env HOMEBRIDGE_DIR='$HOMEBRIDGE_DIR' HOMEBRIDGE_CONTAINER='$HB_CONTAINER' DOCKER_CMD='$DOCKER' PATCH_DIR='$REPO_DIR/patches/homebridge-plugin' bash '$REPO_DIR/scripts/apply-snapshot-patch.sh'"
 fi
 
 # ---- phase 6: homebridge snapshot mount (detect, can't safely auto-do) ------
@@ -192,10 +212,12 @@ if [ "$MOUNTED" = 1 ]; then
 else
   warn "Homebridge does NOT have the snapshot dir mounted — tiles will stay on the placeholder until you add it."
   cat <<EOF
-   Add this bind mount to how you run the Homebridge container and restart it:
+   Add this bind mount to how you run the Homebridge container:
        -v $SNAPS_DIR:/homebridge/nest-snaps
    (docker-compose: under the homebridge service's 'volumes:', add
         - $SNAPS_DIR:/homebridge/nest-snaps )
+   A running container cannot gain a mount, so 'docker restart' is not enough:
+   recreate it (docker rm + docker run, or 'docker compose up -d').
    This is the one step this installer can't do for you, because how you run
    Homebridge (compose / systemd / homebridge-config-ui) is yours to own.
 EOF
@@ -211,8 +233,7 @@ ok "go2rtc reports $warm warm receiver(s)"
 sleep 12
 # `ls` exits 2 when nothing matches, and under `set -euo pipefail` that propagated
 # through the assignment and killed the installer right here -- before the warn below
-# written for this exact case, and before the closing "do NOT docker restart" message,
-# which is the most important line the script prints. The `warm=` line above already
+# written for this exact case, and before the closing reload instructions. The `warm=` line above already
 # guards this way; this one did not. Zero snapshots is normal on a cold start or with
 # every camera switched off.
 n=$(find "$SNAPS_DIR" -maxdepth 1 -name '*.jpg' 2>/dev/null | wc -l | tr -d ' ') || n=0
@@ -238,16 +259,18 @@ then
        "hksvPrebufferSeconds": 6,
        "hksvPrebufferRetainSeconds": 15
 
-   then restart Homebridge. Verify with:
+   then reload Homebridge ($DOCKER exec $HB_CONTAINER pkill -x homebridge). Verify with:
        docker logs $HB_CONTAINER 2>&1 | grep "prebuffer.*serving"
 EOF
 else
   ok "HKSV prebuffer is enabled in $HB_CONFIG"
 fi
 echo
-say "Done. Reload Homebridge with:  $DOCKER exec $HB_CONTAINER pkill -x homebridge   (NOT docker restart -- that reinstalls plugins and wipes the patches). Then open Apple Home; tiles should show real images within a minute."
+say "Done. Reload Homebridge with:  $DOCKER exec $HB_CONTAINER pkill -x homebridge   (prefer this to docker restart: every container start runs npm install, which wipes the patches if the pinned plugin version differs from the installed one). Then open Apple Home; tiles should show real images within a minute."
 # The plugin patches land in dist/ on disk; the running process is still executing the code it
-# loaded at startup. If phase 5 did not have to recreate the container (snapshot mount already
-# present), nothing has restarted it, and tiles sit on the placeholder while everything reports
-# success. Saying this at the end is cheaper than the support question it prevents.
-[ "$MOUNTED" = 0 ] && warn "…once you add the snapshot bind mount to Homebridge (see above)."
+# loaded at startup, and nothing in this script restarts Homebridge, so tiles sit on the
+# placeholder while everything reports success until it is reloaded. Saying this at the end is
+# cheaper than the support question it prevents.
+# `if`, not `[ ] && warn`: as the script's last command, a false test made every run whose
+# mount was already in place exit 1 after succeeding.
+if [ "$MOUNTED" = 0 ]; then warn "…once you add the snapshot bind mount to Homebridge (see above)."; fi

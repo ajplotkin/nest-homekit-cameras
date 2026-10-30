@@ -6,11 +6,13 @@
 #
 # Before `docker compose up -d`:
 #   1. Build the patched go2rtc image (once):
-#        ./install.sh --rebuild --dry-run   # shows the build command, or just run install.sh
+#        ./install.sh --rebuild --dry-run --hb-config /path/to/homebridge/config.json
+#        (prints the build commands; or just run install.sh without --dry-run)
 #      or build it by hand — see the guide's "Build from this fork" (Part 3).
 #   2. Generate go2rtc.yaml from your Homebridge credentials:
-#        python3 scripts/nest-go2rtc-sync.py \
+#        python3 scripts/nest-go2rtc-sync.py --no-restart \
 #          --hb-config /path/to/homebridge/config.json --out ./go2rtc.yaml
+#      (--no-restart: the go2rtc container does not exist yet; compose starts it.)
 #   3. Create the snapshot dir (tmpfs recommended on SD-card systems — see the guide):
 #        sudo mkdir -p /run/nest-snaps
 #
