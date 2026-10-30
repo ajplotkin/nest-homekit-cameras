@@ -248,8 +248,9 @@ else
   # A revision mismatch is now real drift.
   WANT_TAG="$(grep -m1 '^FORK_BRANCH=' "$REPO_DIR/install.sh" 2>/dev/null | sed 's/.*:-//; s/}.*//')"
   if [ -n "$WANT_TAG" ]; then
-    G_REV="$(rexec "curl -s --max-time 8 http://127.0.0.1:${GO2RTC_API_PORT:-1985}/api 2>/dev/null" \
-             | tr -d '\r' | sed -n 's/.*"revision"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    # Read /api once: both the revision and "does it answer at all" come from this body.
+    G_API="$(rexec "curl -s --max-time 8 http://127.0.0.1:${GO2RTC_API_PORT:-1985}/api 2>/dev/null" | tr -d '\r')"
+    G_REV="$(printf '%s' "$G_API" | sed -n 's/.*"revision"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
     # Peeled ref (^{}) first: an annotated tag's own object is NOT the commit, and comparing
     # against the tag object would mismatch every time for annotated tags.
     WANT_SHA="$(git ls-remote "${FORK_URL:-https://github.com/ajplotkin/go2rtc}" \
@@ -258,34 +259,46 @@ else
                   "refs/tags/${WANT_TAG}" 2>/dev/null | cut -f1)"
 
     if [ -n "$G_REV" ] && [ -n "$WANT_SHA" ]; then
-      # go2rtc reports an abbreviated revision, so compare on its length.
-      if [ "${WANT_SHA:0:${#G_REV}}" = "$G_REV" ]; then
+      # go2rtc reports an abbreviated revision, plus ".dirty" when the tree it was built
+      # from had uncommitted changes. Compare the commit part on its own length.
+      G_BASE="${G_REV%.dirty}"
+      if [ "${WANT_SHA:0:${#G_BASE}}" = "$G_BASE" ] && [ "$G_BASE" = "$G_REV" ]; then
         printf "  %-34s %sok%s %s(rev %s == %s)%s\n" "generation" "$GRN" "$OFF" "$DIM" "$G_REV" "$WANT_TAG" "$OFF"
       else
         printf "  %-34s %sWRONG BUILD%s\n" "generation" "$RED" "$OFF"
-        printf "      %sRunning revision %s, but %s is %s.\n" "$DIM" "$G_REV" "$WANT_TAG" "${WANT_SHA:0:${#G_REV}}"
-        printf "      The running binary was NOT built from the tag this repo ships. Rebuild\n"
-        printf "      and redeploy -- see 'Building the go2rtc fork' in the README.%s\n" "$OFF"
+        printf "      %sRunning revision %s, but %s is %s.\n" "$DIM" "$G_REV" "$WANT_TAG" "${WANT_SHA:0:${#G_BASE}}"
+        if [ "$G_BASE" != "$G_REV" ] && [ "${WANT_SHA:0:${#G_BASE}}" = "$G_BASE" ]; then
+          printf "      Right commit, but built from a tree with uncommitted changes. Rebuild from a\n"
+          printf "      clean checkout of the tag ('./install.sh --rebuild' does this).%s\n" "$OFF"
+        elif [ "$G_BASE" != "$G_REV" ]; then
+          printf "      Built from a modified tree, e.g. v1.9.14 + patches/go2rtc-nest.patch. If that\n"
+          printf "      was deliberate this result is expected: the check can only prove a build of\n"
+          printf "      the fork tag. To make it provable, build from the tag ('./install.sh --rebuild').%s\n" "$OFF"
+        else
+          printf "      The running binary was NOT built from the tag this repo ships. Rebuild\n"
+          printf "      and redeploy ('./install.sh --rebuild', or 'Build from this fork' in the README).%s\n" "$OFF"
+        fi
         drift=$((drift + 1))
       fi
     else
-      # Degrade to the old name check rather than failing: no network (git ls-remote) or the
-      # API unreachable are both ordinary, and neither is evidence of drift. A binary that
-      # answers but carries no revision gets no name guess: its name proves nothing either.
-      if [ -z "$G_REV" ] && rexec "curl -s --max-time 8 http://127.0.0.1:${GO2RTC_API_PORT:-1985}/api 2>/dev/null" | grep -q '"version"'; then
-        printf "  %-34s %sunproven%s %s(no revision in the binary)%s\n" "generation" "$YEL" "$OFF" "$DIM" "$OFF"
+      # No proof either way. No network (git ls-remote) or the API unreachable are both
+      # ordinary, and neither is evidence of drift. No guess from the image name: install.sh's
+      # default name carries no tag, so a name check would cry wolf for every install.
+      printf "  %-34s %sunproven%s %s(rev check unavailable)%s\n" "generation" "$YEL" "$OFF" "$DIM" "$OFF"
+      if [ -z "$G_REV" ] && printf '%s' "$G_API" | grep -q '"version"'; then
         G_WHY="the binary carries no git revision (built without git, e.g. in golang:*-alpine; rebuild with install.sh --rebuild)"
+      elif [ -z "$G_REV" ]; then
+        G_WHY="go2rtc API unreachable"
       else
-        case "$G_IMAGE" in
-          *"${WANT_TAG##*-}"*)
-            printf "  %-34s %sname looks current%s %s(rev check unavailable)%s\n" "generation" "$YEL" "$OFF" "$DIM" "$OFF" ;;
-          *)
-            printf "  %-34s %sIMAGE PREDATES %s%s %s(rev check unavailable)%s\n" "generation" "$YEL" "$WANT_TAG" "$OFF" "$DIM" "$OFF" ;;
-        esac
-        if [ -z "$G_REV" ]; then G_WHY="go2rtc API unreachable"; else G_WHY="could not resolve $WANT_TAG (offline?)"; fi
+        G_WHY="could not resolve $WANT_TAG (offline?)"
       fi
       printf "      %sCould not prove the build: %s.%s\n" "$DIM" "$G_WHY" "$OFF"
+      # Not drift, but not a pass either: keep the verdict off "Everything checked is in sync".
+      missing=$((missing+1))
     fi
+  else
+    printf "  %-34s %sskipped%s: no FORK_BRANCH in install.sh\n" "generation" "$YEL" "$OFF"
+    missing=$((missing+1))
   fi
   checked=$((checked + 1))
   verified=$((verified + 1))
@@ -397,7 +410,7 @@ echo
 # a watchdog fix lived on the Pi and in the patch but was never pushed to the fork, so the
 # tag and the patch described different code while everything else reported green.
 #
-# Compares only the files the patch touches. The tag's diff against v1.9.14 covers ~109
+# Compares only the files the patch touches. The tag's diff against v1.9.14 covers 125
 # files, but the rest is upstream dev churn (website, README, xiaomi/tutk/kasa) that this
 # patch deliberately does not carry.
 if [ "$DEEP" = "1" ] && ! command -v gh >/dev/null 2>&1; then
@@ -420,12 +433,16 @@ if [ "$DEEP" = "1" ] && command -v gh >/dev/null 2>&1; then
       MISMATCH=""; NCHECK=0
       for pf in $(grep '^+++ b/' "$G2P" | sed 's|^+++ b/||' | sort -u); do
         NCHECK=$((NCHECK + 1))
-        # Compare the extracted bodies directly. This used `md5` (macOS-only) and selected the
-        # file with $3, which on a "+++ b/path" line is empty: both sides were always empty,
-        # so every file "matched" whatever the patch said. $2 is the path.
-        awk -v F="$pf" '/^\+\+\+ b\//{on=($2=="b/"F)} on && /^[-+ ]/ && !/^(\+\+\+|---)/' "$G2P" > "$WORK/g2p.body"
-        awk -v F="$pf" '/^\+\+\+ b\//{on=($2=="b/"F)} on && /^[-+ ]/ && !/^(\+\+\+|---)/' "$TAGDIFF" > "$WORK/tag.body"
-        if [ ! -s "$WORK/g2p.body" ] || ! cmp -s "$WORK/g2p.body" "$WORK/tag.body"; then MISMATCH="$MISMATCH $pf"; fi
+        # Compare the extracted bodies directly with cmp: an earlier version hashed them with
+        # md5 (macOS-only), and an earlier one still selected the file with $3, which on a
+        # "+++ b/path" line is empty, so every file "matched". $2 is the path.
+        # on=0 at every "diff --git": a deleted file's entry ("+++ /dev/null") never sets it,
+        # and would otherwise append its lines to the previous file's body.
+        awk -v F="$pf" '/^diff --git /{on=0} /^\+\+\+ b\//{on=($2=="b/"F)} on && /^[-+ ]/ && !/^(\+\+\+|---)/' "$G2P" > "$WORK/g2p.body"
+        awk -v F="$pf" '/^diff --git /{on=0} /^\+\+\+ b\//{on=($2=="b/"F)} on && /^[-+ ]/ && !/^(\+\+\+|---)/' "$TAGDIFF" > "$WORK/tag.body"
+        # Both empty (a new empty file, a binary or mode-only change) is a match; an empty
+        # body against a non-empty one is not.
+        cmp -s "$WORK/g2p.body" "$WORK/tag.body" || MISMATCH="$MISMATCH $pf"
       done
       if [ -z "$MISMATCH" ]; then
         printf "  %-34s %sall %s files match %s%s\n" "go2rtc-nest.patch" "$GRN" "$NCHECK" "$WANT_TAG" "$OFF"
@@ -436,12 +453,16 @@ if [ "$DEEP" = "1" ] && command -v gh >/dev/null 2>&1; then
         printf "      code. Anyone following the README gets something you are not running.%s\n" "$OFF"
         drift=$((drift + 1))
       fi
+      # checked, not verified: this compares the repo with GitHub and reads nothing from the
+      # deployment, so it must not stand in for one when every deployment path is wrong.
       checked=$((checked + 1))
-      verified=$((verified + 1))
     else
       printf "  %-34s %scould not fetch tag diff%s (offline?)\n" "go2rtc-nest.patch" "$YEL" "$OFF"
       missing=$((missing+1))
     fi
+  else
+    printf "  %-34s %sskipped%s: no patches/go2rtc-nest.patch, or no FORK_BRANCH in install.sh\n" "go2rtc-nest.patch" "$YEL" "$OFF"
+    missing=$((missing+1))
   fi
   echo
 fi
@@ -515,7 +536,7 @@ if [ "$drift" -eq 0 ] && [ "$missing" -eq 0 ]; then
   echo "${GRN}Everything checked is in sync.${OFF} ($checked artifacts, $verified checks)"
   exit 0
 fi
-[ "$missing" -gt 0 ] && echo "${YEL}$missing not deployed / unreadable${OFF} — expected if you run a subset."
+[ "$missing" -gt 0 ] && echo "${YEL}$missing check(s) could not run${OFF} (not deployed, unreadable, unproven, or a tool/file missing — see the yellow lines above)."
 if [ "$drift" -gt 0 ]; then
   echo "${RED}$drift drifted.${OFF} Decide direction before copying anything:"
   echo "  repo ahead  -> deploy the repo version"

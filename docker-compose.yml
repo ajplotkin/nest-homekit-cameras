@@ -7,8 +7,10 @@
 # Before `docker compose up -d`:
 #   1. Build the patched go2rtc image (once):
 #        ./install.sh --rebuild --dry-run --hb-config /path/to/homebridge/config.json
-#        (prints the build commands; or just run install.sh without --dry-run)
-#      or build it by hand — see the guide's "Build from this fork" (Part 3).
+#        (prints the build commands to run yourself), or build it by hand — see the
+#      guide's "Build from this fork" (Part 3). Don't run install.sh for real AND use
+#      this file: install.sh starts its own go2rtc container and warmer service, and
+#      `docker compose up -d` would then clash with that container name.
 #   2. Generate go2rtc.yaml from your Homebridge credentials:
 #        python3 scripts/nest-go2rtc-sync.py --no-restart \
 #          --hb-config /path/to/homebridge/config.json --out ./go2rtc.yaml
