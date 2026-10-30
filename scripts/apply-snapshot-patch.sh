@@ -13,7 +13,8 @@
 #   ./apply-snapshot-patch.sh
 #
 # With Homebridge in Docker the plugin's files are usually root-owned on the host (npm runs
-# as root in the container); if so, run it with sudo:  sudo HOMEBRIDGE_DIR=... ./apply-snapshot-patch.sh
+# as root in the container); if so, run it with sudo:
+#   sudo env HOMEBRIDGE_DIR=/path/to/homebridge bash ./apply-snapshot-patch.sh
 # DOCKER_CMD (default "docker") only changes the reload command printed at the end,
 # e.g. DOCKER_CMD="sudo docker" when your user is not in the docker group.
 set -uo pipefail
