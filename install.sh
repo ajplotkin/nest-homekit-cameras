@@ -109,15 +109,16 @@ else
   # Go writes its module cache read-only, so a plain `rm -rf` of a previous build fails even
   # for its owner; make it writable first. A build dir left root-owned by an older install.sh
   # still cannot be removed without sudo, and saying so beats a bare "Permission denied".
-  run "{ chmod -R u+w '$BUILD_TMP' 2>/dev/null; rm -rf '$BUILD_TMP'; } || die \"cannot remove $BUILD_TMP (left root-owned by an older install.sh?) -- run: sudo rm -rf '$BUILD_TMP'   then re-run\""
+  run "{ chmod -R u+w '$BUILD_TMP' 2>/dev/null; rm -rf '$BUILD_TMP'; } || { echo \"ERROR: cannot remove $BUILD_TMP (left root-owned by an older install.sh?) -- run: sudo rm -rf '$BUILD_TMP'   then re-run\" >&2; exit 1; }"
   # A shallow clone of an annotated tag prints "warning: ... is not a commit!" and a
   # detached-HEAD lecture even with --quiet; both are harmless and read like a failure.
   # Keep git's output in a log and show it only if the clone actually fails.
   # Source goes in .build/src, with the Go caches and the binary beside it, not inside it:
   # Go counts untracked files in the checkout as modifications and the binary would then
   # report revision "<sha>.dirty", which check-drift.sh reads as a wrong build.
-  run "git -c advice.detachedHead=false clone --quiet --branch '$FORK_BRANCH' --depth 1 '$FORK_URL' '$BUILD_TMP/src' 2>'$GO2RTC_DIR/.clone.log' || { cat '$GO2RTC_DIR/.clone.log' >&2; die \"git clone of $FORK_URL ($FORK_BRANCH) failed\"; }"
-  warn "the Go build below wants ~1-1.5 GB free RAM. On a low-memory host — e.g. a 2 GB Raspberry Pi already running Homebridge/HA — it can OOM and take services down. If that's your box, build the image on a beefier machine (this same repo, any arch you'll run) and move it over: 'docker save $IMAGE | ssh pi docker load', then re-run this script with --image $IMAGE (it detects the existing image and skips the build)."
+  run "mkdir -p '$BUILD_TMP'"
+  run "git -c advice.detachedHead=false clone --quiet --branch '$FORK_BRANCH' --depth 1 '$FORK_URL' '$BUILD_TMP/src' 2>'$BUILD_TMP/clone.log' || { cat '$BUILD_TMP/clone.log' >&2; echo \"ERROR: git clone of $FORK_URL ($FORK_BRANCH) failed\" >&2; exit 1; }"
+  warn "the Go build below pulls golang:1.24 (~1.3 GB on disk) and wants ~1-1.5 GB free RAM. On a low-memory host — e.g. a 2 GB Raspberry Pi already running Homebridge/HA — it can OOM and take services down. If that's your box, build the image on a beefier machine (this same repo, any arch you'll run) and move it over: 'docker save $IMAGE | ssh pi docker load', then re-run this script with --image $IMAGE (it detects the existing image and skips the build)."
   say "  compiling (arm64/amd64 native, a few minutes)…"
   # --user: as root the build would leave .build/ (and its Go caches) root-owned on the
   # host, and the next --rebuild's `rm -rf` as you would fail with Permission denied.
@@ -126,7 +127,7 @@ else
   # into the binary, go2rtc's /api then reports an empty revision, and check-drift.sh
   # cannot tell which tag is running. safe.directory: git refuses (exit 128, which fails
   # the whole build) to read a tree owned by another uid, as on a shared or sudo-made clone.
-  run "$DOCKER run --rm --user $(id -u):$(id -g) -v '$BUILD_TMP':/work -w /work/src -e HOME=/work -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/work/src -e GOFLAGS=-modcacherw -e GOCACHE=/work/.gocache -e GOMODCACHE=/work/.gomod golang:1.24 sh -c 'CGO_ENABLED=0 go build -trimpath -ldflags \"-s -w\" -o /work/go2rtc_patched .'"
+  run "$DOCKER run --rm --user '$(id -u):$(id -g)' -v '$BUILD_TMP':/work -w /work/src -e HOME=/work -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/work/src -e GOFLAGS=-modcacherw -e GOCACHE=/work/.gocache -e GOMODCACHE=/work/.gomod golang:1.24 sh -c 'CGO_ENABLED=0 go build -trimpath -ldflags \"-s -w\" -o /work/go2rtc_patched .'"
   # Build the image from a directory holding only the binary: the source tree plus the Go
   # module cache is hundreds of MB that `docker build` would otherwise send to the daemon.
   run "mkdir -p '$BUILD_TMP/image' && cp '$BUILD_TMP/go2rtc_patched' '$BUILD_TMP/image/go2rtc_patched'"

@@ -24,7 +24,7 @@ This guide walks through the full setup from scratch: getting API access to your
 
 The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-21)** — build from the stable tag **`nestfix-1.9.14-21`** (the tags are a branchless chain on top of upstream master, so build from the tag — there is no branch to check out). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
 
-Two things worth calling out for anyone arriving because their recordings are unreliable:
+For anyone arriving because their recordings are unreliable, two things matter most:
 **HKSV clips from the stock plugin are silent** (an `-an` overrides the whole audio block —
 [#234](https://github.com/potmat/homebridge-google-nest-sdm/issues/234)), and they **begin
 ~3.6s after Google's event timestamp**, which is late enough that HomeKit's own
@@ -61,7 +61,7 @@ Whichever row you're on, the `vEncoder: "copy"` note in [Part 2](#part-2-homebri
 
 ## Quick start (automated) — if Parts 1 & 2 are already done
 
-Most of Google Device Access (Part 1) **can** be scripted, which this guide used to deny. [`scripts/setup-google-device-access.sh`](scripts/setup-google-device-access.sh) automates the Cloud project, the SDM and Pub/Sub APIs, the topic, the `sdm-publisher` IAM binding, the pull subscription and the token exchange. Only four things genuinely need a browser and a human: the **$5 Device Access registration** (it takes a payment, and it is where you link the Pub/Sub topic), the **OAuth consent screen**, the **OAuth client**, and **approving the authorization URL**. The script walks you to each page and waits. The approach is [@WeekendSuperhero's](https://github.com/WeekendSuperhero), from [potmat/homebridge-google-nest-sdm#209](https://github.com/potmat/homebridge-google-nest-sdm/pull/209). Once you have those credentials in a working **Homebridge + homebridge-google-nest-sdm 1.1.25** install, the rest is one script.
+Most of Google Device Access (Part 1) **can** be scripted. [`scripts/setup-google-device-access.sh`](scripts/setup-google-device-access.sh) automates the Cloud project, the SDM and Pub/Sub APIs, the topic, the `sdm-publisher` IAM binding, the pull subscription and the token exchange. Only four things need a browser and a human: the **$5 Device Access registration** (it takes a payment, and it is where you link the Pub/Sub topic), the **OAuth consent screen**, the **OAuth client**, and **approving the authorization URL**. The script walks you to each page and waits. The approach is [@WeekendSuperhero's](https://github.com/WeekendSuperhero), from [potmat/homebridge-google-nest-sdm#209](https://github.com/potmat/homebridge-google-nest-sdm/pull/209). Once you have those credentials in a working **Homebridge + homebridge-google-nest-sdm 1.1.25** install, the rest is one script.
 
 **Option A — `install.sh`** (safe to re-run; builds the patched go2rtc image, sets up the tmpfs, generates the config, starts go2rtc, installs the warmer service, applies the plugin patches):
 
@@ -245,14 +245,16 @@ git checkout nestfix-1.9.14-21   # the release tag; the fork has no release bran
 ```bash
 # Build natively on a Pi (arm64, ~3 min). On a 2 GB Pi this can exhaust RAM and take
 # running services down with it — stop other containers first, or cross-compile elsewhere:
-echo go2rtc_patched >> .git/info/exclude   # so a rebuild here doesn't stamp the binary "dirty"
+grep -qx go2rtc_patched .git/info/exclude 2>/dev/null || echo go2rtc_patched >> .git/info/exclude   # a rebuild here must not stamp the binary "dirty"
 docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src \
   -e HOME=/tmp -e GOCACHE=/tmp/gocache -e GOMODCACHE=/tmp/gomod \
   -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0=/src \
   golang:1.24 sh -c \
   "CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o go2rtc_patched ."
-# golang:1.24 rather than -alpine: it has git, so the build records the commit and
-# go2rtc's /api reports it (check-drift.sh compares it to the tag). --user keeps the
+# golang:1.24 rather than -alpine (~1.3 GB on disk, three times the -alpine image): it has
+# git, so the build records the commit and go2rtc's /api reports it (check-drift.sh
+# compares it to the tag). On the patch-v1.9.14 route above the tree is modified, so the
+# binary reports v1.9.14's commit plus ".dirty" and that check reads WRONG BUILD. --user keeps the
 # output yours; safe.directory stops git refusing a tree owned by another uid, which
 # would otherwise fail the build with "error obtaining VCS status".
 ```
@@ -1042,6 +1044,7 @@ that could also "fix" would be the same hazard wearing a different hat.
 It reports, in order:
 
 - **Byte-identical artifacts** — the scripts and `PrebufferManager.js`, which should match exactly.
+- **Plugin version** — the `package.json` version field, as metadata only (see below).
 - **Reproducibility** (`--deep`) — fetches pristine `EXPECT_VER` from npm, applies this repo's
   diffs, and compares the result to your live `dist/`. Byte-identical or it isn't reproducible.
   This is the only check that actually proves your deployment is the one documented here.
@@ -1049,11 +1052,16 @@ It reports, in order:
   binary's self-reported git revision (`GET /api` -> `.revision`) against the fork tag `install.sh`
   builds. A mismatch is drift, not advice. A binary built without git (anything compiled in
   `golang:*-alpine`, including `install.sh` before 2026-10-30) carries no revision, and the check
-  reports it as `unproven`; rebuild with `./install.sh --rebuild` to make it provable.
+  reports it as `unproven` (not drift, but the run no longer ends "Everything checked is in
+  sync"); rebuild with `./install.sh --rebuild` to make it provable.
 - **Recovery kit freshness** — whether `~/nest-recovery/` on the box still matches the repo, since
   that kit is what you run when the patches are wiped (a plugin reinstall, or a container start
   whose pin no longer matches the installed version).
 - **Process age** — whether Homebridge has actually been reloaded since the last `dist/` write.
+- **Repo go2rtc patch vs fork tag** (`--deep`) — whether `patches/go2rtc-nest.patch` and the fork
+  tag describe the same code, file by file.
+- **Deployment inputs** — `vEncoder: copy` and the prebuffer setting in `config.json`, the number
+  of go2rtc streams, and whether the staged systemd units match `/etc`.
 - **Stale whole-file patch blobs** — this repo shipped whole-file copies before 2026-07-19 and
   moved to unified diffs precisely because pasting a stale whole file silently reverts everything
   done since. Any surviving `*.patched` tree can still do that, so it is flagged.
@@ -1092,12 +1100,12 @@ code is executing. Only `--deep` answers that.
 > files over first. Stage them once:
 >
 > ```bash
-> ssh you@your-pi 'mkdir -p ~/nest-recovery'
+> ssh you@your-pi 'mkdir -p ~/nest-recovery/scripts ~/nest-recovery/patches'
 > scp -r scripts/apply-snapshot-patch.sh you@your-pi:~/nest-recovery/scripts/
 > scp -r patches/homebridge-plugin you@your-pi:~/nest-recovery/patches/
 > ```
 >
-> Then recovery is `sudo HOMEBRIDGE_DIR=/path/to/homebridge ./apply-snapshot-patch.sh` followed
+> Then recovery is `sudo env HOMEBRIDGE_DIR=/path/to/homebridge bash ~/nest-recovery/scripts/apply-snapshot-patch.sh` followed
 > by the `pkill` reload.
 
 Exit status is 0 when clean and 1 on drift, so it works as a cron canary. When something has
