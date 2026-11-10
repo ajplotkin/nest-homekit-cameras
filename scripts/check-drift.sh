@@ -475,9 +475,21 @@ fi
 
 echo "Deployment inputs (outside the patch set)"
 HB_CONF="$HB_DIR/config.json"
+# config.json is often root-only (mode 600 under Homebridge in Docker). A plain grep then fails
+# exactly like a missing key, and this used to report MISSING for settings that were set. Read
+# it as-is if we can, else via non-interactive sudo (still read-only), else say it is unreadable.
+HB_READ=""
+if rexec "test -r '$HB_CONF'"; then HB_READ="grep"
+elif rexec "sudo -n test -r '$HB_CONF' 2>/dev/null"; then HB_READ="sudo -n grep"
+fi
 for k in '"vEncoder"[[:space:]]*:[[:space:]]*"copy"' '"hksvPrebufferSeconds"'; do
   label="$(echo "$k" | sed 's/\[\[:space:\]\]\*//g; s/"//g; s/:.*//')"
-  if rexec "grep -qE '$k' '$HB_CONF' 2>/dev/null"; then
+  if [ -z "$HB_READ" ]; then
+    printf "  %-34s %scould not read%s %s (not readable by this user, and no passwordless sudo)\n" "config.json $label" "$YEL" "$OFF" "$HB_CONF"
+    missing=$((missing+1))
+    continue
+  fi
+  if rexec "$HB_READ -qE '$k' '$HB_CONF' 2>/dev/null"; then
     printf "  %-34s %spresent%s\n" "config.json $label" "$GRN" "$OFF"
   else
     printf "  %-34s %sMISSING%s in %s\n" "config.json $label" "$RED" "$OFF" "$HB_CONF"
