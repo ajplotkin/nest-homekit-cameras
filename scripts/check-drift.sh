@@ -129,6 +129,8 @@ compare "nest-go2rtc-sync.py"       "scripts/nest-go2rtc-sync.py"       "$SCRIPT
 compare "go2rtc-wedge-detector.py"  "scripts/go2rtc-wedge-detector.py"  "$SCRIPTS_DIR/go2rtc-wedge-detector.py"
 compare "PrebufferManager.js"       "patches/homebridge-plugin/new-files/PrebufferManager.js" \
                                     "$PLUGIN_DIR/dist/PrebufferManager.js"
+compare "StreamKey.js"              "patches/homebridge-plugin/new-files/StreamKey.js" \
+                                    "$PLUGIN_DIR/dist/StreamKey.js"
 echo
 
 # --- 2. plugin version ----------------------------------------------------
@@ -170,13 +172,14 @@ if [ "$DEEP" = "1" ]; then
           pfail=1; drift=$((drift + 1)); }
       done
       cp "$REPO_DIR/patches/homebridge-plugin/new-files/PrebufferManager.js" "$B/package/dist/" 2>/dev/null
+      cp "$REPO_DIR/patches/homebridge-plugin/new-files/StreamKey.js" "$B/package/dist/" 2>/dev/null
       if [ "$pfail" -eq 0 ]; then
         # config.schema.json is patched above but was never COMPARED, so a wipe-recovery that
         # missed it stayed fully green. It drives the Homebridge UI's config form, so a stale
         # one hides hksvPrebuffer* from anyone editing through the UI.
         # NOTE: this list is hand-maintained. A new patched file must be added here or it is
         # silently uncovered -- the failure this very entry is fixing.
-        for f in sdm/Api.js sdm/Camera.js HksvStreamer.js StreamingDelegate.js PrebufferManager.js ../config.schema.json; do
+        for f in sdm/Api.js sdm/Camera.js HksvStreamer.js StreamingDelegate.js PrebufferManager.js StreamKey.js ../config.schema.json; do
           mkdir -p "$B/live/$(dirname "$f")"
           label="${f#../}"
           if ! rfetch "$PLUGIN_DIR/dist/$f" "$B/live/$f" || [ ! -s "$B/live/$f" ]; then
@@ -323,7 +326,8 @@ else
               "patches/homebridge-plugin/Api.js.patch|patches/homebridge-plugin/Api.js.patch" \
               "patches/homebridge-plugin/HksvStreamer.js.patch|patches/homebridge-plugin/HksvStreamer.js.patch" \
               "patches/homebridge-plugin/config.schema.json.patch|patches/homebridge-plugin/config.schema.json.patch" \
-              "patches/homebridge-plugin/new-files/PrebufferManager.js|patches/homebridge-plugin/new-files/PrebufferManager.js"; do
+              "patches/homebridge-plugin/new-files/PrebufferManager.js|patches/homebridge-plugin/new-files/PrebufferManager.js" \
+              "patches/homebridge-plugin/new-files/StreamKey.js|patches/homebridge-plugin/new-files/StreamKey.js"; do
     kf="${pair%%|*}"; rf="${pair##*|}"
     tmp="$WORK/kit_$(echo "$kf" | tr '/.' '__')"
     if rfetch "$KIT/$kf" "$tmp" && [ -s "$tmp" ]; then
@@ -399,6 +403,7 @@ echo
 #     encode, and hksvPrebufferSeconds is what makes the ring serve pre-trigger footage.
 #     Lose either and nothing DIFFERS; the box just quietly gets slower or shorter clips.
 #   * go2rtc stream keys -- the plugin derives them by slugifying the camera's room name
+#     (plus its customName or device id when a room holds two or more, see StreamKey.js)
 #     and never checks that go2rtc serves them, so a Google Home rename kills a camera
 #     with no drift anywhere. (Values are never printed: config.json holds OAuth secrets.)
 #   * systemd units -- if you keep a copy of the unit files in <scripts>/systemd-units/ (to

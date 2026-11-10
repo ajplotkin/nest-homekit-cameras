@@ -1,0 +1,797 @@
+{
+ "_comment": "Shared by test/stream-key.test.py (nest-go2rtc-sync.py) and test/stream-key.test.js (StreamKey.js). Both must derive the same names from the same devices. Device ids are fake; real ones are ~94 characters.",
+ "cases": [
+  {
+   "name": "one camera per room, with a thermostat sharing a camera's room (keys must not change)",
+   "golden": "one-camera-per-room.go2rtc.yaml",
+   "devices": [
+    {
+     "name": "enterprises/test-project/devices/AVPHwEtf-doorbell-0001",
+     "type": "sdm.devices.types.DOORBELL",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "Front Door"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Front door"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/AVPHwEtf-upstairs-0002",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "Pool"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Upstairs"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/AVPHwEtf-bedroom--0003",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "Primary Bedroom Upstairs"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Primary Bedroom"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/AVPHwEtf-living---0004",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Living Room"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/AVPHwEtf-thermo---0005",
+     "type": "sdm.devices.types.THERMOSTAT",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "Hallway"
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Living Room"
+      }
+     ]
+    }
+   ],
+   "expect_names": {
+    "AVPHwEtf-doorbell-0001": "Front door",
+    "AVPHwEtf-upstairs-0002": "Upstairs",
+    "AVPHwEtf-bedroom--0003": "Primary Bedroom",
+    "AVPHwEtf-living---0004": "Living Room"
+   },
+   "expect_streams": [
+    "front_door",
+    "upstairs",
+    "primary_bedroom",
+    "living_room"
+   ]
+  },
+  {
+   "name": "two cameras in one room plus a Nest Hub Max display",
+   "devices": [
+    {
+     "name": "enterprises/test-project/devices/H2-mom-dad--000001",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "Mom and Dad’s Room"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Mom & Dad's Room"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/H2-kitchen-display2",
+     "type": "sdm.devices.types.DISPLAY",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Kitchen"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/H2-petcam-000003",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "Petcam"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Living Room"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/H2-unnamed-cam-Qx-7Rb",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Living Room"
+      }
+     ]
+    }
+   ],
+   "expect_names": {
+    "H2-mom-dad--000001": "Mom & Dad's Room",
+    "H2-kitchen-display2": "Kitchen",
+    "H2-petcam-000003": "Living Room Petcam",
+    "H2-unnamed-cam-Qx-7Rb": "Living Room Qx-7Rb"
+   },
+   "expect_streams": [
+    "mom_dad_s_room",
+    "kitchen",
+    "living_room_petcam",
+    "living_room_qx_7rb"
+   ]
+  },
+  {
+   "name": "one camera per room plus a Nest Hub Max display in its own room: the display gets a stream",
+   "devices": [
+    {
+     "name": "enterprises/test-project/devices/H2-mom-dad--000001",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "Mom and Dad’s Room"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Mom & Dad's Room"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/H2-kitchen-display2",
+     "type": "sdm.devices.types.DISPLAY",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Kitchen"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/H2-petcam-000003",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "Petcam"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Den"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/H2-unnamed-cam-Qx-7Rb",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Living Room"
+      }
+     ]
+    }
+   ],
+   "expect_names": {
+    "H2-mom-dad--000001": "Mom & Dad's Room",
+    "H2-kitchen-display2": "Kitchen",
+    "H2-petcam-000003": "Den",
+    "H2-unnamed-cam-Qx-7Rb": "Living Room"
+   },
+   "expect_streams": [
+    "mom_dad_s_room",
+    "kitchen",
+    "den",
+    "living_room"
+   ]
+  },
+  {
+   "name": "two cameras in one room with the same customName fall back to the device id",
+   "devices": [
+    {
+     "name": "enterprises/test-project/devices/garage-one-AAA111",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "Cam"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Garage"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/garage-two-BBB222",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "Cam"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Garage"
+      }
+     ]
+    }
+   ],
+   "expect_names": {
+    "garage-one-AAA111": "Garage AAA111",
+    "garage-two-BBB222": "Garage BBB222"
+   },
+   "expect_streams": [
+    "garage_aaa111",
+    "garage_bbb222"
+   ]
+  },
+  {
+   "name": "room names that differ only in punctuation share a key, so they are disambiguated too",
+   "devices": [
+    {
+     "name": "enterprises/test-project/devices/lr-a-cam-xx0001",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Living Room"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/lr-b-cam-xx0002",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "living-room"
+      }
+     ]
+    }
+   ],
+   "expect_names": {
+    "lr-a-cam-xx0001": "Living Room xx0001",
+    "lr-b-cam-xx0002": "living-room xx0002"
+   },
+   "expect_streams": [
+    "living_room_xx0001",
+    "living_room_xx0002"
+   ]
+  },
+  {
+   "name": "device-id suffixes that differ only in case fall back to the whole id",
+   "devices": [
+    {
+     "name": "enterprises/test-project/devices/AAAAAAxyzABC",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Hall"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/BBBBBBXYZabc",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Hall"
+      }
+     ]
+    }
+   ],
+   "expect_names": {
+    "AAAAAAxyzABC": "Hall AAAAAAxyzABC",
+    "BBBBBBXYZabc": "Hall BBBBBBXYZabc"
+   },
+   "expect_streams": [
+    "hall_aaaaaaxyzabc",
+    "hall_bbbbbbxyzabc"
+   ]
+  },
+  {
+   "name": "a customName equal to another camera's id suffix falls back to the whole id",
+   "devices": [
+    {
+     "name": "enterprises/test-project/devices/kitchen-cam-zzzz01",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "abc123"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Office"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/other-cam-abc123",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Office"
+      }
+     ]
+    }
+   ],
+   "expect_names": {
+    "kitchen-cam-zzzz01": "Office kitchen-cam-zzzz01",
+    "other-cam-abc123": "Office other-cam-abc123"
+   },
+   "expect_streams": [
+    "office_kitchen_cam_zzzz01",
+    "office_other_cam_abc123"
+   ]
+  },
+  {
+   "name": "a customName with no ASCII letters or digits is treated as no name",
+   "devices": [
+    {
+     "name": "enterprises/test-project/devices/den-cam-one-d00001",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "☃☃"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Den"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/den-cam-two-d00002",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "Reading"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Den"
+      }
+     ]
+    }
+   ],
+   "expect_names": {
+    "den-cam-one-d00001": "Den d00001",
+    "den-cam-two-d00002": "Den Reading"
+   },
+   "expect_streams": [
+    "den_d00001",
+    "den_reading"
+   ]
+  },
+  {
+   "name": "a DISPLAY without CameraLiveStream gets no stream but still counts as a camera in its room",
+   "devices": [
+    {
+     "name": "enterprises/test-project/devices/study-camera-s00001",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Study"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/study-display-s00002",
+     "type": "sdm.devices.types.DISPLAY",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Study"
+      }
+     ]
+    }
+   ],
+   "expect_names": {
+    "study-camera-s00001": "Study s00001",
+    "study-display-s00002": "Study s00002"
+   },
+   "expect_streams": [
+    "study_s00001"
+   ]
+  },
+  {
+   "name": "a disambiguated name equal to another room's name falls back to the whole id; the camera alone in that other room keeps its key",
+   "devices": [
+    {
+     "name": "enterprises/test-project/devices/hall-camera-h00001",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "Cam"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Hall"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/hall-camera-h00002",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Hall"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/hallcam-room-h00003",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Hall Cam"
+      }
+     ]
+    }
+   ],
+   "expect_names": {
+    "hall-camera-h00001": "Hall hall-camera-h00001",
+    "hall-camera-h00002": "Hall h00002",
+    "hallcam-room-h00003": "Hall Cam"
+   },
+   "expect_streams": [
+    "hall_hall_camera_h00001",
+    "hall_h00002",
+    "hall_cam"
+   ]
+  },
+  {
+   "name": "a camera sharing its room with a Nest Hub Max: both are disambiguated (the camera's key is no longer the bare room)",
+   "devices": [
+    {
+     "name": "enterprises/test-project/devices/kitchen-camera-k00001",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "Fridge cam"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Kitchen"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/kitchen-hubmax-k00002",
+     "type": "sdm.devices.types.DISPLAY",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Kitchen"
+      }
+     ]
+    }
+   ],
+   "expect_names": {
+    "kitchen-camera-k00001": "Kitchen Fridge cam",
+    "kitchen-hubmax-k00002": "Kitchen k00002"
+   },
+   "expect_streams": [
+    "kitchen_fridge_cam",
+    "kitchen_k00002"
+   ]
+  },
+  {
+   "name": "a camera with no room gets no name and no stream",
+   "devices": [
+    {
+     "name": "enterprises/test-project/devices/roomless-cam-r00001",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "Orphan"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     }
+    },
+    {
+     "name": "enterprises/test-project/devices/porch-cam-p00001",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "Porch"
+      }
+     ]
+    }
+   ],
+   "expect_names": {
+    "porch-cam-p00001": "Porch"
+   },
+   "expect_streams": [
+    "porch"
+   ]
+  }
+ ]
+}

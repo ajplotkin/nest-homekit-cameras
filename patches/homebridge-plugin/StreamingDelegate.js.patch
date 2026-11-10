@@ -269,7 +269,7 @@
              ? [
                  "-acodec", "libfdk_aac",
                  ...(this.cameraRecordingConfiguration.audioCodec.type === 0 /* AAC_LC */ ?
-@@ -419,10 +554,153 @@
+@@ -419,10 +554,156 @@
                  "-b:a", `${this.cameraRecordingConfiguration.audioCodec.bitrate}k`,
                  "-ac", `${this.cameraRecordingConfiguration.audioCodec.audioChannels}`,
              ]
@@ -291,8 +291,9 @@
 +        // back to a direct Google WebRTC dial opened a SECOND concurrent Nest session that collides
 +        // with go2rtc's own (exhausts Google's per-device stream limit) -> failed/empty HKSV recording.
 +        // That collision belonged to the OLD snapshot-freshness gate. Under the current NAME-based
-+        // gate it cannot occur: displayName is the SDM room name, nest-go2rtc-sync.py derives go2rtc
-+        // stream keys from the same source, so a camera with no room has no go2rtc stream either --
++        // gate it cannot occur: displayName comes from the SDM room name (made unique per room by
++        // dist/StreamKey.js), nest-go2rtc-sync.py derives go2rtc stream keys by the same rule, so a
++        // camera with no room has no go2rtc stream either --
 +        // the direct dial is then that device's ONLY session. The fallback is therefore correct to
 +        // exist; it serves room-less cameras.
 +        // KNOWN FOOT-GUN, separate from the above: this checks only that the slug is NON-EMPTY, never
@@ -300,7 +301,9 @@
 +        // rtsp://127.0.0.1:8554/<new_slug> forever while go2rtc.yaml still holds the old key -- no
 +        // fallback fires (the slug is still truthy) and nothing re-runs nest-go2rtc-sync.py, so that
 +        // camera stays dead in HomeKit until someone does. Fail-fast is deliberate (a conflicting
-+        // Google dial would be worse), but re-run the sync script after ANY rename.
++        // Google dial would be worse), but re-run the sync script after ANY rename, and after any
++        // change to which cameras share a room: with two or more in a room the key also carries
++        // each camera's customName or device id (dist/StreamKey.js).
 +        const useGo2rtcRec = !!go2rtcKeyRec;
 +        if (useGo2rtcRec) {
 +            this.log.debug("HKSV recording: using local go2rtc RTSP (warm stream)", this.camera.getDisplayName());
@@ -427,7 +430,7 @@
          // Tear down any prior recording session before overwriting it. A HomeKit hub
          // can start a new recording (e.g. after a brief reconnect) before the previous
          // session's close event fires. Without this, the previous HksvStreamer — and
-@@ -437,12 +715,15 @@
+@@ -437,12 +718,15 @@
              hksvStreamer: hksvStreamer,
              nestStreamer: nestStreamer
          };
@@ -447,7 +450,7 @@
              for await (const box of this.recordingSessionInfo.hksvStreamer.generator()) {
                  pending.push(box.header, box.data);
                  const motionDetected = (_c = this.accessory.getService(this.hap.Service.MotionSensor)) === null || _c === void 0 ? void 0 : _c.getCharacteristic(this.platform.Characteristic.MotionDetected).value;
-@@ -450,6 +731,20 @@
+@@ -450,6 +734,20 @@
                  if (box.type === "moov" || box.type === "mdat") {
                      const fragment = Buffer.concat(pending);
                      pending.splice(0, pending.length);
@@ -468,7 +471,7 @@
                      const isLast = STOP_AFTER_MOTION_STOP && !motionDetected;
                      yield {
                          data: fragment,
-@@ -463,12 +758,57 @@
+@@ -463,12 +761,57 @@
              }
          }
          catch (error) {

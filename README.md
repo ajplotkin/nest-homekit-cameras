@@ -17,10 +17,11 @@ This guide walks through the full setup from scratch: getting API access to your
 ### What's in this repo
 
 - **This README** — the complete, from-scratch guide (start here and read top to bottom).
-- **[`install.sh`](install.sh)** — one-shot installer for everything after your Google credentials. Re-running is safe but **not** a no-op: it recreates the go2rtc container (dropping every warm stream) and rewrites the warmer unit. If your go2rtc config does **not** live at the default `~/go2rtc-nest`, pass `--go2rtc-dir` — otherwise a re-run builds a fresh config at the default path and your existing one goes unused. see [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
+- **[`install.sh`](install.sh)** — one-shot installer for everything after your Google credentials. Re-running is safe but **not** a no-op: it recreates the go2rtc container (dropping every warm stream) and rewrites the warmer and wedge-detector units. If your go2rtc config does **not** live at the default `~/go2rtc-nest`, pass `--go2rtc-dir` — otherwise a re-run builds a fresh config at the default path and your existing one goes unused. see [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
 - **[`docker-compose.yml`](docker-compose.yml)** — the go2rtc + warmer half of the stack as Compose services.
 - **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches), `setup-google-device-access.sh` (automates Part 1 — the Google Cloud half of the credentials setup), `test-prebuffer-e2e.js` (end-to-end proof the prebuffer ring actually recovers pre-trigger footage — see [Testing the prebuffer](#testing-the-prebuffer)), `check-drift.sh` (read-only; proves your deployment still matches this repo — see [Checking for drift](#checking-for-drift)), and `go2rtc-wedge-detector.py` (spots and optionally restarts a go2rtc stream that receives but stops forwarding — see [When go2rtc receives but forwards nothing](#when-go2rtc-receives-but-forwards-nothing--check-this-first)).
-- **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), five plugin diffs against stock 1.1.25 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`, `config.schema.json`), and `homebridge-plugin/new-files/PrebufferManager.js` (a new file, copied in rather than patched — it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)).
+- **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), five plugin diffs against stock 1.1.25 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`, `config.schema.json`), and two new files in `homebridge-plugin/new-files/`, copied in rather than patched: `PrebufferManager.js` (it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)) and `StreamKey.js` (unique names and stream keys for two or more cameras in one room; see [Key derivation](#discover-cameras-and-generate-the-config)).
+- **[`test/`](test/)** — off-box tests that need no cameras, network or root: `stream-key.test.py` and `stream-key.test.js` (the sync script and the plugin derive the same stream keys), `install-dry-run.test.sh` (what `install.sh --dry-run` would do), and the two prebuffer tests described under [Patch the Homebridge plugin](#patch-the-homebridge-plugin).
 
 The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-21)** — build from the stable tag **`nestfix-1.9.14-21`** (the tags are a branchless chain on top of upstream master, so build from the tag — there is no branch to check out). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
 
@@ -63,7 +64,7 @@ Whichever row you're on, the `vEncoder: "copy"` note in [Part 2](#part-2-homebri
 
 Most of Google Device Access (Part 1) **can** be scripted. [`scripts/setup-google-device-access.sh`](scripts/setup-google-device-access.sh) automates the Cloud project, the SDM and Pub/Sub APIs, the topic, the `sdm-publisher` IAM binding, the pull subscription and the token exchange. Only four things need a browser and a human: the **$5 Device Access registration** (it takes a payment, and it is where you link the Pub/Sub topic), the **OAuth consent screen**, the **OAuth client**, and **approving the authorization URL**. The script walks you to each page and waits. The approach is [@WeekendSuperhero's](https://github.com/WeekendSuperhero), from [potmat/homebridge-google-nest-sdm#209](https://github.com/potmat/homebridge-google-nest-sdm/pull/209). Once you have those credentials in a working **Homebridge + homebridge-google-nest-sdm 1.1.25** install, the rest is one script.
 
-**Option A — `install.sh`** (safe to re-run; builds the patched go2rtc image, sets up the tmpfs, generates the config, starts go2rtc, installs the warmer service, applies the plugin patches):
+**Option A — `install.sh`** (safe to re-run; builds the patched go2rtc image, sets up the tmpfs, generates the config, starts go2rtc, installs the warmer service and the [wedge detector](#when-go2rtc-receives-but-forwards-nothing--check-this-first) (detect-only), applies the plugin patches):
 
 ```bash
 git clone https://github.com/ajplotkin/nest-homekit-cameras.git
@@ -105,6 +106,8 @@ Google's docs cover this well. Here are the gotchas they don't emphasize:
 
 **Projects created after January 2025 must self-host their Pub/Sub topic.** Google stopped offering hosted topics for new projects ([release notes, 2025-01-23](https://developers.google.com/nest/device-access/release-notes)). You'll need to create a topic in your GCP project, grant `group:sdm-publisher@googlegroups.com` the `roles/pubsub.publisher` role, create a pull subscription, and register the topic in the Device Access Console. This is only needed for motion/doorbell events — camera streaming works without it.
 
+Enable the Pub/Sub API with gcloud, not the Cloud console. In November 2026 the console's *Enable* button for the Cloud Pub/Sub API did nothing, twice, and showed no error. `gcloud services enable pubsub.googleapis.com --project=YOUR_GCP_PROJECT_ID` enabled it at once, on a project with no billing account linked. [`scripts/setup-google-device-access.sh`](scripts/setup-google-device-access.sh) enables both APIs this way.
+
 **Include the `pubsub` scope in your refresh token** if you want motion and doorbell notifications. The authorization URL should include both `https://www.googleapis.com/auth/sdm.service` and `https://www.googleapis.com/auth/pubsub`.
 
 
@@ -114,6 +117,13 @@ screen's publishing status is **Testing** with user type **External**, Google
 [revokes refresh tokens after 7 days](https://developers.google.com/identity/protocols/oauth2#expiration).
 Everything works, then silently stops a week later. Set publishing status to **In
 production** (Google Auth Platform → Audience → *Publish app*).
+
+Publishing needs the Branding page completed first. In November 2026 the console refused
+*Publish app* until Google Auth Platform → Branding had an app name, a user support email,
+an application home page link and an application privacy policy link, and listed the
+domain of those two links under *Authorized domains* on the same page. The repository URL,
+`https://github.com/ajplotkin/nest-homekit-cameras`, was accepted for both links, with
+`github.com` as the authorized domain.
 
 You will *not* pass Google verification and do not need to: SDM uses a **restricted**
 scope, so a personal project stays permanently "unverified". The only consequence is
@@ -282,8 +292,8 @@ The script below reads your Nest credentials from Homebridge's own `config.json`
 The script is [`scripts/nest-go2rtc-sync.py`](scripts/nest-go2rtc-sync.py) in this repo — **copy it from there** rather than transcribing from this page. What it does:
 
 - Reads your Nest credentials straight from Homebridge's `config.json`.
-- Lists your cameras/doorbells via the SDM API.
-- Derives a **stream key** from each device's SDM **room name** — lowercased, non-alphanumeric → `_` — which is the single join key the warmer and the patched plugin also use. It refuses (loudly, non-zero) if two devices share a room, since the key would collide (see the one-camera-per-room note below).
+- Lists your cameras, doorbells and Nest Hub Max displays via the SDM API. A display gets a stream like a camera, as long as it advertises the `CameraLiveStream` trait: the plugin shows every display as a camera, so without a stream its live view, its recordings and (if you enable it) its HKSV prebuffer all dial `rtsp://127.0.0.1:8554/<key>` and fail, and its tile never gets a warm snapshot.
+- Derives a **stream key** for each camera from its display name — lowercased, non-alphanumeric → `_` — which is the single join key the warmer and the patched plugin also use. With one camera per room (a Nest Hub Max display counts as a camera) the display name is the SDM **room name**, so the key is the room (`living_room`). Two or more cameras in one room each get the room plus the camera's own name; see below.
 - Writes a URL-encoded `go2rtc.yaml` (with a `preload:` per camera) and restarts the go2rtc container.
 
 Grab it and make it executable:
@@ -295,16 +305,25 @@ chmod +x ~/scripts/nest-go2rtc-sync.py
 ```
 
 <details>
-<summary>Key-derivation detail (why the room name is the join key)</summary>
+<summary>Key-derivation detail (how a camera's stream key is chosen)</summary>
 
-Every layer must agree on the stream key or the plugin reads the wrong file. All three derive it identically from the SDM room `displayName`:
+Every layer must agree on the stream key, or the plugin dials a stream go2rtc does not serve and reads a snapshot file nobody writes. The sync script writes the keys into `go2rtc.yaml`, the warmer names each snapshot after its go2rtc stream, and the patched plugin derives the same key from the camera's display name:
 
 ```python
-# in the sync script, the plugin, and the warmer alike:
-key = re.sub(r"[^a-z0-9]+", "_", room_display_name.lower()).strip("_")
+key = re.sub(r"[^a-z0-9]+", "_", display_name.lower()).strip("_")
 ```
 
-This is also why **one camera per room** is required: two cameras in the same room derive the same key and would collide, so the sync script refuses to write that config.
+The display name is the SDM room `displayName` when the device is the only camera, doorbell or display in its room. Rooms are compared by key, so `Living Room` and `living-room` count as one room. With two or more in a room, each one's display name is:
+
+1. `<room> <customName>`, where customName is the name you gave the camera in the Google Home app, if that name is set and no other camera in the room has it;
+2. otherwise `<room> <last 6 characters of the device id>`;
+3. and if one of those names still gives the same key as another camera's, anywhere in the home (room "Hall" with a camera named "Cam", next to a room called "Hall Cam"), it gets `<room> <whole device id>` instead. A camera alone in its room is never renamed by this step.
+
+So a camera named Petcam and an unnamed camera, both in Living Room, become `living_room_petcam` and something like `living_room_qx_7rb`, and HomeKit sees "Living Room Petcam Camera" and "Living Room Qx-7Rb Camera". To replace the id characters with a readable name, name the camera in the Google Home app and re-run the sync.
+
+A camera alone in its room keeps the room as its key, whatever is in other rooms, so an install with one camera per room keeps every key it already had. There is one exception on upgrade: the sync script used to skip Nest Hub Max displays, so a camera sharing its room with one was alone as far as the old rule went, and is not now. Its key changes, from `kitchen` to `kitchen_<name>` say, so re-run the sync and apply the plugin patches together (see [Upgrading an install](#upgrading-an-install-made-from-an-earlier-version-of-this-repo)). Keys also change whenever the set of cameras sharing a room changes; see [After a room change](#after-a-room-change-homebridge-keeps-the-old-name).
+
+The rule is implemented in both places: `display_names()` in the sync script and [`StreamKey.js`](patches/homebridge-plugin/new-files/StreamKey.js) in the plugin. `test/stream-key.test.py` and `test/stream-key.test.js` run both against one fixture, [`test/fixtures/sdm-devices.json`](test/fixtures/sdm-devices.json), and the Python test also checks that a one-camera-per-room config comes out byte-identical to what the script wrote before this rule existed. `node test/stream-key.test.js --plugin /path/to/homebridge/node_modules/homebridge-google-nest-sdm` (inside the Homebridge container, where the plugin's dependencies are) also runs the patched plugin's own device listing against the fixture.
 
 </details>
 
@@ -336,11 +355,23 @@ It is **idempotent and change-detecting**: it regenerates the config, compares i
 
 It preserves the `log.level` already in your config, so a rebuild to pick up a new camera won't silently undo a level you set by hand. Pass `--log-level debug` (or `info`, `warn`, …) to set it explicitly.
 
-Note that a **newly added camera still appears in HomeKit before you do any of this** — the plugin discovers cameras from the SDM API directly. It just won't have a warm stream, so its tile shows the placeholder until you re-run the sync.
+A newly added camera appears in HomeKit the next time Homebridge starts, whether or not you have re-run the sync: the plugin lists devices from the SDM API itself, but only at startup. Until you re-run the sync it has no warm stream, so its tile shows the placeholder.
 
 The generated config is static, and the OAuth *refresh* token it embeds is long-lived (go2rtc mints short-lived access tokens itself at runtime), so a once-written config keeps working indefinitely. You only need to re-run this when your set of cameras or rooms changes.
 
 > **A go2rtc restart drops every warm stream.** When the config *has* changed, the script rewrites `go2rtc.yaml` and restarts the container to load it, and any restart tears down all active WebRTC sessions — tiles briefly fall back to the placeholder and live views drop until the streams re-warm (~30s) and re-extend. Running the script costs nothing when nothing changed, so a periodic timer is fine; it is the restart that is disruptive, and that only fires on a real change.
+
+#### After a room change, Homebridge keeps the old name
+
+These change a camera's stream key: moving it to another room; renaming its room; putting a second camera or a Nest Hub Max in its room; taking one of two cameras out of a room, which returns the other to the bare room key; and renaming a camera in the Google Home app while it shares a room. After any of them, re-run the sync script, then reload Homebridge (`docker exec homebridge pkill -x homebridge`) so the plugin derives the new key as well.
+
+The accessory name does not follow. Homebridge stores each accessory with the name it had when it was first added, in `accessories/cachedAccessories` under the Homebridge directory, and restores it from there on every start. The stream key and snapshot path come from the fresh device list, so streaming works after the reload. What stays old is the name in the Homebridge UI and log, and the name the Home app is offered when you pair the bridge.
+
+If the bridge is already paired, rename the tile in the Home app instead. Otherwise remove the stale accessory from Homebridge's cache and let the plugin add it again under its current name: in the Homebridge UI, Settings → *Remove Individual Accessories*, then pick the camera. The UI shuts Homebridge down before it edits the cache, and it does not restart the container.
+
+Deleting `cachedAccessories` while Homebridge runs does nothing. On shutdown, including the SIGTERM that `pkill` sends, Homebridge writes its in-memory cache back to that file, so the old name returns. To do it by hand, Homebridge has to be stopped with nothing respawning it, which with the official Docker image means stopping the container: `docker stop homebridge`, delete or edit the file, `docker start homebridge`. That is the one place this guide stops and starts the container instead of using `pkill`. The start runs `npm install` exactly as `docker restart` does (see [Patch the Homebridge plugin](#patch-the-homebridge-plugin)), so check first that the plugin pin is exact, and afterwards that `dist/PrebufferManager.js` and `dist/StreamKey.js` are still in the plugin directory; if either is missing, re-run `apply-snapshot-patch.sh`.
+
+Removing the cached accessory, from the UI or by hand, makes the Home app see it removed and added again. This was only done on a bridge that had not been paired yet, so whether a paired Home app keeps the tile's room, automations and recording settings through it is untested.
 
 ### Start go2rtc
 
@@ -464,7 +495,7 @@ The plugin needs a few small changes. They're shipped as unified diffs in **[`pa
 What the patches do:
 
 - **`Camera.js`** — `getSnapshot()` returns the warm JPEG from `/homebridge/nest-snaps/<key>.jpg` instead of the Google logo, falling back to the logo if the file is missing or older than 90 seconds (so an off camera shows the honest placeholder). On a motion/person event it creates `/homebridge/nest-snaps/.refresh` (via the plugin's `fs`, no subshell) to trigger an immediate warm-frame grab. The `<key>` is derived exactly as the sync script derives it, which is how the plugin finds the file the warmer wrote.
-- **`Api.js`** — **auto-reconnects the Pub/Sub subscription**. Upstream sets it up once and, on error, just stops — so a silently dropped streaming-pull connection permanently kills all camera events (no motion alerts, no HKSV recording) until you restart Homebridge. This re-subscribes on `error`/`close` with exponential backoff, plus a 12-hour proactive recycle to catch half-open stalls. Still open upstream as [PR #216](https://github.com/potmat/homebridge-google-nest-sdm/pull/216).
+- **`Api.js`** — **auto-reconnects the Pub/Sub subscription**. Upstream sets it up once and, on error, just stops — so a silently dropped streaming-pull connection permanently kills all camera events (no motion alerts, no HKSV recording) until you restart Homebridge. This re-subscribes on `error`/`close` with exponential backoff, plus a 12-hour proactive recycle to catch half-open stalls. Still open upstream as [PR #216](https://github.com/potmat/homebridge-google-nest-sdm/pull/216). It also calls `StreamKey.js` after listing devices, which gives two or more cameras in one room distinct names and stream keys (see [Key derivation](#discover-cameras-and-generate-the-config)), so keep `Api.js.patch` even if #216 is merged.
 - **`StreamingDelegate.js`** — optional; see [Part 6](#part-6-route-live-view-and-recording-through-go2rtc).
 
 Earlier versions of this repo carried several more patches; those fixes were merged upstream and ship in plugin 1.1.24. The [Related Issues and PRs](#related-issues-and-prs) index records which.
@@ -487,11 +518,26 @@ The script pins the plugin version it was cut against (**1.1.25**) and **refuses
 2. **Open an issue** on this repo asking for the patches to be re-cut against your version.
 3. **Re-cut them yourself.** Take a pristine copy of your plugin's `dist/`, apply each hunk from `patches/homebridge-plugin/*.patch` by hand (they are small and commented), then `diff -u` pristine against patched to produce new `.patch` files, and bump `EXPECT_VER` in `apply-snapshot-patch.sh`. Check the [Related Issues and PRs](#related-issues-and-prs) list first — if a patch has since been merged upstream, you may not need it at all.
 
-> **`PrebufferManager.js` is the exception to all of the above** — it is a whole file, not a diff, so there is nothing to re-cut and `patch` will never warn you that it has gone stale. On a new plugin release, check two things by hand: that `StreamingDelegate.js` still calls it the same way, and that upstream has not shipped its own prebuffer (see [#240](https://github.com/potmat/homebridge-google-nest-sdm/pull/240)) — if it has, drop ours rather than layering them. Then run `node test/prebuffer-noise.test.js` (it needs `node`, so run it on a workstation or inside the Homebridge container), which asserts the retry logging stays throttled both for a camera that was already off at startup and for one switched off after it had been streaming. It fakes ffmpeg, the clock and the timers, so it needs nothing running and finishes in about a second; it exits non-zero on failure. Also run `node test/prebuffer-dts-clamp.test.js`, which checks the reader's stderr restart rules: a burst of ffmpeg's timestamp-clamp warnings restarts the reader in all three wordings ffmpeg has used (6.0, 6.1, and 7.0 onward), including when the whole burst arrives as one chunk, while a burst below the threshold, outside the 10 s window, or of an unrelated DTS warning does not; and an RTP `bad cseq` line restarts it whatever the payload type, which ffmpeg prints in hex. Pass it a path to test another copy of the file, such as a plugin build's `dist/PrebufferManager.js`. (The other automated checks here are [`scripts/check-drift.sh`](scripts/check-drift.sh), which compares the Pi against this repo, and [`scripts/test-prebuffer-e2e.js`](scripts/test-prebuffer-e2e.js), which needs a live restreamer.)
+> **`PrebufferManager.js` is the exception to all of the above** — it is a whole file, not a diff, so there is nothing to re-cut and `patch` will never warn you that it has gone stale. On a new plugin release, check two things by hand: that `StreamingDelegate.js` still calls it the same way, and that upstream has not shipped its own prebuffer (see [#240](https://github.com/potmat/homebridge-google-nest-sdm/pull/240)) — if it has, drop ours rather than layering them. Then run `node test/prebuffer-noise.test.js` (it needs `node`, so run it on a workstation or inside the Homebridge container), which asserts the retry logging stays throttled both for a camera that was already off at startup and for one switched off after it had been streaming. It fakes ffmpeg, the clock and the timers, so it needs nothing running and finishes in about a second; it exits non-zero on failure. Also run `node test/prebuffer-dts-clamp.test.js`, which checks the reader's stderr restart rules: a burst of ffmpeg's timestamp-clamp warnings restarts the reader in all three wordings ffmpeg has used (6.0, 6.1, and 7.0 onward), including when the whole burst arrives as one chunk, while a burst below the threshold, outside the 10 s window, or of an unrelated DTS warning does not; and an RTP `bad cseq` line restarts it whatever the payload type, which ffmpeg prints in hex. Pass it a path to test another copy of the file, such as a plugin build's `dist/PrebufferManager.js`. `StreamKey.js` is a whole file too: on a new plugin release, check that `Api.js` still builds its device list in `list_devices()` the way the patch expects, then run `node test/stream-key.test.js --plugin <plugin dir>` and `python3 test/stream-key.test.py`. (The other automated checks here are [`scripts/check-drift.sh`](scripts/check-drift.sh), which compares the Pi against this repo, and [`scripts/test-prebuffer-e2e.js`](scripts/test-prebuffer-e2e.js), which needs a live restreamer.)
 
 > **These patches live in `node_modules` and are wiped by any `npm install` that names the plugin** (`npm install homebridge-google-nest-sdm@…`), even at the same version. Re-run `apply-snapshot-patch.sh` after any plugin install or upgrade — always in that order: `npm install` first, patch script second. (That is also how you *uninstall* them: reinstall the plugin and don't re-run the patcher.)
 >
-> **This applies all five patches plus one new file, including the Part 6 live-view routing** — the script has no per-patch switch. If you don't want Part 6, read it first and be aware Homebridge needs `--network host`.
+> **This applies all five patches plus two new files, including the Part 6 live-view routing** — the script has no per-patch switch. If you don't want Part 6, read it first and be aware Homebridge needs `--network host`.
+
+#### Upgrading an install made from an earlier version of this repo
+
+When a patch file in this repo changes, a plugin patched with the previous version no longer matches it, and `apply-snapshot-patch.sh` stops with `carries an OLDER generation of …` for that file instead of layering one version on another. `install.sh` runs the patch step before it regenerates `go2rtc.yaml`, so this refusal leaves go2rtc as it was. Put the named files back to stock 1.1.25 and run it again. On a host without npm (the usual case for Homebridge in Docker), fetch the stock tarball with curl, then copy each named file back, for example `Api.js` and `StreamingDelegate.js`:
+
+```bash
+cd "$(mktemp -d)"
+curl -fsSLO https://registry.npmjs.org/homebridge-google-nest-sdm/-/homebridge-google-nest-sdm-1.1.25.tgz
+tar xzf homebridge-google-nest-sdm-1.1.25.tgz
+P=/path/to/homebridge/node_modules/homebridge-google-nest-sdm
+sudo cp package/dist/sdm/Api.js "$P/dist/sdm/Api.js"
+sudo cp package/dist/StreamingDelegate.js "$P/dist/StreamingDelegate.js"
+```
+
+Then re-run this repo's `install.sh`, which also installs its own copy of the sync script before running it. If you run the steps by hand instead, run `apply-snapshot-patch.sh` and then this repo's `scripts/nest-go2rtc-sync.py`, not an older copy you saved elsewhere (an older one skips Nest Hub Max displays and refuses rooms with two cameras). Then reload Homebridge with `pkill`, and check with `scripts/check-drift.sh --deep`. The plugin patches and `go2rtc.yaml` have to come from the same version of this repo: the two sides each derive the stream keys, and a camera whose key differs between them gets no video.
 
 ## Part 5: Verify
 
@@ -757,9 +803,9 @@ Enable Homebridge debug logging, tap a camera tile, and look for the patch's own
 docker logs homebridge 2>&1 | grep "Using local go2rtc RTSP"
 ```
 
-If it appears, live view is coming from the warm stream. If instead you see the plugin opening a Google dial, `go2rtcKey` didn't match a stream name — compare the accessory name against the stream names in `curl -s http://127.0.0.1:1985/api/streams`.
+If it appears, live view is routed to the warm stream. That line appears whenever the camera's key is non-empty, even if go2rtc has no stream by that name: the plugin never falls back to a Google dial for a camera with a key, so a wrong key shows up as ffmpeg failing against `rtsp://127.0.0.1:8554/<key>` and a tile that will not play. (A Google dial instead means the key came out empty, which happens only for a camera with no room.) To check a key, compare the camera's key (its display name, lowercased, other characters → `_`; see [Key derivation](#discover-cameras-and-generate-the-config)) against the stream names in `curl -s http://127.0.0.1:1985/api/streams`. The accessory name can be an old one kept in Homebridge's cache (see [After a room change](#after-a-room-change-homebridge-keeps-the-old-name)), so it is not a reliable guide to the key.
 
-To undo Part 6: reinstall the plugin (`npm install --save-exact homebridge-google-nest-sdm@1.1.25`, inside the container for Docker) and don't re-run the patch script. That reverts all five patches and removes `PrebufferManager.js`, so re-apply them if you still want the snapshot fix — there is no per-patch switch.
+To undo Part 6: reinstall the plugin (`npm install --save-exact homebridge-google-nest-sdm@1.1.25`, inside the container for Docker) and don't re-run the patch script. That reverts all five patches and removes `PrebufferManager.js` and `StreamKey.js`, so re-apply them if you still want the snapshot fix — there is no per-patch switch.
 
 ### When go2rtc receives but forwards nothing — check this FIRST
 
@@ -817,23 +863,32 @@ defaults (500 KB per 30s interval before a frozen receiver counts as evidence) a
 source whose audio is ~4–8 KB/s; a source with high-bitrate audio needs re-tuning, because
 `bytes_recv` counts audio RTP too while the signal is video-only.
 
-To run it continuously, write this to `/etc/systemd/system/go2rtc-wedge-detector.service`,
-replacing `YOUR_USER` (who must be in the `docker` group for the recovery command to work
-once armed):
+`install.sh` runs it continuously, detect-only: it copies the script into `--scripts-dir`,
+writes `/etc/systemd/system/go2rtc-wedge-detector.service` (the unit below, with its user and
+paths filled in) running as the user who ran the installer, logs to `/var/log/nest/wedge-detector.log` with a weekly
+`/etc/logrotate.d/nest-wedge` entry, and enables and restarts the unit. To arm it, add `--arm`
+to the end of the `ExecStart` line, then
+`sudo systemctl daemon-reload && sudo systemctl restart go2rtc-wedge-detector`; that user must
+be in the `docker` group for the recovery command to work. A later run of `install.sh` keeps
+`--arm` if it finds it on `ExecStart` (a mention in a comment does not count).
+
+Without `install.sh`, write the same unit yourself, replacing `YOUR_USER` and the script path:
 
 ```ini
 [Unit]
 Description=Detect a go2rtc stream that receives media but forwards none of it
+Documentation=https://github.com/ajplotkin/nest-homekit-cameras#when-go2rtc-receives-but-forwards-nothing--check-this-first
 After=docker.service
 Wants=docker.service
 
 [Service]
 Type=simple
 User=YOUR_USER
-# No --arm: this only observes and logs. Append --arm once you have confirmed a quiet
-# period, then: sudo systemctl daemon-reload && sudo systemctl restart go2rtc-wedge-detector
-ExecStart=/usr/bin/python3 /home/YOUR_USER/scripts/go2rtc-wedge-detector.py \
-  --api http://127.0.0.1:1985/api/streams --interval 30
+# Without --arm on ExecStart this only observes and logs. To arm it, append --arm to
+# ExecStart, then: sudo systemctl daemon-reload && sudo systemctl restart go2rtc-wedge-detector
+ExecStart=/usr/bin/python3 /home/YOUR_USER/scripts/go2rtc-wedge-detector.py --api http://127.0.0.1:1985/api/streams --interval 30
+StandardOutput=append:/var/log/nest/wedge-detector.log
+StandardError=append:/var/log/nest/wedge-detector.log
 Restart=always
 RestartSec=30
 
@@ -842,16 +897,21 @@ WantedBy=multi-user.target
 ```
 
 ```bash
+sudo mkdir -p /var/log/nest
 sudo systemctl daemon-reload
 sudo systemctl enable --now go2rtc-wedge-detector.service
-journalctl -u go2rtc-wedge-detector -f
+tail -f /var/log/nest/wedge-detector.log
 ```
+
+The log goes to that file, not the journal, so `journalctl -u go2rtc-wedge-detector` shows
+only systemd's own start and stop lines. Because systemd holds the file open, rotate it with
+`copytruncate`, as the `install.sh` logrotate entry does.
 
 Confirm what is actually running before trusting it — the log line states it, and so does the
 process:
 
 ```bash
-journalctl -u go2rtc-wedge-detector -n 3 | grep armed=
+grep armed= /var/log/nest/wedge-detector.log | tail -1
 ps -eo args | grep "[w]edge-detector.py"
 ```
 
@@ -1043,7 +1103,7 @@ that could also "fix" would be the same hazard wearing a different hat.
 
 It reports, in order:
 
-- **Byte-identical artifacts** — the scripts and `PrebufferManager.js`, which should match exactly.
+- **Byte-identical artifacts** — the scripts, `PrebufferManager.js` and `StreamKey.js`, which should match exactly.
 - **Plugin version** — the `package.json` version field, as metadata only (see below).
 - **Reproducibility** (`--deep`) — fetches pristine `EXPECT_VER` from npm, applies this repo's
   diffs, and compares the result to your live `dist/`. Byte-identical or it isn't reproducible.
@@ -1118,7 +1178,7 @@ or the box may be ahead and carrying an undeployed hotfix (commit it).
 - [homebridge-google-nest-sdm #214](https://github.com/potmat/homebridge-google-nest-sdm/issues/214) — Api.js crash on `relationUpdate` events
 - [homebridge-google-nest-sdm #215](https://github.com/potmat/homebridge-google-nest-sdm/issues/215) — README corrections (project ID confusion, self-hosted Pub/Sub, Node regression)
 - [homebridge-google-nest-sdm PR #212](https://github.com/potmat/homebridge-google-nest-sdm/pull/212) by [@littlepope81](https://github.com/littlepope81) — stream startup latency + configurable `analyzeduration`/`probesize` — **merged in 1.1.24**
-- [homebridge-google-nest-sdm PR #216](https://github.com/potmat/homebridge-google-nest-sdm/pull/216) — the Pub/Sub auto-reconnect fix from this repo — **open** (events silently stopping after a connection drop); still carried here as `Api.js.patch`
+- [homebridge-google-nest-sdm PR #216](https://github.com/potmat/homebridge-google-nest-sdm/pull/216) — the Pub/Sub auto-reconnect fix from this repo — **open** (events silently stopping after a connection drop); still carried here as `Api.js.patch`, which also carries the `StreamKey.js` hook for two or more cameras in one room, so it stays even if #216 is merged
 - [homebridge-google-nest-sdm PR #217](https://github.com/potmat/homebridge-google-nest-sdm/pull/217) — the HKSV recording session-leak fix from this repo (orphaned ffmpeg / memory growth; relates to #150) — **merged in 1.1.24**
 - [homebridge-google-nest-sdm PR #223](https://github.com/potmat/homebridge-google-nest-sdm/pull/223) — HKSV recording-lifecycle hardening from this repo (hang-on-dead-input, stale-close, teardown-rejection) — **merged in 1.1.24**
 - [homebridge-google-nest-sdm PR #224](https://github.com/potmat/homebridge-google-nest-sdm/pull/224) — reset the recording session in a `finally` (follow-up to #223) — **open**; still carried here in `StreamingDelegate.js.patch`

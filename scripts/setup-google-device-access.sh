@@ -188,12 +188,13 @@ for api in smartdevicemanagement.googleapis.com pubsub.googleapis.com; do
     run gcloud services enable "$api" --project="$PROJECT_ID"
     # Same reasoning as the project check: verify, because everything downstream
     # (topic, IAM binding, subscription) depends on these and would fail one by one
-    # with less obvious errors. Enabling an API on a brand-new project is the step
-    # most likely to demand a billing account be linked -- which is free to attach
-    # and is not the $5 Device Access fee.
+    # with less obvious errors. This message used to blame billing first. On 2026-11-09
+    # `gcloud services enable` enabled each of these APIs at once on a new project with no
+    # billing account (Pub/Sub after the Cloud console's Enable button had silently done
+    # nothing twice), so it now points at gcloud's own error and mentions billing last.
     if [ "$APPLY" = "1" ] && ! gcloud services list --enabled --project="$PROJECT_ID" 2>/dev/null \
          | awk -v a="$api" 'NR>1 && $1==a {f=1} END{exit !f}'; then
-      fail "enabled $api but it is still not listed. Usually this means the project needs a billing account linked: https://console.cloud.google.com/billing/linkedaccount?project=$PROJECT_ID (free to attach; separate from the \$5 Device Access fee). Link one and re-run."
+      fail "enabled $api but it is still not listed. Read gcloud's output above for the reason, then re-run this script (it reuses what already exists). Both APIs have been seen to enable on a project with no billing account, so link one only if gcloud's error asks for it: https://console.cloud.google.com/billing/linkedaccount?project=$PROJECT_ID (free to attach; separate from the \$5 Device Access fee)."
     fi
   fi
 done
@@ -208,6 +209,14 @@ cat <<EOF
     4. Save and continue through each step
     5. Under Audience -> Test users, ADD $ACCOUNT   <- skipping this is the
        single most common cause of 'access_denied' later
+    6. Under Branding, fill in an application home page link AND an application
+       privacy policy link, and add their domain under Authorized domains. In
+       November 2026 Google would not publish the app without them. The
+       repository URL was accepted for both:
+         https://github.com/ajplotkin/nest-homekit-cameras   (domain: github.com)
+    7. Under Audience, click Publish app (status: In production). While it stays
+       in Testing, Google revokes the refresh token after 7 days and the cameras
+       stop working with no warning.
 EOF
 pause
 

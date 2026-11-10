@@ -6,7 +6,9 @@
 #
 # Re-running is safe but not a no-op: it skips the image build and patches that are
 # already applied, but it recreates the go2rtc container (dropping every warm stream)
-# and rewrites the warmer unit. It changes nothing it can't safely own — the one
+# and rewrites the warmer and wedge-detector units. Of your own edits to the wedge-detector
+# unit only --arm survives a re-run; anything else in that file is overwritten. It changes
+# nothing else it can't safely own — the one
 # step it can't do for you (mounting the snapshot dir into YOUR Homebridge
 # container) is detected and printed as an exact instruction rather than guessed at.
 #
@@ -40,6 +42,11 @@ FORK_URL="${FORK_URL:-https://github.com/ajplotkin/go2rtc.git}"
 FORK_BRANCH="${FORK_BRANCH:-nestfix-1.9.14-21}"
 BASE_IMAGE="${BASE_IMAGE:-alexxit/go2rtc:1.9.14}"
 PLUGIN_VER="1.1.25"
+# Where the wedge-detector unit and its logrotate entry go. Overridable so the dry-run test can
+# point them at a scratch dir; you should not need to.
+WEDGE_UNIT="${WEDGE_UNIT:-/etc/systemd/system/go2rtc-wedge-detector.service}"
+WEDGE_LOGROTATE="${WEDGE_LOGROTATE:-/etc/logrotate.d/nest-wedge}"
+WEDGE_LOG_DIR=/var/log/nest
 REBUILD=0
 DRY_RUN=0
 
@@ -94,7 +101,7 @@ ok "Homebridge config has Nest credentials: $HB_CONFIG"
 PLUGIN_DIR="$HOMEBRIDGE_DIR/node_modules/homebridge-google-nest-sdm"
 if [ -f "$PLUGIN_DIR/package.json" ]; then
   cur=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['version'])" "$PLUGIN_DIR/package.json" 2>/dev/null || echo "?")
-  [ "$cur" = "$PLUGIN_VER" ] && ok "plugin version $cur" || warn "plugin is $cur, patches are cut for $PLUGIN_VER — patch step will refuse; re-cut diffs first"
+  [ "$cur" = "$PLUGIN_VER" ] && ok "plugin version $cur" || warn "plugin is $cur, patches are cut for $PLUGIN_VER — the patch step will refuse and the install stops there, before go2rtc is configured; pin $PLUGIN_VER or re-cut the diffs first"
 else
   warn "plugin not found at $PLUGIN_DIR — the plugin-patch step will be skipped (set --homebridge-dir)"
 fi
@@ -148,15 +155,42 @@ if [ "$SNAPS_DIR" = "/run/nest-snaps" ]; then
 fi
 run "mkdir -p '$SNAPS_DIR'"
 
+# ---- phase 2b: plugin patches -----------------------------------------------
+# Runs BEFORE phase 3 on purpose. The patched plugin and the sync script must derive the same
+# stream keys, and the patcher refuses (exit 1, ending this script under set -e) when a file
+# carries an older generation of a patch, as every upgraded install does after a patch changes.
+# Run after phase 3, that refusal came after go2rtc.yaml had been regenerated with the NEW keys
+# and go2rtc restarted on them, leaving the plugin on the OLD keys: any camera whose key changed
+# was dead until someone noticed. Run first, a refusal leaves go2rtc exactly as it was.
+if [ -f "$PLUGIN_DIR/package.json" ]; then
+  say "Patch the Homebridge plugin"
+  # Homebridge in Docker runs npm as root, so on the host the plugin's files are usually
+  # root-owned and a plain-user patch run cannot write them. It exited 1 here, which under
+  # `set -e` ended the installer before the mount check and the closing instructions.
+  SUDO_PATCH=""
+  if [ ! -w "$PLUGIN_DIR" ] || [ ! -w "$PLUGIN_DIR/dist" ] || [ ! -w "$PLUGIN_DIR/dist/sdm" ]; then
+    SUDO_PATCH="sudo "
+    warn "plugin files are not writable by $(id -un) (normal for Homebridge in Docker) — patching with sudo"
+  fi
+  run "${SUDO_PATCH}env HOMEBRIDGE_DIR='$HOMEBRIDGE_DIR' HOMEBRIDGE_CONTAINER='$HB_CONTAINER' DOCKER_CMD='$DOCKER' PATCH_DIR='$REPO_DIR/patches/homebridge-plugin' bash '$REPO_DIR/scripts/apply-snapshot-patch.sh'"
+  # The patcher's own "reload now" advice is for running it alone. Here go2rtc.yaml is not
+  # regenerated yet, and a plugin reloaded now would dial keys the old config may not serve.
+  warn "don't reload Homebridge yet: go2rtc.yaml is regenerated below; the reload command is printed at the end"
+fi
+
 # ---- phase 3: scripts + generate config + start go2rtc ----------------------
 say "Install helper scripts into $SCRIPTS_DIR"
 run "mkdir -p '$SCRIPTS_DIR'"
-for s in nest-go2rtc-sync.py go2rtc-snapshot-warmer.sh; do
+for s in nest-go2rtc-sync.py go2rtc-snapshot-warmer.sh go2rtc-wedge-detector.py; do
   run "install -m 0755 '$REPO_DIR/scripts/$s' '$SCRIPTS_DIR/$s'"
 done
-did "sync + warmer installed"
+did "sync + warmer + wedge detector installed"
 
 say "Generate go2rtc.yaml from your Homebridge credentials"
+# Create --go2rtc-dir HERE, not only in the build step above: with --image <existing> the
+# build is skipped, nothing had made the directory, and on a fresh machine the sync script
+# died with FileNotFoundError on go2rtc.yaml.tmp. (Seen on a fresh Pi, 2026-11-09.)
+run "mkdir -p '$GO2RTC_DIR'"
 # --no-restart: the container is created a few lines below and reads this file on
 # startup, so there is nothing to restart yet. Without the flag, the sync script's
 # `docker restart` fails on a fresh machine, exits 1, and takes this whole installer
@@ -196,19 +230,74 @@ run "sudo systemctl daemon-reload"
 run "sudo systemctl enable --now go2rtc-snapshot-warmer.service"
 did "warmer service enabled + started"
 
-# ---- phase 5: plugin patches ------------------------------------------------
-if [ -f "$PLUGIN_DIR/package.json" ]; then
-  say "Patch the Homebridge plugin"
-  # Homebridge in Docker runs npm as root, so on the host the plugin's files are usually
-  # root-owned and a plain-user patch run cannot write them. It exited 1 here, which under
-  # `set -e` ended the installer before the mount check and the closing instructions.
-  SUDO_PATCH=""
-  if [ ! -w "$PLUGIN_DIR" ] || [ ! -w "$PLUGIN_DIR/dist" ] || [ ! -w "$PLUGIN_DIR/dist/sdm" ]; then
-    SUDO_PATCH="sudo "
-    warn "plugin files are not writable by $(id -un) (normal for Homebridge in Docker) — patching with sudo"
-  fi
-  run "${SUDO_PATCH}env HOMEBRIDGE_DIR='$HOMEBRIDGE_DIR' HOMEBRIDGE_CONTAINER='$HB_CONTAINER' DOCKER_CMD='$DOCKER' PATCH_DIR='$REPO_DIR/patches/homebridge-plugin' bash '$REPO_DIR/scripts/apply-snapshot-patch.sh'"
+# ---- phase 4b: wedge detector (detect-only) ---------------------------------
+# Watches go2rtc for a stream that keeps receiving from Google but forwards nothing (see the
+# guide, "When go2rtc receives but forwards nothing"). Detect-only: it logs and runs nothing.
+# A unit you armed by hand stays armed: re-running this must not quietly disarm it. Only the
+# ExecStart line (with its backslash continuations) is read, because a unit can mention --arm
+# in a comment or a Description without being armed.
+say "Install go2rtc wedge detector (detect-only unless you armed it)"
+WEDGE_ARM=""
+if [ -f "$WEDGE_UNIT" ] && awk '/^[[:space:]]*ExecStart=/{on=1} on{print; if ($0 !~ /\\$/) on=0}' "$WEDGE_UNIT" \
+     | grep -Eq -- '(^|[[:space:]])--arm([[:space:]]|$)'; then
+  WEDGE_ARM=" --arm"
+  warn "existing $WEDGE_UNIT is armed; kept --arm"
 fi
+# A drop-in (systemctl edit) overrides whatever is written below, armed or not.
+if ls "$WEDGE_UNIT.d"/*.conf >/dev/null 2>&1; then
+  warn "drop-ins in $WEDGE_UNIT.d/ override this unit (an --arm there still applies): check them"
+fi
+# Same user as everything else this script installs: $SCRIPTS_DIR defaults under $HOME, so a
+# different user could not even read the script.
+WEDGE_USER="$(id -un)"
+# The system python, not whatever python3 is first on PATH: an active venv or pyenv shim would
+# otherwise be written into a unit that runs without that environment.
+if [ -x /usr/bin/python3 ]; then PY3=/usr/bin/python3; else PY3="$(command -v python3)"; fi
+run "sudo mkdir -p $WEDGE_LOG_DIR"
+run "sudo tee '$WEDGE_UNIT' >/dev/null <<UNIT
+[Unit]
+Description=Detect a go2rtc stream that receives media but forwards none of it
+Documentation=https://github.com/ajplotkin/nest-homekit-cameras#when-go2rtc-receives-but-forwards-nothing--check-this-first
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=$WEDGE_USER
+# Written by install.sh. Without --arm on ExecStart this only observes and logs. To arm it,
+# append --arm to ExecStart, then: sudo systemctl daemon-reload && sudo systemctl restart
+# go2rtc-wedge-detector. Re-running install.sh keeps --arm when it finds it here.
+ExecStart=$PY3 $SCRIPTS_DIR/go2rtc-wedge-detector.py --api http://127.0.0.1:1985/api/streams --interval 30$WEDGE_ARM
+StandardOutput=append:$WEDGE_LOG_DIR/wedge-detector.log
+StandardError=append:$WEDGE_LOG_DIR/wedge-detector.log
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+UNIT"
+# systemd keeps the log open for append, so rotate with copytruncate.
+if [ -d "$(dirname "$WEDGE_LOGROTATE")" ]; then
+  run "sudo tee '$WEDGE_LOGROTATE' >/dev/null <<ROT
+$WEDGE_LOG_DIR/wedge-detector.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+ROT"
+else
+  warn "$(dirname "$WEDGE_LOGROTATE") not found; $WEDGE_LOG_DIR/wedge-detector.log will not be rotated"
+fi
+run "sudo systemctl daemon-reload"
+# restart, not enable --now: a rewritten unit only takes effect on a restart, and restarting
+# the detector loses nothing but its baselines.
+run "sudo systemctl enable go2rtc-wedge-detector.service"
+run "sudo systemctl restart go2rtc-wedge-detector.service"
+if [ -n "$WEDGE_ARM" ]; then did "wedge detector enabled + started (ARMED: kept from your unit)"; else did "wedge detector enabled + started (detect-only; log $WEDGE_LOG_DIR/wedge-detector.log)"; fi
 
 # ---- phase 6: homebridge snapshot mount (detect, can't safely auto-do) ------
 say "Check Homebridge sees the snapshot directory"

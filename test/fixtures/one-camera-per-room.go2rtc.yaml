@@ -1,0 +1,28 @@
+api:
+  listen: "127.0.0.1:1985"
+rtsp:
+  listen: ":8554"
+webrtc:
+  listen: ":8555"
+log:
+  level: info
+
+streams:
+  front_door:
+    - "nest:?client_id=test-client&client_secret=test-secret&device_id=AVPHwEtf-doorbell-0001&project_id=test-project&protocols=WEB_RTC&refresh_token=test-refresh"
+    - "ffmpeg:front_door#video=mjpeg"
+  upstairs:
+    - "nest:?client_id=test-client&client_secret=test-secret&device_id=AVPHwEtf-upstairs-0002&project_id=test-project&protocols=WEB_RTC&refresh_token=test-refresh"
+    - "ffmpeg:upstairs#video=mjpeg"
+  primary_bedroom:
+    - "nest:?client_id=test-client&client_secret=test-secret&device_id=AVPHwEtf-bedroom--0003&project_id=test-project&protocols=WEB_RTC&refresh_token=test-refresh"
+    - "ffmpeg:primary_bedroom#video=mjpeg"
+  living_room:
+    - "nest:?client_id=test-client&client_secret=test-secret&device_id=AVPHwEtf-living---0004&project_id=test-project&protocols=WEB_RTC&refresh_token=test-refresh"
+    - "ffmpeg:living_room#video=mjpeg"
+
+preload:
+  front_door: "video"
+  upstairs: "video"
+  primary_bedroom: "video"
+  living_room: "video"

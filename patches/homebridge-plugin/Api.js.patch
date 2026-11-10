@@ -126,7 +126,26 @@
          }
      }
      async list_devices() {
-@@ -141,4 +206,8 @@
+@@ -133,6 +198,18 @@
+                 }
+             })
+                 .value();
++            // PATCHED: give two or more cameras in one room (a Nest Hub Max counts) distinct
++            // display names, and so distinct go2rtc stream keys, snapshot files and HomeKit names;
++            // stock gives them all the room name. A camera alone in its room keeps the room name.
++            // The rule lives in dist/StreamKey.js and MUST match scripts/nest-go2rtc-sync.py,
++            // which writes the keys. This hook is why Api.js.patch must stay even if the Pub/Sub
++            // reconnect above is merged upstream.
++            try {
++                require('../StreamKey').applyUniqueNames(this.devices);
++            }
++            catch (e) {
++                this.log.warn(`Could not make camera names unique per room; cameras that share a room will dial a go2rtc stream that does not exist: ${e}`);
++            }
+         }
+         catch (error) {
+             this.log.error(`Could not execute device LIST request: ${(0, ApiError_1.describeApiError)(error)}`);
+@@ -141,4 +218,8 @@
      }
  }
  exports.SmartDeviceManagement = SmartDeviceManagement;

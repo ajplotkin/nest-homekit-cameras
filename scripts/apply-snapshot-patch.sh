@@ -73,8 +73,11 @@ patches=(
 
 # New files, copied rather than patched. Must land BEFORE the patches that require them,
 # otherwise a patched StreamingDelegate.js would throw MODULE_NOT_FOUND at startup.
+# StreamKey.js (2026-11-09) is required by the patched Api.js: it gives two or more cameras in
+# one room distinct names and stream keys, by the same rule as nest-go2rtc-sync.py.
 new_files=(
   "PrebufferManager.js|dist/PrebufferManager.js"
+  "StreamKey.js|dist/StreamKey.js"
 )
 for entry in "${new_files[@]}"; do
   IFS='|' read -r src target <<<"$entry"
@@ -143,7 +146,7 @@ if [ "$applied" = 1 ]; then
   echo "  Prefer this to 'docker restart $CONTAINER'. Every container start runs npm install"
   echo "  against Homebridge's package.json; if the pinned plugin version differs from the"
   echo "  installed one, npm reinstalls the plugin and deletes every patch just applied --"
-  echo "  including dist/PrebufferManager.js. Killing the homebridge process lets s6 respawn"
+  echo "  including dist/PrebufferManager.js and dist/StreamKey.js. Killing the homebridge process lets s6 respawn"
   echo "  it in place without that step: new code is loaded, the patches survive."
 else
   echo "All patches already present; nothing to do."
