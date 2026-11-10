@@ -157,18 +157,22 @@ run "mkdir -p '$SNAPS_DIR'"
 
 # ---- phase 2b: plugin patches -----------------------------------------------
 # Runs BEFORE phase 3 on purpose. The patched plugin and the sync script must derive the same
-# stream keys, and the patcher refuses (exit 1, ending this script under set -e) when a file
-# carries an older generation of a patch, as every upgraded install does after a patch changes.
-# Run after phase 3, that refusal came after go2rtc.yaml had been regenerated with the NEW keys
-# and go2rtc restarted on them, leaving the plugin on the OLD keys: any camera whose key changed
-# was dead until someone noticed. Run first, a refusal leaves go2rtc exactly as it was.
+# stream keys. A file carrying an older generation of a patch (every upgraded install, after a
+# patch changes) is upgraded by the patcher itself: it restores that file from the verified
+# stock tarball and patches it again. What it cannot resolve safely (a hand-edited file, a
+# failed download or hash check) it refuses, changing nothing, and exits 1, which ends this
+# script under set -e. Run after phase 3, that refusal came after go2rtc.yaml had been
+# regenerated with the NEW keys and go2rtc restarted on them, leaving the plugin on the OLD
+# keys. Run first, a refusal leaves go2rtc exactly as it was.
 if [ -f "$PLUGIN_DIR/package.json" ]; then
   say "Patch the Homebridge plugin"
   # Homebridge in Docker runs npm as root, so on the host the plugin's files are usually
   # root-owned and a plain-user patch run cannot write them. It exited 1 here, which under
   # `set -e` ended the installer before the mount check and the closing instructions.
   SUDO_PATCH=""
-  if [ ! -w "$PLUGIN_DIR" ] || [ ! -w "$PLUGIN_DIR/dist" ] || [ ! -w "$PLUGIN_DIR/dist/sdm" ]; then
+  # Files too, not only directories: the patcher refuses a file it cannot write.
+  if [ ! -w "$PLUGIN_DIR" ] || [ ! -w "$PLUGIN_DIR/dist" ] || [ ! -w "$PLUGIN_DIR/dist/sdm" ] \
+     || [ -n "$(find "$PLUGIN_DIR/config.schema.json" "$PLUGIN_DIR/dist" -maxdepth 2 -type f ! -writable 2>/dev/null | head -1)" ]; then
     SUDO_PATCH="sudo "
     warn "plugin files are not writable by $(id -un) (normal for Homebridge in Docker) — patching with sudo"
   fi
@@ -176,6 +180,11 @@ if [ -f "$PLUGIN_DIR/package.json" ]; then
   # The patcher's own "reload now" advice is for running it alone. Here go2rtc.yaml is not
   # regenerated yet, and a plugin reloaded now would dial keys the old config may not serve.
   warn "don't reload Homebridge yet: go2rtc.yaml is regenerated below; the reload command is printed at the end"
+  # If anything below fails, the plugin on disk already derives the new keys but go2rtc.yaml
+  # does not, and the next Homebridge start (a crash, a reboot) loads them. Say so on the way out.
+  if [ "$DRY_RUN" != 1 ]; then
+    trap 'rc=$?; if [ "$rc" != 0 ] && [ -z "${GO2RTC_SYNCED:-}" ]; then printf "\033[1;31mERROR:\033[0m the plugin is patched but go2rtc.yaml was NOT regenerated. Fix the error above and re-run install.sh before Homebridge restarts, or cameras whose stream key changed get no video.\n" >&2; fi' EXIT
+  fi
 fi
 
 # ---- phase 3: scripts + generate config + start go2rtc ----------------------
@@ -200,6 +209,7 @@ run "mkdir -p '$GO2RTC_DIR'"
 # short-circuits before the restart.)
 run "python3 '$SCRIPTS_DIR/nest-go2rtc-sync.py' --hb-config '$HB_CONFIG' --out '$GO2RTC_DIR/go2rtc.yaml' --container '$GO2RTC_CONTAINER' --no-restart"
 run "chmod 600 '$GO2RTC_DIR/go2rtc.yaml' || true"   # contains the OAuth secret
+GO2RTC_SYNCED=1
 did "wrote $GO2RTC_DIR/go2rtc.yaml (chmod 600)"
 
 say "Start go2rtc container ($GO2RTC_CONTAINER)"

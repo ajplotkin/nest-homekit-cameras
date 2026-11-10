@@ -61,7 +61,9 @@ def display_names(devs):
     """{SDM device name: display name} for every camera-type device that has a room.
 
     Keep this identical to uniqueDisplayNames() in StreamKey.js. The rule:
-      * the only camera in its room (compared by slug) -> the room name, unchanged;
+      * the only camera in its room (compared by slug; a room name with no ASCII letter or
+        digit slugs to "", so such rooms are compared by their raw name instead) -> the room
+        name, unchanged;
       * 2+ in one room -> "<room> <customName>" when its customName's slug is non-empty and
         unique among them, else "<room> <last SUFFIX_LEN characters of the device id>";
       * if one of those 2+-per-room names still shares a slug with any other name, in any
@@ -73,7 +75,7 @@ def display_names(devs):
     groups = {}
     for d in devs:
         if dev_type(d) in CAMERA_TYPES and d.get("name") and room_of(d):
-            groups.setdefault(slug(room_of(d)), []).append(d)
+            groups.setdefault(slug(room_of(d)) or "\0" + room_of(d), []).append(d)
     cand, by_name, alone = {}, {}, set()
     for peers in groups.values():
         for d in peers:

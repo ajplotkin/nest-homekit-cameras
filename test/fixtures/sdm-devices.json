@@ -792,6 +792,101 @@
    "expect_streams": [
     "porch"
    ]
+  },
+  {
+   "name": "rooms whose names have no ASCII letters or digits are not merged into one room",
+   "devices": [
+    {
+     "name": "enterprises/test-project/devices/ima-cam-aaa111",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "居間"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/daidokoro-cam-bbb222",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": ""
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "台所"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/shinshitsu-cam-ccc333",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "Bed1"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "寝室"
+      }
+     ]
+    },
+    {
+     "name": "enterprises/test-project/devices/shinshitsu-cam-ddd444",
+     "type": "sdm.devices.types.CAMERA",
+     "traits": {
+      "sdm.devices.traits.Info": {
+       "customName": "Bed2"
+      },
+      "sdm.devices.traits.CameraLiveStream": {
+       "supportedProtocols": [
+        "WEB_RTC"
+       ]
+      }
+     },
+     "parentRelations": [
+      {
+       "parent": "enterprises/test-project/structures/S/rooms/R",
+       "displayName": "寝室"
+      }
+     ]
+    }
+   ],
+   "expect_names": {
+    "ima-cam-aaa111": "居間",
+    "daidokoro-cam-bbb222": "台所",
+    "shinshitsu-cam-ccc333": "寝室 Bed1",
+    "shinshitsu-cam-ddd444": "寝室 Bed2"
+   },
+   "expect_streams": [
+    "bed1",
+    "bed2"
+   ]
   }
  ]
 }

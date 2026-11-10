@@ -327,7 +327,8 @@ else
               "patches/homebridge-plugin/HksvStreamer.js.patch|patches/homebridge-plugin/HksvStreamer.js.patch" \
               "patches/homebridge-plugin/config.schema.json.patch|patches/homebridge-plugin/config.schema.json.patch" \
               "patches/homebridge-plugin/new-files/PrebufferManager.js|patches/homebridge-plugin/new-files/PrebufferManager.js" \
-              "patches/homebridge-plugin/new-files/StreamKey.js|patches/homebridge-plugin/new-files/StreamKey.js"; do
+              "patches/homebridge-plugin/new-files/StreamKey.js|patches/homebridge-plugin/new-files/StreamKey.js" \
+              "patches/homebridge-plugin/known-generations.txt|patches/homebridge-plugin/known-generations.txt"; do
     kf="${pair%%|*}"; rf="${pair##*|}"
     tmp="$WORK/kit_$(echo "$kf" | tr '/.' '__')"
     if rfetch "$KIT/$kf" "$tmp" && [ -s "$tmp" ]; then

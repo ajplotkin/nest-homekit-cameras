@@ -56,7 +56,9 @@ function uniqueDisplayNames(rawDevices) {
     for (const d of rawDevices || []) {
         if (!d || !d.name || !CAMERA_TYPES.includes(devType(d)) || !roomOf(d))
             continue;
-        const k = slug(roomOf(d));
+        // A room name with no ASCII letter or digit slugs to "", so compare such rooms by
+        // their raw name: two different ones are not one room. (Same in display_names().)
+        const k = slug(roomOf(d)) || "\u0000" + roomOf(d);
         if (!groups.has(k))
             groups.set(k, []);
         groups.get(k).push(d);

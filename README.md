@@ -19,9 +19,9 @@ This guide walks through the full setup from scratch: getting API access to your
 - **This README** — the complete, from-scratch guide (start here and read top to bottom).
 - **[`install.sh`](install.sh)** — one-shot installer for everything after your Google credentials. Re-running is safe but **not** a no-op: it recreates the go2rtc container (dropping every warm stream) and rewrites the warmer and wedge-detector units. If your go2rtc config does **not** live at the default `~/go2rtc-nest`, pass `--go2rtc-dir` — otherwise a re-run builds a fresh config at the default path and your existing one goes unused. see [Quick start](#quick-start-automated--if-parts-1--2-are-already-done).
 - **[`docker-compose.yml`](docker-compose.yml)** — the go2rtc + warmer half of the stack as Compose services.
-- **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches), `setup-google-device-access.sh` (automates Part 1 — the Google Cloud half of the credentials setup), `test-prebuffer-e2e.js` (end-to-end proof the prebuffer ring actually recovers pre-trigger footage — see [Testing the prebuffer](#testing-the-prebuffer)), `check-drift.sh` (read-only; proves your deployment still matches this repo — see [Checking for drift](#checking-for-drift)), and `go2rtc-wedge-detector.py` (spots and optionally restarts a go2rtc stream that receives but stops forwarding — see [When go2rtc receives but forwards nothing](#when-go2rtc-receives-but-forwards-nothing--check-this-first)).
-- **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), five plugin diffs against stock 1.1.25 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`, `config.schema.json`), and two new files in `homebridge-plugin/new-files/`, copied in rather than patched: `PrebufferManager.js` (it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)) and `StreamKey.js` (unique names and stream keys for two or more cameras in one room; see [Key derivation](#discover-cameras-and-generate-the-config)).
-- **[`test/`](test/)** — off-box tests that need no cameras, network or root: `stream-key.test.py` and `stream-key.test.js` (the sync script and the plugin derive the same stream keys), `install-dry-run.test.sh` (what `install.sh --dry-run` would do), and the two prebuffer tests described under [Patch the Homebridge plugin](#patch-the-homebridge-plugin).
+- **[`scripts/`](scripts/)** — `nest-go2rtc-sync.py` (auto-discovers cameras → writes `go2rtc.yaml`), `go2rtc-snapshot-warmer.sh` (keeps the JPEG cache warm), `apply-snapshot-patch.sh` (applies/re-applies the Homebridge plugin patches, and upgrades a plugin patched by an earlier version of this repo), `known-generations.py` (rebuilds the list of patched-file hashes that upgrade relies on), `setup-google-device-access.sh` (automates Part 1 — the Google Cloud half of the credentials setup), `test-prebuffer-e2e.js` (end-to-end proof the prebuffer ring actually recovers pre-trigger footage — see [Testing the prebuffer](#testing-the-prebuffer)), `check-drift.sh` (read-only; proves your deployment still matches this repo — see [Checking for drift](#checking-for-drift)), and `go2rtc-wedge-detector.py` (spots and optionally restarts a go2rtc stream that receives but stops forwarding — see [When go2rtc receives but forwards nothing](#when-go2rtc-receives-but-forwards-nothing--check-this-first)).
+- **[`patches/`](patches/)** — `go2rtc-nest.patch` (the go2rtc source changes as one diff against a clean **v1.9.14** checkout), five plugin diffs against stock 1.1.25 (`Camera.js`, `Api.js`, `StreamingDelegate.js`, `HksvStreamer.js`, `config.schema.json`), `known-generations.txt` (the SHA-256 of each plugin file as every past and current version of those diffs leaves it), and two new files in `homebridge-plugin/new-files/`, copied in rather than patched: `PrebufferManager.js` (it gives HKSV a real pre-trigger buffer; see [The prebuffer](#the-prebuffer-why-clips-used-to-open-after-the-person-had-gone)) and `StreamKey.js` (unique names and stream keys for two or more cameras in one room; see [Key derivation](#discover-cameras-and-generate-the-config)).
+- **[`test/`](test/)** — off-box tests that need no cameras, network or root: `stream-key.test.py` and `stream-key.test.js` (the sync script and the plugin derive the same stream keys), `install-dry-run.test.sh` (what `install.sh --dry-run` would do), `apply-patch-upgrade.test.sh` (patching, upgrading an older generation, and every refusal, against a synthetic plugin and a fake registry), and the two prebuffer tests described under [Patch the Homebridge plugin](#patch-the-homebridge-plugin).
 
 The patched go2rtc **source and build** live in a separate fork so the git history and upstream attribution are preserved: **[github.com/ajplotkin/go2rtc](https://github.com/ajplotkin/go2rtc/tree/nestfix-1.9.14-21)** — build from the stable tag **`nestfix-1.9.14-21`** (the tags are a branchless chain on top of upstream master, so build from the tag — there is no branch to check out). Part 3 shows how to build it. This work also folds in several community go2rtc pull requests, credited at the end.
 
@@ -510,7 +510,7 @@ HOMEBRIDGE_DIR=/path/to/homebridge ./scripts/apply-snapshot-patch.sh
 
 With Homebridge in Docker, npm runs as root inside the container, so the plugin's files are usually root-owned on the host and the script can't write them. If it reports a permissions failure, run it with `sudo`: `sudo env HOMEBRIDGE_DIR=/path/to/homebridge bash ./scripts/apply-snapshot-patch.sh`. (`install.sh` checks for this and uses `sudo` for that step itself.)
 
-The script pins the plugin version it was cut against (**1.1.25**) and **refuses to run on a different one** — the compiled `dist/` layout moves between releases, so a stale patch could silently break things. It's idempotent (safe to re-run) and **exits non-zero** if any patch is missing or won't apply, so a re-apply can never leave you half-patched. Want to see exactly what changes? Read the diffs in `patches/homebridge-plugin/`.
+The script pins the plugin version it was cut against (**1.1.25**) and **refuses to run on a different one** — the compiled `dist/` layout moves between releases, so a stale patch could silently break things. It's idempotent (safe to re-run) and **exits non-zero** if any patch is missing or won't apply. It checks every file before it changes any, so a refusal leaves the plugin as it was. `--dry-run` prints what it would do and changes nothing. Want to see exactly what changes? Read the diffs in `patches/homebridge-plugin/`.
 
 **If you're on a different plugin version**, you have three options, in order of preference:
 
@@ -526,18 +526,32 @@ The script pins the plugin version it was cut against (**1.1.25**) and **refuses
 
 #### Upgrading an install made from an earlier version of this repo
 
-When a patch file in this repo changes, a plugin patched with the previous version no longer matches it, and `apply-snapshot-patch.sh` stops with `carries an OLDER generation of …` for that file instead of layering one version on another. `install.sh` runs the patch step before it regenerates `go2rtc.yaml`, so this refusal leaves go2rtc as it was. Put the named files back to stock 1.1.25 and run it again. On a host without npm (the usual case for Homebridge in Docker), fetch the stock tarball with curl, then copy each named file back, for example `Api.js` and `StreamingDelegate.js`:
+When a patch file in this repo changes, a plugin patched with the previous version no longer matches it. Re-running `install.sh`, or `apply-snapshot-patch.sh` on its own, upgrades such a file in place: it checks the file's SHA-256 against [`known-generations.txt`](patches/homebridge-plugin/known-generations.txt), which lists every version of each file these patches have produced from stock 1.1.25, and if it is listed it
+
+1. downloads the stock 1.1.25 tarball from the npm registry with `curl` (no npm needed on the host),
+2. refuses unless the registry's metadata reports version 1.1.25 and the integrity hash pinned in the script, and the tarball itself hashes to that value,
+3. copies the old file to `<homebridge dir>/nest-patch-backups/<UTC time>/`,
+4. restores that one file from the tarball and applies the current patch,
+
+and prints `UPGRADED: <file>`. Run it with `--dry-run` first to see which files it would upgrade. The download happens only when a file needs it.
+
+It refuses, and changes nothing, when a patched file matches no listed version (you edited it, or it came from a copy of these patches the list does not know), when a file it would change is not writable (run it with `sudo`), when the download or a hash check fails, or when the plugin is not 1.1.25. Every refusal prints its reason. For a file you edited, put it back to stock yourself if you don't need the edits; on a host without npm (the usual case for Homebridge in Docker), for example `Api.js`:
 
 ```bash
 cd "$(mktemp -d)"
 curl -fsSLO https://registry.npmjs.org/homebridge-google-nest-sdm/-/homebridge-google-nest-sdm-1.1.25.tgz
+# must print sha512-ipMBmrep/Y+a7ESdHw5kdXBP/5gjvIb2d48nnmx0Z1sbLA8XLGPCI/n1XH1xnpRAY9saP69wSxgT9A0XQmsDbQ==
+echo "sha512-$(openssl dgst -sha512 -binary homebridge-google-nest-sdm-1.1.25.tgz | base64 | tr -d '\n')"
 tar xzf homebridge-google-nest-sdm-1.1.25.tgz
 P=/path/to/homebridge/node_modules/homebridge-google-nest-sdm
 sudo cp package/dist/sdm/Api.js "$P/dist/sdm/Api.js"
-sudo cp package/dist/StreamingDelegate.js "$P/dist/StreamingDelegate.js"
 ```
 
-Then re-run this repo's `install.sh`, which also installs its own copy of the sync script before running it. If you run the steps by hand instead, run `apply-snapshot-patch.sh` and then this repo's `scripts/nest-go2rtc-sync.py`, not an older copy you saved elsewhere (an older one skips Nest Hub Max displays and refuses rooms with two cameras). Then reload Homebridge with `pkill`, and check with `scripts/check-drift.sh --deep`. The plugin patches and `go2rtc.yaml` have to come from the same version of this repo: the two sides each derive the stream keys, and a camera whose key differs between them gets no video.
+then run the script again.
+
+`install.sh` runs the patch step before it regenerates `go2rtc.yaml`, and installs its own copy of the sync script before running it, so a refusal leaves go2rtc as it was. If you run the steps by hand instead, run `apply-snapshot-patch.sh` and then this repo's `scripts/nest-go2rtc-sync.py`, not an older copy you saved elsewhere (an older one skips Nest Hub Max displays and refuses rooms with two cameras). Then reload Homebridge with `pkill`, and check with `scripts/check-drift.sh --deep`. The plugin patches and `go2rtc.yaml` have to come from the same version of this repo: the two sides each derive the stream keys, and a camera whose key differs between them gets no video. A new sync script with an older plugin gives a different key to any camera sharing its room with another camera or with a Nest Hub Max.
+
+After re-cutting a patch, rebuild the list and commit it with the patch: `python3 scripts/known-generations.py <unpacked stock tarball>/package`. `bash test/apply-patch-upgrade.test.sh <stock tarball>` checks that the list is current.
 
 ## Part 5: Verify
 
@@ -803,7 +817,7 @@ Enable Homebridge debug logging, tap a camera tile, and look for the patch's own
 docker logs homebridge 2>&1 | grep "Using local go2rtc RTSP"
 ```
 
-If it appears, live view is routed to the warm stream. That line appears whenever the camera's key is non-empty, even if go2rtc has no stream by that name: the plugin never falls back to a Google dial for a camera with a key, so a wrong key shows up as ffmpeg failing against `rtsp://127.0.0.1:8554/<key>` and a tile that will not play. (A Google dial instead means the key came out empty, which happens only for a camera with no room.) To check a key, compare the camera's key (its display name, lowercased, other characters → `_`; see [Key derivation](#discover-cameras-and-generate-the-config)) against the stream names in `curl -s http://127.0.0.1:1985/api/streams`. The accessory name can be an old one kept in Homebridge's cache (see [After a room change](#after-a-room-change-homebridge-keeps-the-old-name)), so it is not a reliable guide to the key.
+If it appears, live view is routed to the warm stream. That line appears whenever the camera's key is non-empty, even if go2rtc has no stream by that name: the plugin never falls back to a Google dial for a camera with a key, so a wrong key shows up as ffmpeg failing against `rtsp://127.0.0.1:8554/<key>` and a tile that will not play. (A Google dial instead means the key came out empty: a camera with no room, or one alone in a room whose name has no ASCII letter or digit, such as 居間. Rename the room in Google Home to give it a stream.) To check a key, compare the camera's key (its display name, lowercased, other characters → `_`; see [Key derivation](#discover-cameras-and-generate-the-config)) against the stream names in `curl -s http://127.0.0.1:1985/api/streams`. The accessory name can be an old one kept in Homebridge's cache (see [After a room change](#after-a-room-change-homebridge-keeps-the-old-name)), so it is not a reliable guide to the key.
 
 To undo Part 6: reinstall the plugin (`npm install --save-exact homebridge-google-nest-sdm@1.1.25`, inside the container for Docker) and don't re-run the patch script. That reverts all five patches and removes `PrebufferManager.js` and `StreamKey.js`, so re-apply them if you still want the snapshot fix — there is no per-patch switch.
 
@@ -870,7 +884,9 @@ paths filled in) running as the user who ran the installer, logs to `/var/log/ne
 to the end of the `ExecStart` line, then
 `sudo systemctl daemon-reload && sudo systemctl restart go2rtc-wedge-detector`; that user must
 be in the `docker` group for the recovery command to work. A later run of `install.sh` keeps
-`--arm` if it finds it on `ExecStart` (a mention in a comment does not count).
+`--arm` if it finds it on `ExecStart` (a mention in a comment does not count). It replaces any
+unit already there, including one you wrote by hand from the steps below: other edits are lost,
+and its output moves from the journal to that log file.
 
 Without `install.sh`, write the same unit yourself, replacing `YOUR_USER` and the script path:
 
@@ -1164,6 +1180,8 @@ code is executing. Only `--deep` answers that.
 > scp -r scripts/apply-snapshot-patch.sh you@your-pi:~/nest-recovery/scripts/
 > scp -r patches/homebridge-plugin you@your-pi:~/nest-recovery/patches/
 > ```
+>
+> (`patches/homebridge-plugin` includes `known-generations.txt`, which the script needs to upgrade a file patched by an older kit.)
 >
 > Then recovery is `sudo env HOMEBRIDGE_DIR=/path/to/homebridge bash ~/nest-recovery/scripts/apply-snapshot-patch.sh` followed
 > by the `pkill` reload.
