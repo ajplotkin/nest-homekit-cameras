@@ -723,7 +723,7 @@ index 625e3ab..13b4d32 100644
  			mediaCodec := &core.Codec{
  				Name:      videoCodecs[codec.CodecType],
 diff --git a/pkg/nest/api.go b/pkg/nest/api.go
-index 4e9e4db..8f8c601 100644
+index 4e9e4db..228f80a 100644
 --- a/pkg/nest/api.go
 +++ b/pkg/nest/api.go
 @@ -4,6 +4,7 @@ import (
@@ -1083,14 +1083,14 @@ index 4e9e4db..8f8c601 100644
  
  	if res.StatusCode != 200 {
  		return errors.New("nest: wrong status: " + res.Status)
-@@ -469,18 +538,73 @@ func (a *API) StartExtendStreamTimer() {
+@@ -469,18 +538,83 @@ func (a *API) StartExtendStreamTimer() {
  		return
  	}
  
 -	a.extendTimer = time.NewTimer(time.Until(a.StreamExpiresAt) - time.Minute)
 +	// Google expires sessions after ~5 minutes; each successful extension
 +	// returns a new expiresAt, so keep extending until the stream stops.
-+	timer := time.NewTimer(time.Until(a.StreamExpiresAt) - time.Minute)
++	timer := time.NewTimer(extendDelay(a.StreamExpiresAt, time.Now()))
 +	stop := make(chan struct{})
 +	done := make(chan struct{})
 +	a.extendTimer = timer
@@ -1128,13 +1128,7 @@ index 4e9e4db..8f8c601 100644
 +					return
 +				}
 +				fails = 0
-+				// Clamp so a zero/past/short expiresAt from Google can't hot-loop ExtendStream
-+				// at HTTP-round-trip rate (which would 429 and kill the goroutine).
-+				d := time.Until(a.StreamExpiresAt) - time.Minute
-+				if d < 30*time.Second {
-+					d = 30 * time.Second
-+				}
-+				timer.Reset(d)
++				timer.Reset(extendDelay(a.StreamExpiresAt, time.Now()))
 +			case <-stop:
 +				return
 +			}
@@ -1142,6 +1136,22 @@ index 4e9e4db..8f8c601 100644
  	}()
  }
  
++// minExtendDelay is the shortest wait between stream extensions. A var so
++// tests can shorten it.
++var minExtendDelay = 30 * time.Second
++
++// extendDelay is how long to wait before extending a session that expires at
++// expiresAt: a minute early, but never less than minExtendDelay, so a zero,
++// past or near expiresAt cannot make the loop extend at HTTP round-trip rate
++// (which would 429 and kill the goroutine). The minute comes off the time, not
++// the duration: for a zero expiresAt, Sub saturates at the minimum Duration and
++// subtracting from that wraps around to ~292 years, which would stop extending
++// altogether. The trade-off: an expiresAt less than minExtendDelay away is
++// extended after it has passed. From upstream 5fa15e7 (AlexxIT/go2rtc#2351).
++func extendDelay(expiresAt, now time.Time) time.Duration {
++	return max(expiresAt.Add(-time.Minute).Sub(now), minExtendDelay)
++}
++
  func (a *API) StopExtendStreamTimer() {
 +	if a.extendStop != nil {
 +		close(a.extendStop)
@@ -2370,10 +2380,10 @@ index 0000000..ac49869
 +}
 diff --git a/pkg/nest/api_test.go b/pkg/nest/api_test.go
 new file mode 100644
-index 0000000..7d54aaa
+index 0000000..c19a7b7
 --- /dev/null
 +++ b/pkg/nest/api_test.go
-@@ -0,0 +1,493 @@
+@@ -0,0 +1,553 @@
 +package nest
 +
 +import (
@@ -2399,6 +2409,7 @@ index 0000000..7d54aaa
 +type fakeGoogle struct {
 +	tokenRequests atomic.Int32
 +	tokenFail     atomic.Bool  // the token endpoint answers 500
++	noExpiresAt   atomic.Bool  // SDM answers leave out expiresAt
 +	expiresIn     atomic.Int32 // seconds, 0 means 3600
 +
 +	mu       sync.Mutex
@@ -2460,23 +2471,26 @@ index 0000000..7d54aaa
 +			return
 +		}
 +
-+		_ = json.NewEncoder(w).Encode(map[string]any{
-+			"results": map[string]any{
-+				"answerSdp":      "answer",
-+				"expiresAt":      time.Now().Add(5 * time.Minute),
-+				"mediaSessionId": "session",
-+			},
-+		})
++		results := map[string]any{
++			"answerSdp":      "answer",
++			"expiresAt":      time.Now().Add(5 * time.Minute),
++			"mediaSessionId": "session",
++		}
++		if g.noExpiresAt.Load() {
++			delete(results, "expiresAt")
++		}
++		_ = json.NewEncoder(w).Encode(map[string]any{"results": results})
 +	})
 +
 +	srv := httptest.NewServer(mux)
 +	t.Cleanup(srv.Close)
 +
-+	oldToken, oldSDM, oldDelay := tokenURL, sdmURL, busyRetryDelay
++	oldToken, oldSDM, oldDelay, oldFloor := tokenURL, sdmURL, busyRetryDelay, minExtendDelay
 +	tokenURL = srv.URL + "/token"
 +	sdmURL = srv.URL + "/sdm/"
 +	busyRetryDelay = 10 * time.Millisecond
-+	t.Cleanup(func() { tokenURL, sdmURL, busyRetryDelay = oldToken, oldSDM, oldDelay })
++	minExtendDelay = 10 * time.Millisecond
++	t.Cleanup(func() { tokenURL, sdmURL, busyRetryDelay, minExtendDelay = oldToken, oldSDM, oldDelay, oldFloor })
 +
 +	cacheMu.Lock()
 +	cache = map[string]*API{}
@@ -2860,12 +2874,68 @@ index 0000000..7d54aaa
 +	g.expiresIn.Store(0)
 +	_, err := api.ExchangeSDP("project", "device", "offer")
 +	require.NoError(t, err)
-+	api.StreamExpiresAt = time.Now() // timer fires at once
++	api.StreamExpiresAt = time.Now() // timer fires after the floor
 +	api.StartExtendStreamTimer()
++	defer api.StopExtendStreamTimer()
 +	require.Eventually(t, func() bool { return len(g.sdmBearers()) >= 2 }, 5*time.Second, 10*time.Millisecond)
-+	api.StopExtendStreamTimer()
 +	require.Equal(t, "tok2", api.Token)
 +	require.Equal(t, []string{"tok1", "tok2"}, g.sdmBearers()[:2])
++}
++
++// Adapted from upstream 5fa15e7 (AlexxIT/go2rtc#2351, tillo).
++func TestExtendDelay(t *testing.T) {
++	require.Equal(t, 30*time.Second, minExtendDelay, "production floor")
++	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
++
++	// A normal 5-minute session is extended a minute before it expires.
++	require.Equal(t, 4*time.Minute, extendDelay(now.Add(5*time.Minute), now))
++
++	// A missing or near expiresAt must not make the loop extend with no wait.
++	// The zero case is the one a clamp after `time.Until(x) - time.Minute`
++	// misses: Until saturates at the minimum Duration and the subtraction
++	// wraps to ~292 years, so the loop would never extend again.
++	require.Equal(t, 30*time.Second, extendDelay(time.Time{}, now))
++	require.Equal(t, 30*time.Second, extendDelay(now.Add(45*time.Second), now))
++	require.Equal(t, 30*time.Second, extendDelay(now.Add(-time.Hour), now))
++
++	// Exactly at the floor.
++	require.Equal(t, 30*time.Second, extendDelay(now.Add(90*time.Second), now))
++	require.Equal(t, 31*time.Second, extendDelay(now.Add(91*time.Second), now))
++}
++
++// With no expiresAt in any answer, the loop keeps extending at the floor:
++// both the first timer and the re-arm after each extension go through
++// extendDelay. Three extensions need both; either site left on the old
++// arithmetic arms a ~292-year timer and the count stops at 0 or 1.
++func TestExtendLoopZeroExpiresAt(t *testing.T) {
++	g := newFakeGoogle(t)
++	g.noExpiresAt.Store(true)
++	api := newTestAPI(t)
++	_, err := api.ExchangeSDP("project", "device", "offer")
++	require.NoError(t, err)
++	require.True(t, api.StreamExpiresAt.IsZero())
++	api.StartExtendStreamTimer()
++	defer api.StopExtendStreamTimer()
++	require.Eventually(t, func() bool { return len(g.sdmBearers()) >= 4 }, 5*time.Second, 10*time.Millisecond)
++}
++
++// In the normal case both timers follow expiresAt: the first fires a minute
++// before the session expires, not sooner, and after an extension whose answer
++// expires in 5 minutes the loop waits ~4 minutes, not the floor.
++func TestExtendLoopFollowsExpiresAt(t *testing.T) {
++	g := newFakeGoogle(t)
++	api := newTestAPI(t)
++	_, err := api.ExchangeSDP("project", "device", "offer")
++	require.NoError(t, err)
++	api.StreamExpiresAt = time.Now().Add(time.Minute + 300*time.Millisecond)
++	api.StartExtendStreamTimer()
++	defer api.StopExtendStreamTimer()
++
++	time.Sleep(100 * time.Millisecond)
++	require.Len(t, g.sdmBearers(), 1, "extended before expiresAt minus a minute")
++	require.Eventually(t, func() bool { return len(g.sdmBearers()) == 2 }, 2*time.Second, 10*time.Millisecond)
++	time.Sleep(300 * time.Millisecond)
++	require.Len(t, g.sdmBearers(), 2, "re-armed at the floor instead of from the new expiresAt")
 +}
 diff --git a/pkg/nest/client_test.go b/pkg/nest/client_test.go
 new file mode 100644

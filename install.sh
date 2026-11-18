@@ -39,7 +39,7 @@ FORK_URL="${FORK_URL:-https://github.com/ajplotkin/go2rtc.git}"
 # master, so there is no branch to build from; work in progress is never tagged and so
 # never lands in someone's install. `git clone --branch` accepts a tag. Override to
 # build a different tag: FORK_BRANCH=nestfix-1.9.14-10 ./install.sh
-FORK_BRANCH="${FORK_BRANCH:-nestfix-1.9.14-21}"
+FORK_BRANCH="${FORK_BRANCH:-nestfix-1.9.14-22}"
 BASE_IMAGE="${BASE_IMAGE:-alexxit/go2rtc:1.9.14}"
 PLUGIN_VER="1.1.25"
 # Where the wedge-detector unit and its logrotate entry go. Overridable so the dry-run test can
